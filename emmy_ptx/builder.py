@@ -1,0 +1,540 @@
+"""Typed values and an instruction builder that folds, simplifies and reuses.
+
+The lowering never writes PTX opcodes for arithmetic directly; it calls the
+:class:`Builder`, which
+
+* folds constants (``a0 * 4 + 0`` with ``a0`` known becomes an immediate),
+* tracks a proven integer range ``[lo, hi]`` for every int value, and uses it
+  to pick cheaper instructions: unsigned division, shifts and masks for powers
+  of two, dropping ``x % n`` when ``x < n``, and deciding comparisons outright,
+* value-numbers pure instructions (common-subexpression elimination) within
+  dominance scopes that the lowering opens around branches and loop bodies,
+* widens integer arithmetic to 64 bits only when a range could overflow 32.
+
+Integer semantics are C's (``/`` truncates, ``%`` is the C remainder), which
+is what Emmy's index expressions mean. Float arithmetic is IEEE single with
+round-to-nearest (``.rn``): spelled that way, ptxas may not contract a
+multiply and an add into one FMA, so results match numpy bit for bit.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from dataclasses import dataclass
+
+import numpy as np
+
+from .ptx import Imm, Instr, Kernel, Label, LabelRef, Mem, Reg, Vec
+
+INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
+
+
+@dataclass(frozen=True)
+class Value:
+    """An operand with a type and, for integers, a proven inclusive range.
+
+    ``type`` is one of ``s32``, ``s64`` (C ``int`` / ``long long``), ``f32``,
+    ``f16``, ``f64`` or ``pred``. ``mutable`` marks a read of a register that is
+    reassigned elsewhere (an accumulator or a loop counter): such reads are
+    never value-numbered.
+    """
+
+    type: str
+    op: Reg | Imm
+    lo: int | None = None
+    hi: int | None = None
+    mutable: bool = False
+
+    @property
+    def const(self):
+        return self.op.value if isinstance(self.op, Imm) else None
+
+    @property
+    def is_int(self) -> bool:
+        return self.type in INT_RANGE
+
+    @property
+    def is_float(self) -> bool:
+        return self.type in ("f16", "f32", "f64")
+
+    @property
+    def nonneg(self) -> bool:
+        return self.lo is not None and self.lo >= 0
+
+    def key(self):
+        """Identity of the value for value numbering (``None``: never reuse)."""
+        if self.mutable:
+            return None
+        if isinstance(self.op, Imm):
+            return ("imm", self.op.type, self.op.value)
+        return ("reg", self.op.name)
+
+
+@dataclass
+class Variable:
+    """A mutable register: an accumulator, a reassigned state or a loop counter."""
+
+    reg: Reg
+    type: str
+    lo: int | None = None
+    hi: int | None = None
+
+    def read(self) -> Value:
+        lo, hi = (self.lo, self.hi) if self.type in INT_RANGE else (None, None)
+        if self.type in INT_RANGE and lo is None:
+            lo, hi = INT_RANGE[self.type]
+        return Value(self.type, self.reg, lo, hi, mutable=True)
+
+
+def _is_pow2(n) -> bool:
+    return isinstance(n, int) and n > 0 and n & (n - 1) == 0
+
+
+def _cdiv(a: int, b: int) -> int:
+    """C integer division (truncates toward zero)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def _crem(a: int, b: int) -> int:
+    """C remainder (takes the sign of the dividend)."""
+    return a - _cdiv(a, b) * b
+
+
+def _f32(x) -> float:
+    return float(np.float32(x))
+
+
+def _operand_key(x):
+    if isinstance(x, Value):
+        return x.key()
+    if isinstance(x, Mem):
+        base = ("reg", x.base.name) if isinstance(x.base, Reg) else ("sym", x.base.name)
+        return ("mem", base, x.offset)
+    return ("raw", str(x))
+
+
+class Builder:
+    """Emits instructions into a :class:`~emmy_ptx.ptx.Kernel` (see module doc)."""
+
+    def __init__(self, kernel: Kernel):
+        self.k = kernel
+        self._tables: list[dict] = [{}]
+
+    # -- dominance scopes for value numbering --------------------------------
+
+    @contextlib.contextmanager
+    def cse_scope(self):
+        """Values numbered inside the block are forgotten when it closes."""
+        self._tables.append({})
+        try:
+            yield
+        finally:
+            self._tables.pop()
+
+    def _lookup(self, key):
+        for table in reversed(self._tables):
+            if key in table:
+                return table[key]
+        return None
+
+    def pure(self, op: str, type_: str, args: tuple, lo=None, hi=None, commutative=False) -> Value:
+        """Emit, or reuse, a side-effect-free instruction with one result."""
+        keys = tuple(_operand_key(a) for a in args)
+        if commutative:
+            order = sorted(range(len(args)), key=lambda i: repr(keys[i]))
+            args, keys = tuple(args[i] for i in order), tuple(keys[i] for i in order)
+            # PTX reads best with the immediate last
+            if len(args) == 2 and isinstance(args[0], Value) and args[0].const is not None:
+                args, keys = args[::-1], keys[::-1]
+        key = None if None in keys else (op, keys)
+        if key is not None:
+            hit = self._lookup(key)
+            if hit is not None:
+                return hit
+        reg = self.k.reg(type_)
+        self.k.emit(Instr(op, (reg, *(a.op if isinstance(a, Value) else a for a in args))))
+        if type_ in INT_RANGE and lo is None:
+            lo, hi = INT_RANGE[type_]
+        v = Value(type_, reg, lo, hi)
+        if key is not None:
+            self._tables[-1][key] = v
+        return v
+
+    def emit(self, op: str, *args, ndefs: int = 0, effect: bool = True, guard: Value | None = None, negate=False):
+        """Emit an instruction verbatim (stores, barriers, async copies ...)."""
+        g = None
+        if guard is not None:
+            if guard.const is not None:
+                if bool(guard.const) == negate:
+                    return  # statically never executes
+            else:
+                g = guard.op
+        ops = tuple(a.op if isinstance(a, Value) else a for a in args)
+        self.k.emit(Instr(op, ops, ndefs=ndefs, effect=effect, guard=g, negate=negate))
+
+    # -- constants and registers ------------------------------------------------
+
+    def int_const(self, v: int, type_: str | None = None) -> Value:
+        v = int(v)
+        if type_ is None:
+            type_ = "s32" if INT_RANGE["s32"][0] <= v <= INT_RANGE["s32"][1] else "s64"
+        return Value(type_, Imm(v, type_), v, v)
+
+    def f32_const(self, x: float) -> Value:
+        return Value("f32", Imm(_f32(x), "f32"))
+
+    def pred_const(self, b: bool) -> Value:
+        return Value("pred", Imm(bool(b), "pred"))
+
+    def special(self, name: str, lo: int, hi: int) -> Value:
+        """Read a special register such as ``%tid.x`` (range from the launch)."""
+        if lo == hi:
+            return self.int_const(lo)
+        return self.pure("mov.u32", "s32", (Reg(name, "b32"),), lo, hi)
+
+    def assume(self, v: Value, lo: int, hi: int) -> Value:
+        """``v`` with a range the caller knows from the mathematics (e.g. a clamp
+        done in floating point before the conversion to int)."""
+        if v.const is not None:
+            return v
+        return Value(v.type, v.op, max(lo, v.lo), min(hi, v.hi), v.mutable)
+
+    def in_reg(self, v: Value) -> Value:
+        """``v`` in a register (stores and some instructions take no immediates)."""
+        if isinstance(v.op, Reg):
+            return v
+        return self.pure(f"mov.{_mov_type(v.type)}", v.type, (v,), v.lo, v.hi)
+
+    # -- mutable variables ------------------------------------------------------
+
+    def variable(self, type_: str, init: Value | None = None, lo=None, hi=None) -> Variable:
+        var = Variable(self.k.reg(type_), type_, lo, hi)
+        if init is not None:
+            self.assign(var, init)
+        return var
+
+    def assign(self, var: Variable, v: Value) -> None:
+        v = self.convert(v, var.type)
+        self.k.emit(Instr(f"mov.{_mov_type(var.type)}", (var.reg, v.op)))
+
+    # -- conversions -------------------------------------------------------------
+
+    def convert(self, v: Value, type_: str) -> Value:
+        """C conversion of ``v`` to ``type_``."""
+        if v.type == type_:
+            return v
+        if type_ == "pred":
+            return self.truthy(v)
+        if v.type == "pred":
+            if type_ in INT_RANGE:
+                return self.select(v, self.int_const(1, type_), self.int_const(0, type_))
+            one, zero = self.f32_const(1.0), self.f32_const(0.0)
+            return self.convert(self.select(v, one, zero), type_)
+        if v.is_int and type_ in INT_RANGE:
+            if v.const is not None:
+                return self.int_const(v.const, type_)
+            if type_ == "s64":
+                return self.pure("cvt.s64.s32", "s64", (v,), v.lo, v.hi)
+            lo, hi = INT_RANGE["s32"]
+            keep = v.lo is not None and lo <= v.lo and v.hi <= hi
+            return self.pure("cvt.u32.u64", "s32", (v,), v.lo if keep else None, v.hi if keep else None)
+        if v.is_int and type_ == "f32":
+            if v.const is not None:
+                return self.f32_const(float(v.const))
+            return self.pure(f"cvt.rn.f32.{v.type}", "f32", (v,))
+        if v.is_float and type_ in INT_RANGE:
+            if v.type != "f32":
+                v = self.convert(v, "f32")
+            return self.pure(f"cvt.rzi.{type_}.f32", type_, (v,))
+        if v.is_float and type_ in ("f16", "f32", "f64"):
+            if v.type == "f32" and v.const is not None and type_ == "f64":
+                return Value("f64", Imm(float(v.const), "f64"))
+            rnd = ".rn" if _float_rank(type_) < _float_rank(v.type) else ""
+            return self.pure(f"cvt{rnd}.{type_}.{v.type}", type_, (self.in_reg(v),))
+        raise TypeError(f"cannot convert {v.type} to {type_}")
+
+    def truthy(self, v: Value) -> Value:
+        """C truthiness: non-zero (NaN counts as true)."""
+        if v.type == "pred":
+            return v
+        if v.const is not None:
+            return self.pred_const(v.const != 0)
+        if v.is_int:
+            return self.icmp("!=", v, self.int_const(0, v.type))
+        return self.pure(f"setp.neu.{v.type}", "pred", (v, self._fzero(v.type)))
+
+    def _fzero(self, type_: str) -> Value:
+        return self.f32_const(0.0) if type_ == "f32" else self.convert(self.f32_const(0.0), type_)
+
+    # -- integer arithmetic ---------------------------------------------------------
+
+    def _widen(self, a: Value, b: Value, lo: int, hi: int):
+        """Common integer type for ``a op b``; 64-bit if the range needs it."""
+        t = "s64" if "s64" in (a.type, b.type) else "s32"
+        if t == "s32" and not (INT_RANGE["s32"][0] <= lo and hi <= INT_RANGE["s32"][1]):
+            t = "s64"
+        return self.convert(a, t), self.convert(b, t), t
+
+    def add(self, a: Value, b: Value) -> Value:
+        if a.const is not None and b.const is not None:
+            return self.int_const(a.const + b.const)
+        if a.const == 0:
+            return b
+        if b.const == 0:
+            return a
+        lo, hi = a.lo + b.lo, a.hi + b.hi
+        a, b, t = self._widen(a, b, lo, hi)
+        return self.pure(f"add.{t}", t, (a, b), lo, hi, commutative=True)
+
+    def sub(self, a: Value, b: Value) -> Value:
+        if a.const is not None and b.const is not None:
+            return self.int_const(a.const - b.const)
+        if b.const == 0:
+            return a
+        if a.key() is not None and a.key() == b.key():
+            return self.int_const(0)
+        lo, hi = a.lo - b.hi, a.hi - b.lo
+        a, b, t = self._widen(a, b, lo, hi)
+        return self.pure(f"sub.{t}", t, (a, b), lo, hi)
+
+    def mul(self, a: Value, b: Value) -> Value:
+        if a.const is not None and b.const is not None:
+            return self.int_const(a.const * b.const)
+        if b.const is None and a.const is not None:
+            a, b = b, a
+        if b.const == 0:
+            return self.int_const(0)
+        if b.const == 1:
+            return a
+        corners = [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi]
+        lo, hi = min(corners), max(corners)
+        if _is_pow2(b.const):
+            a2, _, t = self._widen(a, b, lo, hi)
+            return self.pure(f"shl.b{t[1:]}", t, (a2, Imm(b.const.bit_length() - 1, "u32")), lo, hi)
+        a, b, t = self._widen(a, b, lo, hi)
+        return self.pure(f"mul.lo.{t}", t, (a, b), lo, hi, commutative=True)
+
+    def div(self, a: Value, b: Value) -> Value:
+        """C ``/`` on integers (truncation)."""
+        if a.const is not None and b.const is not None and b.const != 0:
+            return self.int_const(_cdiv(a.const, b.const))
+        if b.const == 1:
+            return a
+        a, b, t = self._widen(a, b, min(a.lo, -a.hi), max(a.hi, -a.lo))  # |a / b| <= |a|
+        if a.nonneg and b.lo > 0:
+            lo, hi = a.lo // b.hi, a.hi // b.lo
+            if lo == hi:
+                return self.int_const(lo, t)
+            if _is_pow2(b.const):
+                return self.pure(f"shr.u{t[1:]}", t, (a, Imm(b.const.bit_length() - 1, "u32")), lo, hi)
+            return self.pure(f"div.u{t[1:]}", t, (a, b), lo, hi)
+        bound = max(abs(a.lo), abs(a.hi))
+        return self.pure(f"div.{t}", t, (a, b), -bound, bound)
+
+    def rem(self, a: Value, b: Value) -> Value:
+        """C ``%`` on integers (sign of the dividend)."""
+        if a.const is not None and b.const is not None and b.const != 0:
+            return self.int_const(_crem(a.const, b.const))
+        if b.const in (1, -1):
+            return self.int_const(0, a.type)
+        a, b, t = self._widen(a, b, a.lo, a.hi)
+        if a.nonneg and b.lo > 0:
+            if a.hi < b.lo:
+                return a
+            hi = min(a.hi, b.hi - 1)
+            if _is_pow2(b.const):
+                return self.pure(f"and.b{t[1:]}", t, (a, Imm(b.const - 1, t)), 0, hi)
+            return self.pure(f"rem.u{t[1:]}", t, (a, b), 0, hi)
+        mag = max(abs(b.lo), abs(b.hi)) - 1
+        return self.pure(f"rem.{t}", t, (a, b), -mag if not a.nonneg else 0, mag)
+
+    def shl(self, a: Value, b: Value) -> Value:
+        if b.const is not None:
+            return self.mul(a, self.int_const(1 << b.const, a.type))
+        return self.pure(f"shl.b{a.type[1:]}", a.type, (a, self.convert(b, "s32")))
+
+    def shr(self, a: Value, b: Value) -> Value:
+        if a.const is not None and b.const is not None:
+            return self.int_const(a.const >> b.const)
+        if b.const is not None and a.nonneg:
+            return self.pure(f"shr.u{a.type[1:]}", a.type, (a, Imm(b.const, "u32")), a.lo >> b.const, a.hi >> b.const)
+        return self.pure(f"shr.{a.type}", a.type, (a, self.convert(b, "s32")))
+
+    def bitop(self, op: str, a: Value, b: Value) -> Value:
+        """``&``, ``|`` or ``^`` on integers."""
+        fold = {"&": lambda x, y: x & y, "|": lambda x, y: x | y, "^": lambda x, y: x ^ y}[op]
+        if a.const is not None and b.const is not None:
+            return self.int_const(fold(a.const, b.const))
+        if b.const is None and a.const is not None:
+            a, b = b, a
+        if op == "&" and a.nonneg and b.const is not None and _is_pow2(b.const + 1) and a.hi <= b.const:
+            return a  # the mask keeps every bit the value can have
+        if op != "&" and b.const == 0:
+            return a
+        a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
+        lo = hi = None
+        if a.nonneg and b.nonneg:
+            top = (1 << max(a.hi, b.hi).bit_length()) - 1
+            lo, hi = 0, (min(a.hi, b.hi) if op == "&" else top)
+        name = {"&": "and", "|": "or", "^": "xor"}[op]
+        return self.pure(f"{name}.b{t[1:]}", t, (a, b), lo, hi, commutative=True)
+
+    def imin(self, a: Value, b: Value) -> Value:
+        if a.hi <= b.lo:
+            return a
+        if b.hi <= a.lo:
+            return b
+        a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
+        return self.pure(f"min.{t}", t, (a, b), min(a.lo, b.lo), min(a.hi, b.hi), commutative=True)
+
+    def imax(self, a: Value, b: Value) -> Value:
+        if a.lo >= b.hi:
+            return a
+        if b.lo >= a.hi:
+            return b
+        a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
+        return self.pure(f"max.{t}", t, (a, b), max(a.lo, b.lo), max(a.hi, b.hi), commutative=True)
+
+    def icmp(self, op: str, a: Value, b: Value) -> Value:
+        """Integer comparison -> predicate, decided statically when ranges allow."""
+        decided = _decide(op, a.lo, a.hi, b.lo, b.hi)
+        if decided is not None:
+            return self.pred_const(decided)
+        a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
+        return self.pure(f"setp.{_CMP[op]}.{t}", "pred", (a, b))
+
+    # -- predicates ---------------------------------------------------------------
+
+    def pnot(self, p: Value) -> Value:
+        if p.const is not None:
+            return self.pred_const(not p.const)
+        return self.pure("not.pred", "pred", (p,))
+
+    def pand(self, a: Value, b: Value) -> Value:
+        for x, y in ((a, b), (b, a)):
+            if x.const is not None:
+                return y if x.const else self.pred_const(False)
+        return self.pure("and.pred", "pred", (a, b), commutative=True)
+
+    def por(self, a: Value, b: Value) -> Value:
+        for x, y in ((a, b), (b, a)):
+            if x.const is not None:
+                return self.pred_const(True) if x.const else y
+        return self.pure("or.pred", "pred", (a, b), commutative=True)
+
+    def select(self, p: Value, a: Value, b: Value) -> Value:
+        """``p ? a : b``. Integer operands share a width, floats a precision."""
+        if p.const is not None:
+            return a if p.const else b
+        if a.key() is not None and a.key() == b.key():
+            return a
+        if a.is_int and b.is_int:
+            a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
+            lo, hi = min(a.lo, b.lo), max(a.hi, b.hi)
+        else:
+            t = a.type if a.type == b.type else "f32"
+            a, b, lo, hi = self.convert(a, t), self.convert(b, t), None, None
+        return self.pure(f"selp.{_mov_type(t)}", t, (a, b, p), lo, hi)
+
+    # -- float arithmetic (IEEE, round to nearest) ------------------------------
+
+    def fbin(self, op: str, a: Value, b: Value) -> Value:
+        """``+ - * /`` on f32, folded when both operands are constants."""
+        a, b = self.convert(a, "f32"), self.convert(b, "f32")
+        if a.const is not None and b.const is not None:
+            x, y = np.float32(a.const), np.float32(b.const)
+            with np.errstate(all="ignore"):
+                r = {"+": x + y, "-": x - y, "*": x * y, "/": x / y}[op]
+            return self.f32_const(float(r))
+        name = {"+": "add.rn", "-": "sub.rn", "*": "mul.rn", "/": "div.rn"}[op]
+        return self.pure(f"{name}.f32", "f32", (a, b), commutative=op in "+*")
+
+    def fma(self, a: Value, b: Value, c: Value) -> Value:
+        return self.pure("fma.rn.f32", "f32", tuple(self.convert(x, "f32") for x in (a, b, c)))
+
+    def fop(self, op: str, *args, type_: str = "f32") -> Value:
+        """Any other pure instruction, e.g. ``fop("sqrt.rn.f32", x)``."""
+        return self.pure(op, type_, args)
+
+    def bits(self, x: Value) -> Value:
+        """The IEEE bit pattern of an f32 as an int."""
+        return self.pure("mov.b32", "s32", (self.convert(x, "f32"),))
+
+    def from_bits(self, i: Value) -> Value:
+        """Reinterpret an int's bits as an f32."""
+        if i.const is not None:
+            return self.f32_const(float(np.array([i.const & 0xFFFFFFFF], np.uint32).view(np.float32)[0]))
+        return self.pure("mov.b32", "f32", (i,))
+
+    def fcmp(self, op: str, a: Value, b: Value) -> Value:
+        """C float comparison -> predicate (ordered, except ``!=``)."""
+        a, b = self.convert(a, "f32"), self.convert(b, "f32")
+        if a.const is not None and b.const is not None:
+            x, y = a.const, b.const
+            return self.pred_const({"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y, "==": x == y, "!=": x != y}[op])
+        code = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "neu"}[op]
+        return self.pure(f"setp.{code}.f32", "pred", (a, b))
+
+    # -- control flow ---------------------------------------------------------------
+
+    def label(self, hint: str = "L") -> str:
+        return self.k.label(hint)
+
+    def place(self, label: str) -> None:
+        self.k.emit(Label(label))
+
+    def branch(self, label: str, when: Value | None = None, negate: bool = False) -> None:
+        """``bra label``, optionally predicated on ``when`` (or its negation)."""
+        self.emit("bra", LabelRef(label), guard=when, negate=negate)
+
+
+_CMP = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "ne"}
+
+
+def _decide(op, alo, ahi, blo, bhi):
+    """Statically decide ``a op b`` from ranges, or ``None``."""
+    if None in (alo, ahi, blo, bhi):
+        return None
+    if op == "<":
+        return True if ahi < blo else False if alo >= bhi else None
+    if op == "<=":
+        return True if ahi <= blo else False if alo > bhi else None
+    if op == ">":
+        return True if alo > bhi else False if ahi <= blo else None
+    if op == ">=":
+        return True if alo >= bhi else False if ahi < blo else None
+    if op == "==":
+        if alo == ahi == blo == bhi:
+            return True
+        return False if ahi < blo or bhi < alo else None
+    if op == "!=":
+        d = _decide("==", alo, ahi, blo, bhi)
+        return None if d is None else not d
+    return None
+
+
+def _mov_type(t: str) -> str:
+    return {"s32": "b32", "s64": "b64", "f16": "b16"}.get(t, t)
+
+
+def _float_rank(t: str) -> int:
+    return {"f16": 0, "f32": 1, "f64": 2}[t]
+
+
+def eliminate_dead_code(kernel: Kernel) -> None:
+    """Delete pure instructions whose results are never read, to a fixpoint.
+
+    Flow-insensitive and therefore safe for registers written more than once:
+    an instruction goes only if *no* instruction anywhere reads what it writes.
+    """
+    while True:
+        used = {r.name for item in kernel.body if isinstance(item, Instr) for r in item.uses()}
+        keep = [
+            item
+            for item in kernel.body
+            if not isinstance(item, Instr) or item.effect or not item.defs() or any(r.name in used for r in item.defs())
+        ]
+        if len(keep) == len(kernel.body):
+            return
+        kernel.body[:] = keep
