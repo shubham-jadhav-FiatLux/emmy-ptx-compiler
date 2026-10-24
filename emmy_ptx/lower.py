@@ -375,15 +375,9 @@ class Lowerer:
             if not left.terms:
                 return right.scaled(left.const)
         v = self.expr(e)
-        if v.const is not None:
-            return Affine(const=int(v.const))
         if not v.is_int:
             raise LoweringError(f"non-integer index expression {e!r}")
-        key = v.key()
-        if key is None:  # a mutable register: its own term, never merged
-            self._uniq += 1
-            key = ("var", self._uniq)
-        return Affine({key: [v, 1]})
+        return self._as_affine(v)
 
     def materialize(self, aff: Affine, with_const: bool = True) -> Value:
         b = self.b
@@ -873,10 +867,16 @@ class Lowerer:
         self.b.emit(f"st.shared.{_ldst(buf.type)}", self.address(buf, flat=self._as_affine(index)), v)
 
     def _as_affine(self, v: Value) -> Affine:
+        """An integer value as an affine form, looking through ``base + c``
+        definitions so the constant can become an address immediate."""
         if v.const is not None:
             return Affine(const=int(v.const))
+        offset = self.b.offset_of(v)
+        if offset is not None:
+            base, c = offset
+            return self._as_affine(base).plus(Affine(const=c))
         key = v.key()
-        if key is None:
+        if key is None:  # a mutable register: its own term, never merged
             self._uniq += 1
             key = ("var", self._uniq)
         return Affine({key: [v, 1]})

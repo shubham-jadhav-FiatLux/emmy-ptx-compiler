@@ -138,6 +138,7 @@ class Builder:
         self._loops: list[_Loop] = []
         self._level: dict[str, int] = {}  # register -> loop depth of its definition
         self._guards = 0
+        self._offsets: dict = {}  # value key -> (base value, constant): value = base + constant
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -368,7 +369,9 @@ class Builder:
             return a
         lo, hi = a.lo + b.lo, a.hi + b.hi
         a, b, t = self._widen(a, b, lo, hi)
-        return self.pure(f"add.{t}", t, (a, b), lo, hi, commutative=True)
+        v = self.pure(f"add.{t}", t, (a, b), lo, hi, commutative=True)
+        self._note_offset(v, a, b, 1)
+        return v
 
     def sub(self, a: Value, b: Value) -> Value:
         if a.const is not None and b.const is not None:
@@ -379,7 +382,24 @@ class Builder:
             return self.int_const(0)
         lo, hi = a.lo - b.hi, a.hi - b.lo
         a, b, t = self._widen(a, b, lo, hi)
-        return self.pure(f"sub.{t}", t, (a, b), lo, hi)
+        v = self.pure(f"sub.{t}", t, (a, b), lo, hi)
+        if b.const is not None:
+            self._note_offset(v, a, b, -1)
+        return v
+
+    def _note_offset(self, v: Value, a: Value, b: Value, sign: int) -> None:
+        """Remember ``v = base + constant`` so addresses can fold the constant
+        into an instruction's immediate offset (see ``offset_of``)."""
+        if v.key() is None:
+            return
+        for base, c in ((a, b), (b, a)):
+            if c.const is not None and base.const is None and base.key() is not None:
+                self._offsets[v.key()] = (base, sign * int(c.const) if c is b else int(c.const))
+                return
+
+    def offset_of(self, v: Value):
+        """``(base, c)`` when ``v`` was built as ``base + c``, else ``None``."""
+        return self._offsets.get(v.key()) if v.key() is not None else None
 
     def mul(self, a: Value, b: Value) -> Value:
         if a.const is not None and b.const is not None:
