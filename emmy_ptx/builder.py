@@ -20,11 +20,12 @@ multiply and an add into one FMA, so results match numpy bit for bit.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
-from .ptx import Imm, Instr, Kernel, Label, LabelRef, Mem, Reg, Vec
+from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg
 
 INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
 
@@ -114,12 +115,29 @@ def _operand_key(x):
     return ("raw", str(x))
 
 
+@dataclass
+class _Loop:
+    """An open loop: where its invariant instructions go, and how many may."""
+
+    preheader: list  # instruction list spliced in just before the loop's first trip
+    table: int  # index of the value-numbering table live at the preheader
+    guards: int  # conditional nesting depth when the loop opened
+    budget: int  # instructions this preheader may still receive (register pressure)
+
+
 class Builder:
     """Emits instructions into a :class:`~emmy_ptx.ptx.Kernel` (see module doc)."""
+
+    # Per loop, at most this many invariant instructions are hoisted into its
+    # preheader: each hoisted value occupies a register for the whole loop.
+    HOIST_BUDGET = 96
 
     def __init__(self, kernel: Kernel):
         self.k = kernel
         self._tables: list[dict] = [{}]
+        self._loops: list[_Loop] = []
+        self._level: dict[str, int] = {}  # register -> loop depth of its definition
+        self._guards = 0
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -132,10 +150,61 @@ class Builder:
         finally:
             self._tables.pop()
 
+    @contextlib.contextmanager
+    def loop(self):
+        """The body of a rolled loop (open it after the zero-trip check).
+
+        Loop-invariant code motion: a pure instruction whose operands were all
+        defined before an enclosing loop is emitted once, in that loop's
+        preheader, instead of once per trip. Loads qualify only from read-only
+        memory and only when no branch inside the loop guards them, so a
+        hoisted load never runs where the original would not have.
+
+        The preheader follows the zero-trip check, so it dominates the loop
+        body but not the code after the loop: hoisted values are numbered in
+        a table of their own that closes with the loop.
+        """
+        pre = Block()
+        self.k.emit(pre)
+        self._tables.append({})
+        self._loops.append(_Loop(pre.items, len(self._tables) - 1, self._guards, self.HOIST_BUDGET))
+        try:
+            yield
+        finally:
+            self._loops.pop()
+            self._tables.pop()
+
+    @contextlib.contextmanager
+    def guarded(self):
+        """Code that only runs under a condition (a branch body)."""
+        self._guards += 1
+        try:
+            yield
+        finally:
+            self._guards -= 1
+
     def _lookup(self, key):
         for table in reversed(self._tables):
             if key in table:
                 return table[key]
+        return None
+
+    def _depth_of(self, x) -> int:
+        """Loop depth at which operand ``x`` becomes available."""
+        if isinstance(x, Value):
+            if x.mutable:
+                return len(self._loops)
+            x = x.op
+        if isinstance(x, Mem):
+            x = x.base
+        return self._level.get(x.name, 0) if isinstance(x, Reg) else 0
+
+    def _hoist_target(self, op: str, args: tuple) -> _Loop | None:
+        """The outermost open loop whose preheader can hold this instruction."""
+        depth = max((self._depth_of(a) for a in args), default=0)
+        for frame in self._loops[depth:]:
+            if frame.budget > 0 and (not op.startswith("ld.") or frame.guards == self._guards):
+                return frame
         return None
 
     def pure(self, op: str, type_: str, args: tuple, lo=None, hi=None, commutative=False) -> Value:
@@ -153,12 +222,22 @@ class Builder:
             if hit is not None:
                 return hit
         reg = self.k.reg(type_)
-        self.k.emit(Instr(op, (reg, *(a.op if isinstance(a, Value) else a for a in args))))
+        instr = Instr(op, (reg, *(a.op if isinstance(a, Value) else a for a in args)))
+        target = self._hoist_target(op, args)
+        if target is not None:
+            target.preheader.append(instr)
+            target.budget -= 1
+            self._level[reg.name] = self._loops.index(target)
+            table = self._tables[target.table]
+        else:
+            self.k.emit(instr)
+            self._level[reg.name] = len(self._loops)
+            table = self._tables[-1]
         if type_ in INT_RANGE and lo is None:
             lo, hi = INT_RANGE[type_]
         v = Value(type_, reg, lo, hi)
         if key is not None:
-            self._tables[-1][key] = v
+            table[key] = v
         return v
 
     def emit(self, op: str, *args, ndefs: int = 0, effect: bool = True, guard: Value | None = None, negate=False):
@@ -171,7 +250,10 @@ class Builder:
             else:
                 g = guard.op
         ops = tuple(a.op if isinstance(a, Value) else a for a in args)
-        self.k.emit(Instr(op, ops, ndefs=ndefs, effect=effect, guard=g, negate=negate))
+        instr = Instr(op, ops, ndefs=ndefs, effect=effect, guard=g, negate=negate)
+        for r in instr.defs():
+            self._level[r.name] = len(self._loops)
+        self.k.emit(instr)
 
     # -- constants and registers ------------------------------------------------
 
@@ -210,6 +292,7 @@ class Builder:
 
     def variable(self, type_: str, init: Value | None = None, lo=None, hi=None) -> Variable:
         var = Variable(self.k.reg(type_), type_, lo, hi)
+        self._level[var.reg.name] = 1 << 30  # reassigned: invariant in no loop
         if init is not None:
             self.assign(var, init)
         return var
@@ -449,6 +532,11 @@ class Builder:
             with np.errstate(all="ignore"):
                 r = {"+": x + y, "-": x - y, "*": x * y, "/": x / y}[op]
             return self.f32_const(float(r))
+        # identities exact for every x, NaN and -0 included (x + 0 is not: -0 + 0 = +0)
+        if (op == "*" and b.const == 1.0) or (op == "/" and b.const == 1.0) or (op == "-" and _is_plus_zero(b)):
+            return a
+        if op == "*" and a.const == 1.0:
+            return b
         name = {"+": "add.rn", "-": "sub.rn", "*": "mul.rn", "/": "div.rn"}[op]
         return self.pure(f"{name}.f32", "f32", (a, b), commutative=op in "+*")
 
@@ -514,6 +602,10 @@ def _decide(op, alo, ahi, blo, bhi):
         d = _decide("==", alo, ahi, blo, bhi)
         return None if d is None else not d
     return None
+
+
+def _is_plus_zero(v: Value) -> bool:
+    return v.const is not None and v.const == 0.0 and math.copysign(1.0, v.const) > 0
 
 
 def _mov_type(t: str) -> str:

@@ -52,7 +52,10 @@ STATIC_SMEM_LIMIT = 48 * 1024
 # many statements: past it the PTX grows faster than ptxas can schedule it.
 UNROLL_BUDGET = 4096
 # Loops this short are unrolled completely even when the IR does not ask.
-AUTO_UNROLL_TRIPS = 16
+AUTO_UNROLL_TRIPS = 64
+# Streaming multiprocessors of the evaluation GPU (RTX 5090). Only a scheduling
+# hint depends on it; the generated code is correct on any GPU.
+TARGET_SMS = 170
 
 # identities of the reduction combines (emmy's ElementwiseImpl table)
 IDENTITY = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "minimum": 1e30}
@@ -120,7 +123,13 @@ class LoweringError(Exception):
 class Lowerer:
     def __init__(self, src: KernelSource):
         self.src = src
-        self.kernel = Kernel(src.name, tuple(_param_name(p) for p in src.params), maxntid=src.launch.block)
+        # A grid that fits in one wave puts at most one CTA on each SM, so extra
+        # registers per thread cannot cost occupancy: let ptxas spend them on
+        # keeping more loads in flight (it otherwise caps registers to leave room
+        # for CTAs that never come). Bigger grids keep ptxas's own balance.
+        one_wave = src.launch.grid <= TARGET_SMS
+        self.kernel = Kernel(src.name, tuple(_param_name(p) for p in src.params), maxntid=src.launch.block,
+                             minnctapersm=1 if one_wave else None)
         self.b = Builder(self.kernel)
         self.scope = Scope()
         self.mutable = _reassigned_names(src.body)
@@ -134,6 +143,7 @@ class Lowerer:
     def run(self) -> Kernel:
         self.body(self.src.body)
         self.b.emit("ret")
+        self.kernel.flatten()
         eliminate_dead_code(self.kernel)
         return self.kernel
 
@@ -145,16 +155,18 @@ class Lowerer:
             handler(s)
 
     @contextlib.contextmanager
-    def block(self, dominated: bool = False):
+    def block(self, dominated: bool = False, guarded: bool = False):
         """A C block: a new name scope, and unless ``dominated`` (straight-line
-        code such as an unrolled iteration) a new value-numbering scope."""
+        code such as an unrolled iteration) a new value-numbering scope.
+        ``guarded`` marks a branch body (its loads must stay where they are)."""
         self.scope = Scope(self.scope)
         try:
-            if dominated:
+            with contextlib.ExitStack() as stack:
+                if not dominated:
+                    stack.enter_context(self.b.cse_scope())
+                if guarded:
+                    stack.enter_context(self.b.guarded())
                 yield
-            else:
-                with self.b.cse_scope():
-                    yield
         finally:
             self.scope = self.scope.parent
 
@@ -441,8 +453,8 @@ class Lowerer:
         done = b.label("tile_end")
         if needs_guard:
             b.branch(done, b.icmp(">=", gid, b.int_const(n)))
-            gid = Value(gid.type, gid.op, gid.lo, min(gid.hi, n - 1)) if gid.const is None else gid
-        with self.block():
+            gid = b.assume(gid, gid.lo, n - 1)  # inside the guard
+        with self.block(guarded=needs_guard):
             for name, v in zip((a.name for a in s.axes), self._decode(s, gid, extents)):
                 self.scope.names[name] = v
             self.body(s.body)
@@ -475,8 +487,7 @@ class Lowerer:
             size = b.imin(b.int_const(g), b.sub(b.int_const(ea), b.mul(grp, b.int_const(g))))
             a = b.add(b.mul(grp, b.int_const(g)), b.rem(b.rem(sub, gsize), size))
             o = b.div(b.rem(sub, gsize), size)
-        coords[gi] = Value(a.type, a.op, 0, ea - 1) if a.const is None else a
-        coords[oi] = Value(o.type, o.op, 0, eb - 1) if o.const is None else o
+        coords[gi], coords[oi] = b.assume(a, 0, ea - 1), b.assume(o, 0, eb - 1)
         return coords
 
     def stmt_Loop(self, s) -> None:
@@ -545,20 +556,24 @@ class Lowerer:
             if first.const is not False:
                 if first.const is None:
                     b.branch(rest, first, negate=True)
-                b.place(top)
-                with self.block():
-                    base = Value(type_, counter.reg, start.lo, body_hi, mutable=True)
-                    for k in range(factor):
-                        v = b.add(base, b.int_const(k * step.const))
-                        self._guarded_iteration(name, v, s.body, end, guard=False)
-                nxt = b.add(Value(type_, counter.reg, start.lo, body_hi, mutable=True), b.int_const(factor * step.const))
-                b.assign(counter, nxt)
-                b.branch(top, b.icmp("<", nxt, limit))
+                with b.loop():
+                    b.place(top)
+                    with self.block():
+                        # within one trip the counter is constant: let its uses be value-numbered
+                        # (the body's table closes before the latch; the counter is never hoisted)
+                        base = Value(type_, counter.reg, start.lo, body_hi)
+                        for k in range(factor):
+                            v = b.add(base, b.int_const(k * step.const))
+                            self._guarded_iteration(name, v, s.body, end, guard=False)
+                    nxt = b.add(Value(type_, counter.reg, start.lo, body_hi, mutable=True), b.int_const(factor * step.const))
+                    b.assign(counter, nxt)
+                    b.branch(top, b.icmp("<", nxt, limit))
                 b.place(rest)
             if exact:  # the leftover is the same for every thread: straight-line code
-                cur = Value(type_, counter.reg, start.lo, end.hi, mutable=True)
-                for k in range(trips[0] % factor):
-                    self._guarded_iteration(name, b.add(cur, b.int_const(k * step.const)), s.body, end, guard=False)
+                cur = Value(type_, counter.reg, start.lo, end.hi)
+                with b.cse_scope():
+                    for k in range(trips[0] % factor):
+                        self._guarded_iteration(name, b.add(cur, b.int_const(k * step.const)), s.body, end, guard=False)
                 return
         # one iteration per trip (also the leftover of a partially unrolled loop)
         hi = end.hi - 1 if end.hi is not None else None
@@ -570,13 +585,14 @@ class Lowerer:
         top, done = b.label("loop"), b.label("loop_end")
         if first.const is None:
             b.branch(done, first, negate=True)
-        b.place(top)
-        with self.block():
-            self.scope.names[name] = Value(type_, counter.reg, start.lo, hi, mutable=True)
-            self.body(s.body)
-        nxt = b.add(Value(type_, counter.reg, start.lo, hi, mutable=True), step)
-        b.assign(counter, nxt)
-        b.branch(top, b.icmp("<", nxt, end))
+        with b.loop():
+            b.place(top)
+            with self.block():
+                self.scope.names[name] = Value(type_, counter.reg, start.lo, hi)  # constant within a trip
+                self.body(s.body)
+            nxt = b.add(Value(type_, counter.reg, start.lo, hi, mutable=True), step)
+            b.assign(counter, nxt)
+            b.branch(top, b.icmp("<", nxt, end))
         b.place(done)
 
     def _guarded_iteration(self, name: str, v: Value, stmts, end: Value, guard: bool) -> None:
@@ -587,14 +603,14 @@ class Lowerer:
         b = self.b
         skip = b.label("trip_skip")
         b.branch(skip, b.icmp("<", v, end), negate=True)
-        with b.cse_scope():
+        with b.guarded(), b.cse_scope():
             self._iteration(name, v, stmts, end)
         b.place(skip)
 
     def _iteration(self, name: str, v: Value, stmts, end: Value) -> None:
         with self.block(dominated=True):
-            if v.const is None and end.hi is not None:
-                v = Value(v.type, v.op, v.lo, min(v.hi, end.hi - 1))
+            if end.hi is not None:
+                v = self.b.assume(v, v.lo, end.hi - 1)  # inside the body, v < end
             self.scope.names[name] = v
             self.body(stmts)
 
@@ -607,13 +623,13 @@ class Lowerer:
             return
         other = b.label("else" if s.else_body else "endif")
         b.branch(other, p, negate=True)
-        with self.block():
+        with self.block(guarded=True):
             self.body(s.body)
         if s.else_body:
             done = b.label("endif")
             b.branch(done)
             b.place(other)
-            with self.block():
+            with self.block(guarded=True):
                 self.body(s.else_body)
             b.place(done)
         else:
@@ -637,7 +653,8 @@ class Lowerer:
         op = s.op.name
         dtype = s.dtype.name if s.dtype is not None else elementwise.promote(op, [_dtype_of(a) for a in args])
         v = elementwise.apply(self.b, op, args, dtype)
-        if op == "multiply" and v.type == "f32" and v.key() is not None and all(a.type == "f32" for a in args):
+        if (op == "multiply" and v.type == "f32" and v.const is None and all(a.type == "f32" for a in args)
+                and v.key() not in [a.key() for a in args]):  # a real product (x * 1 folds away)
             self.products[v.key()] = (args[0], args[1])  # an Accum may fuse it into an FMA
         self.define(s.name, v)
 
@@ -649,10 +666,14 @@ class Lowerer:
         base = self.value(s.base) if s.base is not None else acc.read()
         canon = REDUCE_CANON.get(s.op.name, "add")  # emmy folds unknown combines additively
         value = self.value(s.value)
-        factors = self.products.get(value.key()) if value.key() is not None else None
-        if canon == "add" and factors is not None and acc.type == "f32":
-            new = b.fma(factors[0], factors[1], base)  # contract the dot-product step
-        else:
+        new = None
+        if canon == "add" and acc.type == "f32":  # contract a product into the fold: one FMA
+            for product, addend in ((value, base), (base, value)):
+                factors = self.products.get(product.key()) if product.key() is not None else None
+                if factors is not None and addend.type == "f32":
+                    new = b.fma(factors[0], factors[1], addend)
+                    break
+        if new is None:
             new = elementwise.apply(b, canon, [base, b.convert(value, acc.type)], _dtype_name(acc.type))
         b.assign(acc, new)
 
@@ -808,7 +829,7 @@ class Lowerer:
         while half > 0:
             skip = b.label("tree_skip")
             b.branch(skip, b.icmp("<", t, b.int_const(half)), negate=True)
-            with self.block():
+            with self.block(guarded=True):
                 if s.inner is not None:
                     iv, scale = self.value(s.inner[0]), b.int_const(int(s.inner[1]))
                     slot = b.add(b.mul(t, scale), iv)

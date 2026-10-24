@@ -193,7 +193,7 @@ def _reduce_half_pi(b: Builder, x: Value):
     r_var, k_var = b.variable("f32", r), b.variable("s32", k)
     fast = b.label("trig_fast")
     b.branch(fast, b.fcmp(">", b.fop("abs.f32", b.in_reg(x)), _c(b, TRIG_FAST_LIMIT)), negate=True)
-    with b.cse_scope():
+    with b.guarded(), b.cse_scope():
         xd = b.convert(x, "f64")
         kd = b.fop("cvt.rni.f64.f64", b.fop("mul.rn.f64", xd, _f64(b, TWO_OVER_PI), type_="f64"), type_="f64")
         nkd = b.fop("neg.f64", kd, type_="f64")
