@@ -357,8 +357,9 @@ class Builder:
     def shr(self, a: Value, b: Value) -> Value:
         if a.const is not None and b.const is not None:
             return self.int_const(a.const >> b.const)
-        if b.const is not None and a.nonneg:
-            return self.pure(f"shr.u{a.type[1:]}", a.type, (a, Imm(b.const, "u32")), a.lo >> b.const, a.hi >> b.const)
+        if b.const is not None:
+            sign = "u" if a.nonneg else "s"  # arithmetic shift == floor division, like Python's >>
+            return self.pure(f"shr.{sign}{a.type[1:]}", a.type, (a, Imm(b.const, "u32")), a.lo >> b.const, a.hi >> b.const)
         return self.pure(f"shr.{a.type}", a.type, (a, self.convert(b, "s32")))
 
     def bitop(self, op: str, a: Value, b: Value) -> Value:
@@ -374,9 +375,10 @@ class Builder:
             return a
         a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
         lo = hi = None
-        if a.nonneg and b.nonneg:
-            top = (1 << max(a.hi, b.hi).bit_length()) - 1
-            lo, hi = 0, (min(a.hi, b.hi) if op == "&" else top)
+        if op == "&" and (a.nonneg or b.nonneg):  # x & m lies in [0, m] for m >= 0
+            lo, hi = 0, min(v.hi for v in (a, b) if v.nonneg)
+        elif a.nonneg and b.nonneg:
+            lo, hi = 0, (1 << max(a.hi, b.hi).bit_length()) - 1
         name = {"&": "and", "|": "or", "^": "xor"}[op]
         return self.pure(f"{name}.b{t[1:]}", t, (a, b), lo, hi, commutative=True)
 
