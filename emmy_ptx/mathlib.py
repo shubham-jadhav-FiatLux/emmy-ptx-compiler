@@ -157,7 +157,7 @@ def tanh(b: Builder, x: Value) -> Value:
         return folded
     a = b.fop("abs.f32", b.in_reg(x))
     x2 = b.fbin("*", x, x)
-    small = b.fma(b.fbin("*", x, x2), horner(b, TANH, x2), x)
+    small = b.fop("copysign.f32", x, b.fma(b.fbin("*", x, x2), horner(b, TANH, x2), x))  # tanh(-0) = -0
     e = exp(b, b.fbin("+", a, a))
     big = b.fbin("-", _c(b, 1.0), b.fbin("*", _c(b, 2.0), b.fop("rcp.rn.f32", b.fbin("+", e, _c(b, 1.0)))))
     big = b.fop("copysign.f32", x, big)

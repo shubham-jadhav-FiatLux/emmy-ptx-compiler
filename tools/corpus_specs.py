@@ -205,3 +205,119 @@ OPEN = [
     attn("512x64", 512, 512, 64, 8.0),
     attn("odd", 100, 100, 48, 6.928203),
 ]
+
+# ---- round 2: chains of kernels, large sizes, more op mixes ---------------------------------
+OPEN += [
+    # several kernels per problem (intermediates chained by the runner)
+    dict(id="k_mlp", code="x = torch.randn(64, 128); w1 = torch.randn(128, 256); w2 = torch.randn(256, 64); "
+                          "torch.relu(x @ w1) @ w2",
+         ref=_c(lambda x, w1, w2: np.maximum(x @ w1, 0) @ w2), rtol=1e-3, atol=1e-3),
+    dict(id="k_mm_softmax", code="x = torch.randn(128, 256); w = torch.randn(256, 512); torch.softmax(x @ w, dim=-1)",
+         ref=_c(lambda x, w: _softmax(x @ w)), rtol=1e-3, atol=1e-5),
+    dict(id="k_mm_rowsum", code="x = torch.randn(64, 512); w = torch.randn(512, 256); (x @ w).sum(-1)",
+         ref=_c(lambda x, w: (x @ w).sum(-1)), rtol=1e-3, atol=1e-3),
+    dict(id="k_center_global", code="x = torch.randn(65536); x - x.mean()",
+         ref=_c(lambda x: x - x.mean()), rtol=1e-4, atol=1e-4),
+    dict(id="k_center_global_coop", code="x = torch.randn(8192); x - x.mean()",
+         ref=_c(lambda x: x - x.mean()), rtol=1e-4, atol=1e-4, knobs=REDUCE_KNOBS),
+    dict(id="k_div_total", code="x = torch.randn(4096); x / (x * x).sum()",
+         ref=_c(lambda x: x / (x * x).sum()), rtol=1e-4, atol=1e-6),
+    dict(id="k_ln_mm", code="x = torch.randn(64, 256); w = torch.randn(256, 128); "
+                            "torch.nn.functional.layer_norm(x, (256,)) @ w",
+         ref=_c(lambda x, w: ((x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + 1e-5)) @ w),
+         rtol=1e-3, atol=1e-3),
+    dict(id="k_gelu_mlp", code="x = torch.randn(32, 128); w1 = torch.randn(128, 512); w2 = torch.randn(512, 128); "
+                               "torch.nn.functional.gelu(x @ w1) @ w2",
+         ref=_c(lambda x, w1, w2: (0.5 * (x @ w1) * (1.0 + _erf((x @ w1) / np.sqrt(2.0)))) @ w2), rtol=1e-3, atol=1e-3),
+    dict(id="k_softmax_then_mm", code="x = torch.randn(128, 256); w = torch.randn(256, 64); torch.softmax(x, dim=-1) @ w",
+         ref=_c(lambda x, w: _softmax(x) @ w), rtol=1e-3, atol=1e-4),
+
+    # large sizes
+    pw("big_2m", "torch.randn(2048, 1024) * torch.randn(2048, 1024)", _e(lambda a, b: a * b), 0, 0),
+    red("sum_1m", "torch.randn(1048576).sum()", _c(lambda x: x.sum()), 1e-3, 1e-3),
+    red("rows_big", "torch.randn(1024, 4096).sum(-1)", _c(lambda x: x.sum(-1)), 1e-4, 1e-3),
+    mm("2048", 2048, 2048, 2048),
+    dict(id="f_softmax_big", code="torch.softmax(torch.randn(1024, 4096), dim=-1)",
+         ref=_c(_softmax), rtol=1e-3, atol=1e-5),
+    attn("1024x64", 1024, 1024, 64, 8.0),
+
+    # pointwise mixes
+    pw("expm1", "torch.exp(torch.randn(4096)) - 1.0", lambda x: [(np.exp(x.astype(f64)).astype(f32) - f32(1.0))], 1e-6, 1e-6),
+    pw("mish", "x = torch.randn(4096); x * torch.tanh(torch.nn.functional.softplus(x))",
+       _c(lambda x: x * np.tanh(np.log1p(np.exp(x))))),
+    pw("hypot", "x = torch.randn(4096); y = torch.randn(4096); torch.sqrt(x * x + y * y)",
+       _e(lambda x, y: np.sqrt(x * x + y * y)), 0, 0),
+    pw("absdiff", "x = torch.randn(4096); y = torch.randn(4096); torch.where(x > y, x - y, y - x)",
+       _e(lambda x, y: np.where(x > y, x - y, y - x)), 0, 0),
+    pw("relu_sq", "torch.relu(torch.randn(4096)) ** 2", _e(lambda x: np.maximum(x, 0) * np.maximum(x, 0)), 1e-6, 1e-6),
+    pw("sincos", "x = torch.randn(4096); y = torch.randn(4096); torch.cos(x) * torch.sin(y)",
+       _c(lambda x, y: np.cos(x) * np.sin(y))),
+    pw("exp_sin", "torch.exp(torch.sin(torch.randn(4096)))", _c(lambda x: np.exp(np.sin(x)))),
+    pw("manual_sigmoid", "x = torch.randn(4096); 1.0 / (1.0 + torch.exp(-x))", _c(lambda x: 1.0 / (1.0 + np.exp(-x)))),
+    pw("dsigmoid", "x = torch.randn(4096); torch.sigmoid(x) * (1.0 - torch.sigmoid(x))",
+       _c(lambda x: 1.0 / (1.0 + np.exp(-x)) * (1.0 - 1.0 / (1.0 + np.exp(-x))))),
+    pw("log2", "torch.log2(torch.abs(torch.randn(4096)) + 0.5)", _c(lambda x: np.log2(np.abs(x) + 0.5))),
+    pw("exp2", "torch.exp2(torch.randn(4096))", _c(np.exp2)),
+    pw("floor", "torch.floor(torch.randn(4096) * 4.0)", _e(lambda x: np.floor(x * f32(4.0))), 0, 0),
+    pw("sign", "torch.sign(torch.randn(4096))", _e(np.sign), 0, 0),
+    pw("bcast_3d", "x = torch.randn(8, 16, 32); y = torch.randn(16, 1); x * y + 1.0",
+       _e(lambda x, y: x * y + f32(1.0)), 1e-6, 1e-6),
+    pw("scale_shift_2d", "torch.randn(300, 7) * 0.5 + 0.25", _e(lambda x: x * f32(0.5) + f32(0.25)), 0, 0),
+
+    # reductions
+    red("cols_mean", "torch.randn(64, 512).mean(0)", _c(lambda x: x.mean(0))),
+    red("mid_axis", "torch.randn(32, 64, 16).sum(1)", _c(lambda x: x.sum(1))),
+    red("prod", "torch.prod(torch.randn(256) * 0.01 + 1.0)", lambda x: [np.prod((x * f32(0.01) + f32(1.0)).astype(f64)).astype(f32)]),
+    red("var", "torch.var(torch.randn(64, 512), -1)", _c(lambda x: x.var(-1, ddof=1)), 1e-3, 1e-4),
+    red("std", "torch.std(torch.randn(64, 512), -1)", _c(lambda x: x.std(-1, ddof=1)), 1e-3, 1e-4),
+    red("norm", "torch.norm(torch.randn(64, 512), dim=-1)", _c(lambda x: np.sqrt((x * x).sum(-1))), 1e-3, 1e-4),
+    red("logsumexp", "torch.logsumexp(torch.randn(64, 512), -1)",
+        _c(lambda x: np.log(np.exp(x - x.max(-1, keepdims=True)).sum(-1)) + x.max(-1)), 1e-3, 1e-4),
+    red("short_rows", "torch.randn(1000, 10).sum(-1)", _c(lambda x: x.sum(-1))),
+    red("long_rows", "torch.randn(10, 10000).sum(-1)", _c(lambda x: x.sum(-1)), 1e-3, 1e-3),
+    red("rowdot", "x = torch.randn(128, 256); y = torch.randn(128, 256); (x * y).sum(-1)", _c(lambda x, y: (x * y).sum(-1))),
+    red("absmax", "torch.randn(64, 777).abs().amax(-1)", _c(lambda x: np.abs(x).max(-1))),
+    red("cols_max", "torch.randn(500, 64).amax(0)", _c(lambda x: x.max(0))),
+
+    # matmul variants
+    dict(id="m_batched_2d", code="torch.randn(4, 32, 64) @ torch.randn(64, 128)",
+         ref=_c(lambda a, b: a @ b), rtol=1e-3, atol=1e-3),
+    dict(id="m_bmm_small", code="torch.randn(8, 16, 32) @ torch.randn(8, 32, 16)",
+         ref=_c(lambda a, b: a @ b), rtol=1e-3, atol=1e-3),
+    dict(id="m_scaled", code="x = torch.randn(96, 160); w = torch.randn(160, 80); (x @ w) * 0.5",
+         ref=_c(lambda x, w: (x @ w) * 0.5), rtol=1e-3, atol=1e-3),
+    mm("48x96x80", 48, 96, 80),
+    mm("1000x100x10", 1000, 100, 10),
+    mm("7x1000x3", 7, 1000, 3),
+
+    # fused variants
+    dict(id="f_softmax_row1", code="torch.softmax(torch.randn(1, 10000), dim=-1)", ref=_c(_softmax), rtol=1e-3, atol=1e-6),
+    dict(id="f_softmax_tiny_rows", code="torch.softmax(torch.randn(10000, 8), dim=-1)", ref=_c(_softmax), rtol=1e-3, atol=1e-5),
+    dict(id="f_softmax_3d_mid", code="torch.softmax(torch.randn(8, 64, 32), dim=1)",
+         ref=_c(lambda x: _softmax(x, axis=1)), rtol=1e-3, atol=1e-5),
+    dict(id="f_layernorm_odd", code="torch.nn.functional.layer_norm(torch.randn(37, 1000), (1000,))",
+         ref=_c(lambda x: (x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + 1e-5)), rtol=1e-3, atol=1e-4),
+    dict(id="f_rms_row1", code="x = torch.randn(1, 8192); w = torch.randn(8192); "
+                                "x / torch.sqrt((x * x).mean(-1, keepdim=True) + 1e-5) * w",
+         ref=_c(lambda x, w: x / np.sqrt((x ** 2).mean(-1, keepdims=True) + 1e-5) * w), rtol=1e-3, atol=1e-4),
+    dict(id="f_normalize", code="torch.nn.functional.normalize(torch.randn(64, 300), dim=-1)",
+         ref=_c(lambda x: x / np.maximum(np.sqrt((x * x).sum(-1, keepdims=True)), 1e-12)), rtol=1e-3, atol=1e-4),
+    dict(id="f_x_softmax", code="x = torch.randn(64, 256); x * torch.softmax(x, -1)",
+         ref=_c(lambda x: x * _softmax(x)), rtol=1e-3, atol=1e-5),
+    # Not included: ((x - x.mean(-1, keepdim=True)) ** 2).mean(-1). emmy 0.3.11 split-K's the
+    # outer mean but computes the inner mean over the first half-row only, so its own nvcc
+    # reference fails too (checked with tools/ref_bench.py); our PTX reproduces that IR exactly.
+
+    # attention variants
+    attn("q64_k1024", 64, 1024, 64, 8.0),
+    attn("512x32", 512, 512, 32, 5.656854),
+    dict(id="a_batched", code="q = torch.randn(4, 64, 32); kt = torch.randn(4, 32, 64); v = torch.randn(4, 64, 32); "
+                              "torch.softmax(q @ kt / 5.656854, dim=-1) @ v",
+         ref=_c(lambda q, kt, v: _softmax((q @ kt) / 5.656854) @ v), rtol=1e-3, atol=1e-4),
+    dict(id="a_mulscale", code="q = torch.randn(128, 64); kt = torch.randn(64, 128); v = torch.randn(128, 64); "
+                               "torch.softmax((q @ kt) * 0.125, dim=-1) @ v",
+         ref=_c(lambda q, kt, v: _softmax((q @ kt) * 0.125) @ v), rtol=1e-3, atol=1e-4),
+    dict(id="a_noscale", code="q = torch.randn(64, 16); kt = torch.randn(16, 64); v = torch.randn(64, 16); "
+                              "torch.softmax(q @ kt, dim=-1) @ v",
+         ref=_c(lambda q, kt, v: _softmax(q @ kt) @ v), rtol=1e-3, atol=1e-4),
+]
