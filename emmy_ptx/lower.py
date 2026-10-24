@@ -51,6 +51,8 @@ STATIC_SMEM_LIMIT = 48 * 1024
 # Fully unroll an ``unroll`` loop only while the expanded body stays below this
 # many statements: past it the PTX grows faster than ptxas can schedule it.
 UNROLL_BUDGET = 4096
+# Loops this short are unrolled completely even when the IR does not ask.
+AUTO_UNROLL_TRIPS = 16
 
 # identities of the reduction combines (emmy's ElementwiseImpl table)
 IDENTITY = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "minimum": 1e30}
@@ -502,44 +504,92 @@ class Lowerer:
                     self.declare_var(st.name, dtype, self.b.convert(self.b.f32_const(IDENTITY[canon]), dtype))
 
     def _loop(self, s, start: Value, step: Value, end: Value, end_name: str | None = None) -> None:
+        """``for (v = start; v < end; v += step) body``.
+
+        Loops are unrolled completely when the trip count is bounded and the
+        expanded body fits the budget: always for ``unroll`` loops, and for any
+        loop of at most AUTO_UNROLL_TRIPS trips. Other loops with a constant
+        step run ``factor`` iterations per trip of a rolled loop, followed by
+        the leftover iterations. The iterations stay in their original order
+        (so accumulations round exactly as written); unrolling only lets the
+        loads of several iterations be in flight at once.
+        """
+        trips = _trip_range(start, step, end)
+        size = _body_size(s.body)
+        with self.block(dominated=True):
+            if end_name:  # the hoisted bound is visible to the body
+                self.scope.names[end_name] = end
+            if trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
+                for k in range(trips[1]):
+                    v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
+                    self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
+                return
+            factor = _unroll_factor(size) if step.const is not None else 1
+            self._rolled(s, start, step, end, trips, factor)
+
+    def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
         b = self.b
         name = s.axis.name
-        trips = _trip_range(start, step, end)
-        if s.unroll and trips is not None and trips[1] * _body_size(s.body) <= UNROLL_BUDGET:
-            lo_trips, hi_trips = trips
-            with self.block(dominated=True):
-                if end_name:
-                    self.scope.names[end_name] = end
-                for k in range(hi_trips):
-                    v = b.add(start, b.mul(step, b.int_const(k)))
-                    if k < lo_trips:
-                        self._iteration(name, v, s.body, end)
-                    else:  # this trip runs only on threads whose start is small enough
-                        skip = b.label("trip_skip")
-                        b.branch(skip, b.icmp("<", v, end), negate=True)
-                        with self.b.cse_scope():
-                            self._iteration(name, v, s.body, end)
-                        b.place(skip)
+        type_ = "s64" if "s64" in (start.type, end.type, step.type) else "s32"
+        exact = trips is not None and trips[0] == trips[1]
+        if trips is not None and trips[1] == 0:
             return
-        first = b.icmp("<", start, end)
+        counter = b.variable(type_, start)
+        if factor > 1 and (trips is None or trips[1] >= factor):
+            # main loop: `factor` iterations per trip while v + (factor-1)*step < end
+            span = b.int_const((factor - 1) * step.const)
+            limit = b.sub(end, span)
+            body_hi = limit.hi - 1 if limit.hi is not None else None
+            first = b.icmp("<", start, limit) if not (exact and trips[0] >= factor) else b.pred_const(True)
+            top, rest = b.label("loop_x%d" % factor), b.label("loop_rest")
+            if first.const is not False:
+                if first.const is None:
+                    b.branch(rest, first, negate=True)
+                b.place(top)
+                with self.block():
+                    base = Value(type_, counter.reg, start.lo, body_hi, mutable=True)
+                    for k in range(factor):
+                        v = b.add(base, b.int_const(k * step.const))
+                        self._guarded_iteration(name, v, s.body, end, guard=False)
+                nxt = b.add(Value(type_, counter.reg, start.lo, body_hi, mutable=True), b.int_const(factor * step.const))
+                b.assign(counter, nxt)
+                b.branch(top, b.icmp("<", nxt, limit))
+                b.place(rest)
+            if exact:  # the leftover is the same for every thread: straight-line code
+                cur = Value(type_, counter.reg, start.lo, end.hi, mutable=True)
+                for k in range(trips[0] % factor):
+                    self._guarded_iteration(name, b.add(cur, b.int_const(k * step.const)), s.body, end, guard=False)
+                return
+        # one iteration per trip (also the leftover of a partially unrolled loop)
+        hi = end.hi - 1 if end.hi is not None else None
+        cur = Value(type_, counter.reg, start.lo, None if hi is None else hi + abs(step.hi or 0) * max(factor, 1),
+                    mutable=True)
+        first = b.icmp("<", cur if factor > 1 else start, end)
         if first.const is False:
             return
         top, done = b.label("loop"), b.label("loop_end")
-        type_ = "s64" if "s64" in (start.type, end.type, step.type) else "s32"
-        hi = (end.hi - 1) if end.hi is not None else None
-        counter = b.variable(type_, start, lo=start.lo, hi=hi)
         if first.const is None:
             b.branch(done, first, negate=True)
         b.place(top)
         with self.block():
-            if end_name:
-                self.scope.names[end_name] = end
-            self.scope.names[name] = counter
+            self.scope.names[name] = Value(type_, counter.reg, start.lo, hi, mutable=True)
             self.body(s.body)
         nxt = b.add(Value(type_, counter.reg, start.lo, hi, mutable=True), step)
         b.assign(counter, nxt)
         b.branch(top, b.icmp("<", nxt, end))
         b.place(done)
+
+    def _guarded_iteration(self, name: str, v: Value, stmts, end: Value, guard: bool) -> None:
+        """One unrolled iteration; ``guard`` when only some threads still run it."""
+        if not guard:
+            self._iteration(name, v, stmts, end)
+            return
+        b = self.b
+        skip = b.label("trip_skip")
+        b.branch(skip, b.icmp("<", v, end), negate=True)
+        with b.cse_scope():
+            self._iteration(name, v, stmts, end)
+        b.place(skip)
 
     def _iteration(self, name: str, v: Value, stmts, end: Value) -> None:
         with self.block(dominated=True):
@@ -857,6 +907,12 @@ def _body_size(stmts) -> int:
         else:
             total += 1
     return max(total, 1)
+
+
+def _unroll_factor(body_size: int) -> int:
+    """Iterations per trip for a rolled loop: enough independent loads in
+    flight to cover memory latency, without blowing up big bodies."""
+    return 8 if body_size <= 6 else 4 if body_size <= 24 else 1
 
 
 def _trip_range(start: Value, step: Value, end: Value):
