@@ -355,6 +355,9 @@ OPEN += [
     sdpa("sdpa_h8", (1, 8, 64, 16)),
     sdpa("sdpa_causal_odd", (1, 2, 96, 48), causal=True),
     sdpa("sdpa_causal_long", (1, 1, 256, 64), causal=True),
+    sdpa("sdpa", (1, 1, 128, 64)),
+    sdpa("sdpa_causal", (1, 1, 128, 64), causal=True),
+    sdpa("sdpa_heads", (2, 4, 64, 32)),
     # inputs are numbered by first use in the expression: q, kt, mask, v
     dict(id="a_masked", code="q = torch.randn(64, 32); kt = torch.randn(32, 64); m = torch.randn(64, 64); "
                               "v = torch.randn(64, 32); torch.softmax(q @ kt / 5.656854 + m, dim=-1) @ v",

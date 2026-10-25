@@ -14,56 +14,64 @@ the parameter order and the launch geometry. Requirements: Python 3.12+,
 
 ## Results
 
-Measured on the evaluation runner (RTX 5090, sm_120):
+Measured on the evaluation runner (RTX 5090, sm_120), with each problem's own
+launch from `meta.json`:
 
 | | |
 |---|---|
 | Open problem set | **15 / 15** pass (all five categories); the four pointwise problems are bit-exact |
-| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **145 / 145** pass |
-| Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants incl. split-K over two kernels) | **106 / 106** pass |
-| Hand-built IR for rarely generated statements (`tests/test_gpu_lowering.py`) | 7 / 7 pass |
-| Speed vs nvcc's build of emmy's reference CUDA, same launches (158 problems) | **0.96x the time** (geometric mean): attention 0.77x, reductions 0.92x, matmul 0.97x, pointwise 1.08x |
-| Math library accuracy (vs correctly rounded float64) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) |
-| Compile time | < 1 s per kernel (mostly importing emmy); largest PTX 200 KB |
+| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **162 / 162** pass |
+| Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
+| Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
+| Speed against nvcc's build of emmy's reference CUDA (278 problems, same launches) | **0.59x the time** (geometric mean): attention 0.13x, chained 0.27x, fused 0.53x, reductions 0.69x, matmul 0.91x, pointwise 1.00x (launch-bound); total 3.3 ms against 76.9 ms |
+| Math library accuracy (against correctly rounded float64) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) |
+| Tests | 78 (17 run hand-built IR on the GPU) |
+| Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
 
 ## How it works
 
 ```
-*.ir.json + meta.json ─► frontend ─► lowering ──► builder ─► PTX text ─► ptxas
-                          load the     one rule     folding · ranges · CSE
-                          graph        per IR       · loop-invariant code motion
-                                       statement    · affine addresses
+*.ir.json + meta.json ─► frontend ─► lowering ──────────► builder ─► PTX text ─► ptxas
+                                     one rule per IR      folding · ranges · CSE · LICM
+                                     statement, plus      affine addresses · vector loads
+                                     loop-body rewrites
 ```
 
-* **One lowering rule per IR statement** (`emmy_ptx/lower.py`): `Tile`,
-  `Loop`/`StridedLoop`, `Cond`, `Load`/`Write` (vector, atomic, shared),
-  `Assign`/`Accum`/`Init`/`Let`/`Select`, `Smem` (static arrays or one dynamic
-  pool), `Sync`, `WarpShuffle`, `TreeHalve`, the `cp.async` family and
-  `ZeroPrologue`. Names follow C block scoping, exactly as in the CUDA C++
-  emmy would print for the same IR.
-* **A builder that knows what every integer can be** (`emmy_ptx/builder.py`).
-  Thread and block indices get their ranges from the launch, and every
-  integer value carries a proven `[lo, hi]`. Division by a power of two
-  becomes a shift, `x % n` disappears when `x < n`, and guards and comparisons
-  that the ranges decide are removed. Constants are folded, pure instructions
-  are value-numbered within dominance scopes, and loop-invariant work moves
-  to loop preheaders.
-* **Addresses in affine form.** `x[4*a0 + k]` for `k = 0..3` is one address
-  register plus `[reg+4k]` immediates, and `ld/st.v2/.v4` are emitted where
-  emmy vectorized.
-* **Loops** whose trip counts the ranges bound are unrolled completely; long
-  loops run 4-8 iterations per trip, always in their original order, so sums
-  round exactly as written while several loads are in flight.
+* **One lowering rule per IR statement** (`emmy_ptx/lower.py`), with names in
+  C block scoping, exactly as in the CUDA C++ emmy would print.
+* **A builder that knows what every integer can be** (`emmy_ptx/builder.py`):
+  proven ranges turn divisions into shifts and remove guards the launch
+  already guarantees; constants fold; pure instructions are value-numbered
+  and loop-invariant ones hoisted; addresses are affine, so `x[4*a0 + k]` is
+  one register plus immediates, and adjacent loads become vector loads.
+* **Lanes that compute the same thing share it.** A uniformity analysis knows,
+  for every value, how many neighbouring lanes hold it alike. Emmy's schedules
+  often give many lanes the same work; the compiler splits it among them:
+  * *reductions* that a group of lanes would each compute whole are split
+    across the group and merged with a butterfly, choosing which loop to split
+    by how its loads coalesce (attention dot products, softmax of a matmul);
+  * *lane blocking* for attention: the lanes holding a query row take turns
+    scoring keys (a whole dot product each), update the online softmax once per
+    block of keys, and pass the weights to each other through shared memory,
+    the work split of FlashAttention-2, derived from the IR;
+  * *idle threads*: when a launch has far more threads than cells (emmy
+    schedules that fold a whole row in one thread), each cell gets a group of
+    lanes, and its reductions and loops are split among them.
+* **Loop-body rewrites** (`emmy_ptx/mapping.py`, `congruence.py`): provably
+  equal accumulators are merged, repeated arithmetic removed, independent
+  sibling loops fused, and the online softmax's merge of two partial states is
+  derived from the IR's own update.
 * **Numerics.** Elementwise arithmetic is IEEE single with explicit
-  round-to-nearest (`add.rn`, `mul.rn`, `div.rn`, `sqrt.rn`), so pointwise
-  kernels reproduce numpy bit for bit. Reductions fuse `acc += a*b` into FMA.
+  round-to-nearest, so pointwise kernels reproduce numpy bit for bit.
   `exp`, `log`, `tanh`, `erf`, `sin`, `cos` and `pow` are accurate routines
-  built from minimax polynomials (`tools/fit_poly.py`) and exact argument
-  reductions.
+  built from minimax polynomials and exact argument reductions. Splitting a
+  reduction regroups its sum (well within the tolerances); folds that are not
+  split keep the IR's order.
 
-[docs/DESIGN.md](docs/DESIGN.md) explains each part in detail.
+[docs/DESIGN.md](docs/DESIGN.md) explains each part, with the measurements behind
+the choices.
 
 ## Layout
 
@@ -71,23 +79,27 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
 compile.py             command-line entry point (PTX to stdout, errors to stderr)
 emmy_ptx/
   frontend.py          IR + meta.json -> KernelSource
-  lower.py             Kernel IR statements -> instructions
+  lower.py             Kernel IR statements -> instructions; how each loop is lowered
+  mapping.py           loop-body analyses and rewrites (fusion, online softmax, lane blocking)
+  congruence.py        accumulators that always hold the same value
+  regroup.py           cooperative reductions in contiguous chunks
   builder.py           typed values, folding, ranges, value numbering, LICM, DCE
+  vectorize.py         adjacent scalar loads -> ld.v2 / ld.v4
   elementwise.py       Assign/Accum operations and emmy's dtype rules
   mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid
   ptx.py               registers, operands, instructions, module text
-tests/                 builder unit tests, end-to-end compile checks (pytest)
-tools/                 corpus generation, GPU suite runner, nvcc race, math accuracy
+tests/                 unit tests (builder, rewrites, a lane-level IR interpreter) and GPU tests
+tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
 docs/DESIGN.md
 ```
 
 ## Testing
 
 ```bash
-# unit + compile tests (set EMMY_PROBLEMS to problem folders; PTXAS to assemble too)
+# unit + compile tests; set EMMY_RUNNER=http://runner.riftstack.ai:48701 to also run the GPU tests
 python -m pytest tests
 
-# compile, run and check problem folders on the runner
+# compile, run and check problem folders on the runner (margin = share of the tolerance used)
 python tools/run_suite.py <problems-dir> [--bench]
 
 # build the wider corpus with the organisers' generator (needs torch)
