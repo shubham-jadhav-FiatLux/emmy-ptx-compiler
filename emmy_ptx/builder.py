@@ -149,8 +149,9 @@ class Builder:
         self._loops: list[_Loop] = []
         self._level: dict[str, int] = {}  # register -> loop depth of its definition
         self._guards = 0
-        self._offsets: dict = {}  # value key -> (base value, constant): value = base + constant
+        self._linear: dict = {}  # value key -> (terms, const): value = sum(coeff * term) + const
         self._ug: dict[str, int] = {}  # register -> uniform group of its value (see Value.ug)
+        self.align: dict[str, int] = {}  # address register -> known byte alignment
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -314,6 +315,17 @@ class Builder:
             return self.int_const(lo)
         return self.pure("mov.u32", "s32", (Reg(name, "b32"),), lo, hi)
 
+    def snapshot(self, v: Value) -> Value:
+        """``v`` as an immutable value: a copy when it is a read of a register
+        that will be reassigned."""
+        if not v.mutable:
+            return v
+        return self.pure(f"mov.{_mov_type(v.type)}", v.type, (v,), v.lo, v.hi)
+
+    def note_align(self, reg: Reg, align: int) -> None:
+        """Record that the address in ``reg`` is a multiple of ``align`` bytes."""
+        self.align[reg.name] = align
+
     def assume(self, v: Value, lo: int, hi: int) -> Value:
         """``v`` with a range the caller knows from the mathematics (e.g. a clamp
         done in floating point before the conversion to int)."""
@@ -409,7 +421,7 @@ class Builder:
         lo, hi = a.lo + b.lo, a.hi + b.hi
         a, b, t = self._widen(a, b, lo, hi)
         v = self.pure(f"add.{t}", t, (a, b), lo, hi, commutative=True)
-        self._note_offset(v, a, b, 1)
+        self._note_linear(v, [(a, 1), (b, 1)])
         return v
 
     def sub(self, a: Value, b: Value) -> Value:
@@ -422,23 +434,28 @@ class Builder:
         lo, hi = a.lo - b.hi, a.hi - b.lo
         a, b, t = self._widen(a, b, lo, hi)
         v = self.pure(f"sub.{t}", t, (a, b), lo, hi)
-        if b.const is not None:
-            self._note_offset(v, a, b, -1)
+        self._note_linear(v, [(a, 1), (b, -1)])
         return v
 
-    def _note_offset(self, v: Value, a: Value, b: Value, sign: int) -> None:
-        """Remember ``v = base + constant`` so addresses can fold the constant
-        into an instruction's immediate offset (see ``offset_of``)."""
-        if v.key() is None:
+    def _note_linear(self, v: Value, parts) -> None:
+        """Remember how ``v`` was built as ``sum(coeff * part)`` (constants folded
+        into the constant term), so addresses can split off the constant into
+        an immediate offset and see the factors that prove alignment."""
+        if v.key() is None or v.const is not None:
             return
-        for base, c in ((a, b), (b, a)):
-            if c.const is not None and base.const is None and base.key() is not None:
-                self._offsets[v.key()] = (base, sign * int(c.const) if c is b else int(c.const))
-                return
+        terms, const = [], 0
+        for part, coeff in parts:
+            if part.const is not None:
+                const += coeff * int(part.const)
+            elif part.key() is None:
+                return  # a reassigned register: not a fixed quantity
+            else:
+                terms.append((part, coeff))
+        self._linear[v.key()] = (terms, const)
 
-    def offset_of(self, v: Value):
-        """``(base, c)`` when ``v`` was built as ``base + c``, else ``None``."""
-        return self._offsets.get(v.key()) if v.key() is not None else None
+    def linear_of(self, v: Value):
+        """``(terms, const)`` with v = sum(c * t) + const, if ``v`` was built that way."""
+        return self._linear.get(v.key()) if v.key() is not None else None
 
     def mul(self, a: Value, b: Value) -> Value:
         if a.const is not None and b.const is not None:
@@ -453,9 +470,13 @@ class Builder:
         lo, hi = min(corners), max(corners)
         if _is_pow2(b.const):
             a2, _, t = self._widen(a, b, lo, hi)
-            return self.pure(f"shl.b{t[1:]}", t, (a2, Imm(b.const.bit_length() - 1, "u32")), lo, hi)
-        a, b, t = self._widen(a, b, lo, hi)
-        return self.pure(f"mul.lo.{t}", t, (a, b), lo, hi, commutative=True)
+            v = self.pure(f"shl.b{t[1:]}", t, (a2, Imm(b.const.bit_length() - 1, "u32")), lo, hi)
+        else:
+            a2, b2, t = self._widen(a, b, lo, hi)
+            v = self.pure(f"mul.lo.{t}", t, (a2, b2), lo, hi, commutative=True)
+        if b.const is not None:
+            self._note_linear(v, [(a2, int(b.const))])
+        return v
 
     def div(self, a: Value, b: Value) -> Value:
         """C ``/`` on integers (truncation)."""

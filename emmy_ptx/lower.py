@@ -25,6 +25,7 @@ from . import elementwise
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .frontend import DEFAULT_BLOCK, KernelSource
 from .ptx import SIZEOF, Imm, Kernel, Mem, Reg, Sym, Vec
+from .vectorize import vectorize_loads
 
 # emmy dtype names (graph tensors) -> PTX memory types
 MEM_TYPE = {
@@ -48,6 +49,10 @@ VALUE_TYPE = {
 }
 
 STATIC_SMEM_LIMIT = 48 * 1024
+# Alignment (bytes) assumed for every buffer base: cudaMalloc returns 256-byte
+# aligned memory and emmy's own float4 accesses rely on 16; shared arrays are
+# declared .align 16 or more.
+MAX_ALIGN = 16
 # Fully unroll an ``unroll`` loop only while the expanded body stays below this
 # many statements: past it the PTX grows faster than ptxas can schedule it.
 UNROLL_BUDGET = 4096
@@ -151,6 +156,7 @@ class Lowerer:
         self.b.emit("ret")
         self.kernel.flatten()
         eliminate_dead_code(self.kernel)
+        vectorize_loads(self.kernel, self.b.align)
         return self.kernel
 
     def body(self, stmts) -> None:
@@ -204,6 +210,7 @@ class Lowerer:
                 raise LoweringError(f"parameter {name!r} has no tensor record in the IR or meta.json")
             raw = b.pure("ld.param.u64", "s64", (Mem(Sym(_param_name(name))),))
             ptr = b.pure("cvta.to.global.u64", "s64", (raw,))
+            b.note_align(ptr.op, MAX_ALIGN)
             out[name] = GlobalBuffer(name, ptr, MEM_TYPE[buf.dtype], buf.shape, name not in self.src.written)
         return out
 
@@ -261,8 +268,8 @@ class Lowerer:
         """Declare ``name`` in the current scope (a register if it is reassigned later)."""
         if name in self.mutable:
             self.scope.names[name] = self.b.variable(v.type, v)
-        else:
-            self.scope.names[name] = v
+        else:  # C copies: a later update of an accumulator must not show through
+            self.scope.names[name] = self.b.snapshot(v)
 
     def declare_var(self, name: str, type_: str, init: Value) -> Variable:
         var = self.b.variable(type_, init)
@@ -431,12 +438,17 @@ class Lowerer:
             elem = _swizzled(b, self.materialize(aff), swizzle)
             aff = Affine({elem.key() or ("swz", id(elem)): [elem, 1]}) if elem.const is None else Affine(const=elem.const)
         var = self.materialize(aff, with_const=False)
+        # bytes the register part is a multiple of: every term contributes coeff*size
+        # times an arbitrary integer; bases (parameters, shared arrays) are 16-aligned
+        align = min([MAX_ALIGN] + [_lowbit(abs(c) * size) for _, c in aff.terms.values()])
         if isinstance(buf, SharedArray):
             disp = buf.offset + aff.const * size
             if var.const == 0:
                 return Mem(Sym(buf.symbol), disp)
             base = b.pure("mov.u32", "s32", (Sym(buf.symbol),), 0, 1 << 24)
-            return Mem(b.add(base, b.mul(var, b.int_const(size))).op, disp)
+            reg = b.add(base, b.mul(var, b.int_const(size))).op
+            b.note_align(reg, align)
+            return Mem(reg, disp)
         disp = aff.const * size
         if var.const == 0:
             return Mem(buf.pointer.op, disp)
@@ -445,7 +457,9 @@ class Lowerer:
         else:
             wide = "mul.wide.u32" if var.nonneg else "mul.wide.s32"
             off = b.pure(wide, "s64", (var, Imm(size, "u32")), var.lo * size, var.hi * size)
-        return Mem(b.pure("add.s64", "s64", (buf.pointer, off), commutative=True).op, disp)
+        reg = b.pure("add.s64", "s64", (buf.pointer, off), commutative=True).op
+        b.note_align(reg, align)
+        return Mem(reg, disp)
 
     # ------------------------------------------------------------- statements: structure
 
@@ -635,11 +649,17 @@ class Lowerer:
         b = self.b
         lane = self.value("lane")
         rank = lane if group == WARP else b.bitop("&", lane, b.int_const(group - 1))
-        rounds = -(-trips // group)
-        for j in range(rounds):
-            i = b.add(rank, b.int_const(group * j))
-            v = b.add(start, b.mul(i, step))
-            self._guarded_iteration(s.axis.name, v, s.body, end, guard=j == rounds - 1 and trips % group != 0)
+        if trips % group == 0:  # contiguous chunks: each lane's loads are adjacent (vectorizable)
+            chunk = trips // group
+            first = b.mul(rank, b.int_const(chunk))
+            for j in range(chunk):
+                v = b.add(start, b.mul(b.add(first, b.int_const(j)), step))
+                self._guarded_iteration(s.axis.name, v, s.body, end, guard=False)
+        else:  # interleaved, the last round only on the lanes it reaches
+            rounds = -(-trips // group)
+            for j in range(rounds):
+                v = b.add(start, b.mul(b.add(rank, b.int_const(group * j)), step))
+                self._guarded_iteration(s.axis.name, v, s.body, end, guard=j == rounds - 1)
         mask = self.kernel.reg("s32")
         b.emit("activemask.b32", mask, ndefs=1, effect=False)
         for name in dict.fromkeys(st.name for st in s.body if type(st).__name__ == "Accum"):
@@ -1005,10 +1025,13 @@ class Lowerer:
         definitions so the constant can become an address immediate."""
         if v.const is not None:
             return Affine(const=int(v.const))
-        offset = self.b.offset_of(v)
-        if offset is not None:
-            base, c = offset
-            return self._as_affine(base).plus(Affine(const=c))
+        linear = self.b.linear_of(v)
+        if linear is not None:
+            terms, const = linear
+            out = Affine(const=const)
+            for t, c in terms:
+                out = out.plus(self._as_affine(t).scaled(c))
+            return out
         key = v.key()
         if key is None:  # a mutable register: its own term, never merged
             self._uniq += 1
