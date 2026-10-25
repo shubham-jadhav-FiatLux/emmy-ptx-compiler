@@ -16,7 +16,7 @@ from emmy.compiler.dtype import F32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import Smem, Sync, Tile, TreeHalve, WarpShuffle
-from emmy.compiler.ir.stmt import Accum, Assign, Cond, Load, Select, SelectBranch, StridedLoop, Write
+from emmy.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from emmy.compiler.ir.stmt.leaves import Init, Let
 
 from emmy_ptx import PTX_VERSION, TARGET
@@ -147,6 +147,34 @@ def test_segmented_warp_shuffle():
     ))]
     got = run(body, {"x": x}, {"out": (64,)}, 1, 64)["out"]
     want = np.repeat(x.reshape(8, 8).astype(np.float64).sum(1), 8)
+    assert np.allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("cols,trips", [(16, 50), (32, 64), (32, 33), (8, 24)])
+def test_reduction_shared_by_lanes_is_split_across_them(cols, trips):
+    """Every lane of a `cols`-lane group needs the same dot product of row r;
+    the compiler splits its iterations across the group (including an uneven
+    last round) and combines the partials with shuffles."""
+    rows = 256 // cols
+    x = rng.standard_normal((rows, trips)).astype(np.float32)
+    y = rng.standard_normal(trips).astype(np.float32)
+    z = rng.standard_normal(cols).astype(np.float32)
+    k = Axis("k", Dim(trips))
+    body = [Tile(axes=(Axis("r", Dim(rows)), Axis("c", Dim(cols))), body=(
+        Loop(axis=k, body=(
+            Load(name="xv", input="x", index=(Var("r"), Var("k"))),
+            Load(name="yv", input="y", index=(Var("k"),)),
+            Assign("p", "multiply", ("xv", "yv")),
+            Accum("acc", "p"),
+            Accum("big", "xv", op="maximum"),
+        )),
+        Load(name="zc", input="z", index=(Var("c"),)),
+        Assign("o", "add", ("acc", "zc")),
+        Assign("o2", "add", ("o", "big")),
+        Write("out", (Var("r"), Var("c")), "o2"),
+    ))]
+    got = run(body, {"x": x, "y": y, "z": z}, {"out": (rows, cols)}, 1, 256)["out"]
+    want = (x.astype(np.float64) @ y)[:, None] + z[None, :] + x.max(1)[:, None]
     assert np.allclose(got, want, rtol=1e-5, atol=1e-5)
 
 

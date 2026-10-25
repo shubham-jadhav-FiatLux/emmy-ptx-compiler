@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass, field
 
 from . import elementwise
-from .builder import INT_RANGE, Builder, Value, Variable, eliminate_dead_code
+from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .frontend import DEFAULT_BLOCK, KernelSource
 from .ptx import SIZEOF, Imm, Kernel, Mem, Reg, Sym, Vec
 
@@ -56,6 +56,11 @@ AUTO_UNROLL_TRIPS = 64
 # Streaming multiprocessors of the evaluation GPU (RTX 5090). Only a scheduling
 # hint depends on it; the generated code is correct on any GPU.
 TARGET_SMS = 170
+# A reduction shared by a group of lanes is split across them only when it has
+# at least this many trips (the shuffle tree costs log2(group) steps).
+SPLIT_MIN_TRIPS = 16
+# Associative, commutative combines a lane-split reduction may regroup.
+SPLITTABLE = ("add", "multiply", "maximum", "minimum")
 
 # identities of the reduction combines (emmy's ElementwiseImpl table)
 IDENTITY = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "minimum": 1e30}
@@ -135,6 +140,7 @@ class Lowerer:
         self.mutable = _reassigned_names(src.body)
         self.products: dict[str, tuple[Value, Value]] = {}  # SSA name -> factors of a multiply
         self._uniq = 0
+        self.converged = False  # every lane of each warp is executing the current statement
         self.shared = self._layout_shared()
         self.globals = self._prologue()
 
@@ -155,11 +161,14 @@ class Lowerer:
             handler(s)
 
     @contextlib.contextmanager
-    def block(self, dominated: bool = False, guarded: bool = False):
+    def block(self, dominated: bool = False, guarded: bool = False, divergent: bool = False):
         """A C block: a new name scope, and unless ``dominated`` (straight-line
         code such as an unrolled iteration) a new value-numbering scope.
-        ``guarded`` marks a branch body (its loads must stay where they are)."""
+        ``guarded`` marks a branch body (its loads must stay where they are);
+        ``divergent`` a branch whose condition may differ between lanes."""
         self.scope = Scope(self.scope)
+        converged = self.converged
+        self.converged = converged and not divergent
         try:
             with contextlib.ExitStack() as stack:
                 if not dominated:
@@ -169,6 +178,15 @@ class Lowerer:
                 yield
         finally:
             self.scope = self.scope.parent
+            self.converged = converged
+
+    def _pessimize(self, stmts) -> None:
+        """Forget the uniformity of the variables ``stmts`` reassign: at a merge
+        point or a loop head their value is not known to be uniform."""
+        for name in _assigned_in(stmts):
+            var = self.scope.lookup(name)
+            if isinstance(var, Variable):
+                var.ug = 1
 
     # ------------------------------------------------------------- set-up
 
@@ -178,7 +196,7 @@ class Lowerer:
         self.tid = b.special("%tid.x", 0, launch.block - 1)
         self.ctaid = b.special("%ctaid.x", 0, launch.grid - 1)
         self.scope.names["lane"] = b.bitop("&", self.tid, b.int_const(31))
-        self.scope.names["warp"] = b.shr(self.tid, b.int_const(5))
+        self.scope.names["warp"] = b.uniform(b.shr(self.tid, b.int_const(5)), WARP)
         out = {}
         for name in self.src.params:
             buf = self.src.buffers.get(name)
@@ -448,10 +466,14 @@ class Lowerer:
         if needs_guard:
             b.branch(done, b.icmp(">=", gid, b.int_const(n)))
             gid = b.assume(gid, gid.lo, n - 1)  # inside the guard
+        # every lane of each warp runs the body, unless the guard can split a warp
+        block = self.src.launch.block
+        self.converged = not s.aux_threads and (not needs_guard or (n % WARP == 0 and block % WARP == 0))
         with self.block(guarded=needs_guard):
             for name, v in zip((a.name for a in s.axes), self._decode(s, gid, extents)):
                 self.scope.names[name] = v
             self.body(s.body)
+        self.converged = False
         b.place(done)
 
     def _decode(self, s, gid: Value, extents: list[int]) -> list[Value]:
@@ -459,10 +481,16 @@ class Lowerer:
         grouped CTA rasterization of two adjacent block axes."""
         b = self.b
         strides = [math.prod(extents[i + 1 :]) for i in range(len(extents))]
+        # Lanes l of a warp hold flat ids base + l, base a multiple of the
+        # largest power of two dividing both the block size and 32. So
+        # (gid / stride) % extent is the same throughout each aligned group of
+        # lowbit(stride) lanes, capped there: the coordinate's uniform group.
+        cap = 1 if s.aux_threads else min(WARP, _lowbit(self.src.launch.block))
         coords = []
         for i, (stride, extent) in enumerate(zip(strides, extents)):
             term = b.div(gid, b.int_const(stride))
-            coords.append(term if i == 0 else b.rem(term, b.int_const(extent)))
+            coord = term if i == 0 else b.rem(term, b.int_const(extent))
+            coords.append(b.uniform(coord, min(cap, _lowbit(stride))))
         raster = _raster_plan(s, extents)
         if raster is None:
             return coords
@@ -481,7 +509,9 @@ class Lowerer:
             size = b.imin(b.int_const(g), b.sub(b.int_const(ea), b.mul(grp, b.int_const(g))))
             a = b.add(b.mul(grp, b.int_const(g)), b.rem(b.rem(sub, gsize), size))
             o = b.div(b.rem(sub, gsize), size)
-        coords[gi], coords[oi] = b.assume(a, 0, ea - 1), b.assume(o, 0, eb - 1)
+        group = min(cap, _lowbit(strides[ni]))  # both are functions of gid / strides[ni]
+        coords[gi] = b.uniform(b.assume(a, 0, ea - 1), group)
+        coords[oi] = b.uniform(b.assume(o, 0, eb - 1), group)
         return coords
 
     def stmt_Loop(self, s) -> None:
@@ -524,6 +554,10 @@ class Lowerer:
         with self.block(dominated=True):
             if end_name:  # the hoisted bound is visible to the body
                 self.scope.names[end_name] = end
+            group = self._split_plan(s, start, step, end, trips)
+            if group:
+                self._split_reduction(s, start, step, end, trips[0], group)
+                return
             if trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
                 for k in range(trips[1]):
                     v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
@@ -531,6 +565,94 @@ class Lowerer:
                 return
             factor = _unroll_factor(size) if step.const is not None else 1
             self._rolled(s, start, step, end, trips, factor)
+
+    def _split_plan(self, s, start: Value, step: Value, end: Value, trips) -> int:
+        """Lanes that can share the iterations of reduction loop ``s`` (0: none).
+
+        Emmy's tile decode often gives every lane of an aligned group the same
+        reduction to compute (all lanes of a warp take the same query rows in
+        attention, and each computes the same dot products). When the folded
+        values are uniform over groups of G lanes, those G lanes can split the
+        iterations and combine their partial results with log2(G) shuffles:
+        the same reduction, regrouped, which an associative and commutative
+        combine allows. The loop qualifies when every lane of the warp runs it,
+        its trip count is known, its body only loads, computes and folds, and
+        nothing but the fold itself reads the accumulators.
+        """
+        if not self.converged or trips is None or trips[0] != trips[1] or trips[0] < SPLIT_MIN_TRIPS:
+            return 0
+        if not s.seed or any(type(st).__name__ not in ("Load", "Assign", "Let", "Accum") for st in s.body):
+            return 0
+        accs = [st for st in s.body if type(st).__name__ == "Accum"]
+        names = {st.name for st in accs}
+        if not accs:
+            return 0
+        for st in accs:
+            if st.base is not None or REDUCE_CANON.get(st.op.name) not in SPLITTABLE:
+                return 0
+            if (st.dtype.name if st.dtype is not None else "f32") != "f32":
+                return 0
+        loop_ug = min(start.ug, step.ug, end.ug)
+        env: dict[str, int] = {}
+
+        def of_name(n: str) -> int:
+            if n in env:
+                return env[n]
+            if n == s.axis.name:
+                return loop_ug
+            bound = self.scope.lookup(n)
+            return bound.ug if isinstance(bound, (Value, Variable)) else 1
+
+        def of_expr(e) -> int:
+            return min([of_name(v) for v in e.free_vars()] + [WARP])
+
+        group = loop_ug
+        for st in s.body:
+            kind = type(st).__name__
+            reads = set()
+            if kind == "Load":
+                reads = {v for e in st.index for v in e.free_vars()}
+                for n in st.names:
+                    env[n] = min([of_expr(e) for e in st.index] + [WARP])
+            elif kind == "Assign":
+                reads = set(st.args)
+                env[st.name] = min([of_name(a) for a in st.args] + [WARP])
+            elif kind == "Let":
+                reads = set(st.value.free_vars())
+                env[st.name] = of_expr(st.value)
+            else:  # Accum
+                reads = {st.value}
+                group = min(group, of_name(st.value))
+            if reads & names:
+                return 0  # an accumulator is read mid-fold: not a pure reduction
+        group = min(group, 1 << (trips[0].bit_length() - 1))
+        return group if group >= 2 else 0
+
+    def _split_reduction(self, s, start: Value, step: Value, end: Value, trips: int, group: int) -> None:
+        """Lane l of each aligned group of ``group`` lanes folds iterations
+        l, l+group, l+2*group, ...; a butterfly of shuffles then gives every
+        lane of the group the whole reduction."""
+        b = self.b
+        lane = self.value("lane")
+        rank = lane if group == WARP else b.bitop("&", lane, b.int_const(group - 1))
+        rounds = -(-trips // group)
+        for j in range(rounds):
+            i = b.add(rank, b.int_const(group * j))
+            v = b.add(start, b.mul(i, step))
+            self._guarded_iteration(s.axis.name, v, s.body, end, guard=j == rounds - 1 and trips % group != 0)
+        mask = self.kernel.reg("s32")
+        b.emit("activemask.b32", mask, ndefs=1, effect=False)
+        for name in dict.fromkeys(st.name for st in s.body if type(st).__name__ == "Accum"):
+            var = self.lookup(name)
+            canon = REDUCE_CANON[next(st.op.name for st in s.body if type(st).__name__ == "Accum" and st.name == name)]
+            width = group // 2
+            while width:
+                cur = b.in_reg(var.read())
+                other = self.kernel.reg(var.type)
+                b.emit("shfl.sync.bfly.b32", other, cur, Imm(width, "u32"), Imm(31, "u32"), mask, ndefs=1, effect=False)
+                b.assign(var, elementwise.apply(b, canon, [var.read(), Value(var.type, other)], _dtype_name(var.type)))
+                width //= 2
+            var.ug = group  # every lane of the group now holds the whole fold
 
     def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
         b = self.b
@@ -540,6 +662,8 @@ class Lowerer:
         if trips is not None and trips[1] == 0:
             return
         counter = b.variable(type_, start)
+        counter.ug = min(start.ug, step.ug, end.ug)
+        self._pessimize(s.body)
         if factor > 1 and (trips is None or trips[1] >= factor):
             # main loop: `factor` iterations per trip while v + (factor-1)*step < end
             span = b.int_const((factor - 1) * step.const)
@@ -555,7 +679,7 @@ class Lowerer:
                     with self.block():
                         # within one trip the counter is constant: let its uses be value-numbered
                         # (the body's table closes before the latch; the counter is never hoisted)
-                        base = Value(type_, counter.reg, start.lo, body_hi)
+                        base = Value(type_, counter.reg, start.lo, body_hi, ug=counter.ug)
                         for k in range(factor):
                             v = b.add(base, b.int_const(k * step.const))
                             self._guarded_iteration(name, v, s.body, end, guard=False)
@@ -564,7 +688,7 @@ class Lowerer:
                     b.branch(top, b.icmp("<", nxt, limit))
                 b.place(rest)
             if exact:  # the leftover is the same for every thread: straight-line code
-                cur = Value(type_, counter.reg, start.lo, end.hi)
+                cur = Value(type_, counter.reg, start.lo, end.hi, ug=counter.ug)
                 with b.cse_scope():
                     for k in range(trips[0] % factor):
                         self._guarded_iteration(name, b.add(cur, b.int_const(k * step.const)), s.body, end, guard=False)
@@ -582,7 +706,7 @@ class Lowerer:
         with b.loop():
             b.place(top)
             with self.block():
-                self.scope.names[name] = Value(type_, counter.reg, start.lo, hi)  # constant within a trip
+                self.scope.names[name] = Value(type_, counter.reg, start.lo, hi, ug=counter.ug)  # constant within a trip
                 self.body(s.body)
             nxt = b.add(Value(type_, counter.reg, start.lo, hi, mutable=True), step)
             b.assign(counter, nxt)
@@ -596,10 +720,12 @@ class Lowerer:
             return
         b = self.b
         skip = b.label("trip_skip")
-        b.branch(skip, b.icmp("<", v, end), negate=True)
-        with b.guarded(), b.cse_scope():
+        runs = b.icmp("<", v, end)
+        b.branch(skip, runs, negate=True)
+        with self.block(guarded=True, divergent=runs.ug < WARP):
             self._iteration(name, v, stmts, end)
         b.place(skip)
+        self._pessimize(stmts)
 
     def _iteration(self, name: str, v: Value, stmts, end: Value) -> None:
         with self.block(dominated=True):
@@ -617,17 +743,19 @@ class Lowerer:
             return
         other = b.label("else" if s.else_body else "endif")
         b.branch(other, p, negate=True)
-        with self.block(guarded=True):
+        divergent = p.ug < WARP
+        with self.block(guarded=True, divergent=divergent):
             self.body(s.body)
         if s.else_body:
             done = b.label("endif")
             b.branch(done)
             b.place(other)
-            with self.block(guarded=True):
+            with self.block(guarded=True, divergent=divergent):
                 self.body(s.else_body)
             b.place(done)
         else:
             b.place(other)
+        self._pessimize((*s.body, *s.else_body))
 
     # ------------------------------------------------------------- statements: values
 
@@ -705,16 +833,17 @@ class Lowerer:
         while k < width:
             n = _vector_width(width - k, mtype)
             addr = self.address(buf, flat=base.plus(Affine(const=k)))
+            ug = b.ug_of(addr)  # lanes that read the same address read the same value
             if n == 1 and space == "global.nc":
                 out.append(b.pure(f"ld.{space}.{_ldst(mtype)}", vtype, (addr,)))
             elif n == 1:
                 reg = self.kernel.reg(vtype)
-                b.emit(f"ld.{space}.{_ldst(mtype)}", reg, addr, ndefs=1, effect=False)
-                out.append(Value(vtype, reg, *_type_range(vtype)))
+                b.emit(f"ld.{space}.{_ldst(mtype)}", reg, addr, ndefs=1, effect=False, ug=ug)
+                out.append(Value(vtype, reg, *_type_range(vtype), ug=ug))
             else:
                 regs = tuple(self.kernel.reg(vtype) for _ in range(n))
-                b.emit(f"ld.{space}.v{n}.{_ldst(mtype)}", Vec(regs), addr, ndefs=1, effect=False)
-                out.extend(Value(vtype, r, *_type_range(vtype)) for r in regs)
+                b.emit(f"ld.{space}.v{n}.{_ldst(mtype)}", Vec(regs), addr, ndefs=1, effect=False, ug=ug)
+                out.extend(Value(vtype, r, *_type_range(vtype), ug=ug) for r in regs)
             k += n
         return out
 
@@ -813,6 +942,10 @@ class Lowerer:
                     self.define(sb, Value(vtype, out))
                 self.merge(s.combine_states, s.state, vtype)
             lane_mask //= 2
+        for st in s.state:  # the butterfly leaves each aligned group of `length` lanes agreeing
+            var = self.scope.lookup(st)
+            if isinstance(var, Variable):
+                var.ug = max(var.ug, min(WARP, int(s.length)))
 
     def stmt_TreeHalve(self, s) -> None:
         b = self.b
@@ -822,8 +955,9 @@ class Lowerer:
         half = int(s.length) // 2
         while half > 0:
             skip = b.label("tree_skip")
-            b.branch(skip, b.icmp("<", t, b.int_const(half)), negate=True)
-            with self.block(guarded=True):
+            active = b.icmp("<", t, b.int_const(half))
+            b.branch(skip, active, negate=True)
+            with self.block(guarded=True, divergent=active.ug < WARP):
                 if s.inner is not None:
                     iv, scale = self.value(s.inner[0]), b.int_const(int(s.inner[1]))
                     slot = b.add(b.mul(t, scale), iv)
@@ -928,6 +1062,23 @@ def _body_size(stmts) -> int:
         else:
             total += 1
     return max(total, 1)
+
+
+def _lowbit(n: int) -> int:
+    """The largest power of two dividing ``n``."""
+    return n & -n
+
+
+def _assigned_in(stmts) -> set[str]:
+    """Names some statement in ``stmts`` (at any depth) reassigns."""
+    out = set()
+    for s in _walk(stmts):
+        kind = type(s).__name__
+        if kind == "Accum":
+            out.add(s.name)
+        elif kind in ("WarpShuffle", "TreeHalve"):
+            out.update(s.state)
+    return out
 
 
 def _unroll_factor(body_size: int) -> int:

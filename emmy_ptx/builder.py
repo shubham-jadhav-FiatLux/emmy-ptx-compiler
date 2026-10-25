@@ -28,6 +28,7 @@ import numpy as np
 from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg
 
 INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
+WARP = 32
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,10 @@ class Value:
     ``f16``, ``f64`` or ``pred``. ``mutable`` marks a read of a register that is
     reassigned elsewhere (an accumulator or a loop counter): such reads are
     never value-numbered.
+
+    ``ug`` (uniform group) is the largest aligned group of lanes, 1 to 32,
+    within which every lane of a warp is guaranteed to hold the same value:
+    32 for constants and block-level indices, 1 for anything lane-dependent.
     """
 
     type: str
@@ -45,6 +50,11 @@ class Value:
     lo: int | None = None
     hi: int | None = None
     mutable: bool = False
+    ug: int = 1
+
+    def __post_init__(self):
+        if isinstance(self.op, Imm):
+            object.__setattr__(self, "ug", WARP)
 
     @property
     def const(self):
@@ -79,12 +89,13 @@ class Variable:
     type: str
     lo: int | None = None
     hi: int | None = None
+    ug: int = 1  # uniformity of the value it holds now (see Value.ug)
 
     def read(self) -> Value:
         lo, hi = (self.lo, self.hi) if self.type in INT_RANGE else (None, None)
         if self.type in INT_RANGE and lo is None:
             lo, hi = INT_RANGE[self.type]
-        return Value(self.type, self.reg, lo, hi, mutable=True)
+        return Value(self.type, self.reg, lo, hi, mutable=True, ug=self.ug)
 
 
 def _is_pow2(n) -> bool:
@@ -139,6 +150,7 @@ class Builder:
         self._level: dict[str, int] = {}  # register -> loop depth of its definition
         self._guards = 0
         self._offsets: dict = {}  # value key -> (base value, constant): value = base + constant
+        self._ug: dict[str, int] = {}  # register -> uniform group of its value (see Value.ug)
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -224,6 +236,8 @@ class Builder:
                 return hit
         reg = self.k.reg(type_)
         instr = Instr(op, (reg, *(a.op if isinstance(a, Value) else a for a in args)))
+        ug = min((self.ug_of(a) for a in args), default=WARP)
+        self._ug[reg.name] = ug
         target = self._hoist_target(op, args)
         if target is not None:
             target.preheader.append(instr)
@@ -236,13 +250,36 @@ class Builder:
             table = self._tables[-1]
         if type_ in INT_RANGE and lo is None:
             lo, hi = INT_RANGE[type_]
-        v = Value(type_, reg, lo, hi)
+        v = Value(type_, reg, lo, hi, ug=ug)
         if key is not None:
             table[key] = v
         return v
 
-    def emit(self, op: str, *args, ndefs: int = 0, effect: bool = True, guard: Value | None = None, negate=False):
-        """Emit an instruction verbatim (stores, barriers, async copies ...)."""
+    def ug_of(self, x) -> int:
+        """Uniform group of an operand (a Value, an address, a symbol, a special register)."""
+        if isinstance(x, Value):
+            return x.ug
+        if isinstance(x, Mem):
+            x = x.base
+        if isinstance(x, Reg):
+            if x.name.startswith("%ctaid") or x.name.startswith("%nctaid") or x.name.startswith("%ntid"):
+                return WARP
+            return self._ug.get(x.name, 1)
+        return WARP  # immediates, symbols, labels
+
+    def uniform(self, v: Value, ug: int) -> Value:
+        """``v``, known (from the mathematics of its computation) to be uniform
+        within aligned groups of ``ug`` lanes."""
+        if v.const is not None:
+            return v
+        if isinstance(v.op, Reg):
+            self._ug[v.op.name] = ug
+        return Value(v.type, v.op, v.lo, v.hi, v.mutable, ug)
+
+    def emit(self, op: str, *args, ndefs: int = 0, effect: bool = True, guard: Value | None = None, negate=False,
+             ug: int = 1):
+        """Emit an instruction verbatim (stores, barriers, async copies ...);
+        ``ug`` is the uniformity of whatever it defines."""
         g = None
         if guard is not None:
             if guard.const is not None:
@@ -254,6 +291,7 @@ class Builder:
         instr = Instr(op, ops, ndefs=ndefs, effect=effect, guard=g, negate=negate)
         for r in instr.defs():
             self._level[r.name] = len(self._loops)
+            self._ug[r.name] = ug
         self.k.emit(instr)
 
     # -- constants and registers ------------------------------------------------
@@ -281,7 +319,7 @@ class Builder:
         done in floating point before the conversion to int)."""
         if v.const is not None:
             return v
-        return Value(v.type, v.op, max(lo, v.lo), min(hi, v.hi), v.mutable)
+        return Value(v.type, v.op, max(lo, v.lo), min(hi, v.hi), v.mutable, v.ug)
 
     def in_reg(self, v: Value) -> Value:
         """``v`` in a register (stores and some instructions take no immediates)."""
@@ -300,6 +338,7 @@ class Builder:
 
     def assign(self, var: Variable, v: Value) -> None:
         v = self.convert(v, var.type)
+        var.ug = v.ug
         self.k.emit(Instr(f"mov.{_mov_type(var.type)}", (var.reg, v.op)))
 
     # -- conversions -------------------------------------------------------------
