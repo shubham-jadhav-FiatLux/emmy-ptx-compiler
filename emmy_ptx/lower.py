@@ -194,9 +194,12 @@ class SplitPlan:
 
 
 class Lowerer:
-    def __init__(self, src: KernelSource, spread: bool = False):
+    def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False):
         self.src = src
         self.spread = spread  # do idle threads join the cells (_spread)?
+        # the fallback lowering (see compile_file): one rule per statement, in the IR's order, with
+        # none of the optional rewrites (fusion, regrouping, lane splits, unrolling the IR does not ask for)
+        self.plain = plain
         self.cell_threads = 1  # threads per cell when a cell spans warps (a whole block), else 1
         self.shared_loop = False  # did lanes share a loop's work in the Tile being lowered?
         self.wants_spread = False  # would a Tile gain from spread cells (see run)?
@@ -232,17 +235,20 @@ class Lowerer:
             self.kernel.decls.append(f".shared .align 16 .b8 {LANE_BUFFER}[{self._lane_bytes}];")
         self.kernel.flatten()
         eliminate_dead_code(self.kernel)
-        vectorize_loads(self.kernel, self.b.align)
+        if not self.plain:
+            vectorize_loads(self.kernel, self.b.align)
         return self.kernel
 
     def body(self, stmts) -> None:
-        stmts = list(_issue_loads_early(stmts, self._readonly))
+        stmts = list(stmts if self.plain else _issue_loads_early(stmts, self._readonly))
         i = 0
         while i < len(stmts):
-            # later loops over the same iterations join this one (exact; see mapping.py)
-            s = mapping.absorb_siblings(stmts, i, self._fusable)
-            if kind(s) == "StridedLoop" and self.converged:
-                s = self._regrouped(stmts, i, s)
+            s = stmts[i]
+            if not self.plain:
+                # later loops over the same iterations join this one (exact; see mapping.py)
+                s = mapping.absorb_siblings(stmts, i, self._fusable)
+                if kind(s) == "StridedLoop" and self.converged:
+                    s = self._regrouped(stmts, i, s)
             handler = getattr(self, "stmt_" + kind(s), None)
             if handler is None:
                 raise LoweringError(f"unsupported statement {kind(s)}")
@@ -641,7 +647,7 @@ class Lowerer:
         them and ``_dealt`` its independent loops. ``run`` lowers a kernel with
         spread cells only when, lowered without, the lanes shared no loop."""
         launch = self.src.launch
-        if not (self.spread or candidate) or s.aux_threads or not _thread_free(s.body):
+        if self.plain or not (self.spread or candidate) or s.aux_threads or not _thread_free(s.body):
             return 1
         if not any(kind(x) in LOOPS for x in walk(s.body)):
             return 1  # nothing to share
@@ -741,6 +747,8 @@ class Lowerer:
     def _merge_congruent(self, s):
         """``s`` with provably equal accumulators sharing one representative
         (see congruence.py), and the members to alias after the loop."""
+        if self.plain:
+            return s, {}
         start = {}
         for st in s.body:
             if type(st).__name__ == "Accum":
@@ -770,7 +778,8 @@ class Lowerer:
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
                 self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
         else:
-            factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS, trips) if step.const is not None else 1
+            partly = step.const is not None and not self.plain
+            factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS, trips) if partly else 1
             self._rolled(s, start, step, end, trips, factor)
 
     def _auto_unroll(self, s) -> int:
@@ -779,6 +788,8 @@ class Lowerer:
         inner product), whose loads then all take immediate offsets (measured:
         a 256x256 cp.async matmul 6.8 -> 4.8 us; unrolling every loop of up to
         128 trips instead grew some kernels five times over)."""
+        if self.plain:
+            return 0
         tile = any(kind(x) == "Load" and isinstance(self.scope.lookup(x.input) or self.shared.get(x.input), SharedArray)
                    for x in walk(s.body))
         return SMEM_UNROLL_TRIPS if tile else AUTO_UNROLL_TRIPS
@@ -807,7 +818,7 @@ class Lowerer:
         splitting the loops in it (the coalescing-driven choice of the loop to
         parallelize, as in PPCG and Yang et al., PLDI'10).
         """
-        if not self.converged or trips is None or trips[0] != trips[1] or trips[0] < SPLIT_MIN_TRIPS:
+        if self.plain or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < SPLIT_MIN_TRIPS:
             return None
         fold = self._fold(s, start, step, end)
         n = trips[0]
@@ -927,9 +938,9 @@ class Lowerer:
         rather than kt[d, t]), one lane per key would read a cache line per
         lane, so a slot then has several lanes (``_key_lanes``), which split
         the key's dot product and read its row coalesced."""
-        if not self.converged or trips is None or trips[0] != trips[1] or None in (start.const, step.const):
+        if self.plain or not self.converged or trips is None or trips[0] != trips[1]:
             return None
-        if not s.seed or not mapping.is_pure_loop(s):
+        if None in (start.const, step.const) or not s.seed or not mapping.is_pure_loop(s):
             return None
         accs = [st for st in s.body if kind(st) == "Accum"]
         if not accs or any(st.dtype is not None and st.dtype.name != "f32" for st in accs):
@@ -978,7 +989,7 @@ class Lowerer:
         can take iterations r, r + G, ... instead: the same stores, G times
         fewer each. Each buffer is stored by one statement whose index moves
         with the loop variable, and the loop reads no buffer it stores."""
-        if not self.converged or trips is None or trips[0] != trips[1] or trips[0] < 2:
+        if self.plain or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < 2:
             return 0
         if any(kind(x) in mapping.CROSS_THREAD or kind(x) == "Init" for x in walk(s.body)):
             return 0

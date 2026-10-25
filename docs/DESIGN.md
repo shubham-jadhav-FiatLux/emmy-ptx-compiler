@@ -11,6 +11,7 @@ evaluation runner (RTX 5090), each problem with its own launch.
  KernelSource
       │  lower.Lowerer          one rule per IR statement, C block scoping;
       │                         per loop: split across lanes, lane-blocked, dealt, unrolled or rolled
+      │                         (should that fail: lowered again plainly, without the optional rewrites, §3)
       │      ├─ mapping / congruence / regroup   loop-body analyses and IR-to-IR rewrites
       │      ├─ builder.Builder                  folding · ranges · uniformity · value numbering · LICM
       │      └─ elementwise / mathlib
@@ -122,6 +123,23 @@ Unrolled and rolled loops run iterations in their original order, so their
 sums round exactly as the IR specifies. Read-only loads are issued as early as
 their indices allow (`_issue_loads_early`), so their latencies overlap the
 arithmetic between them.
+
+**The plain lowering, a fallback.** Every rewrite in this document is
+optional: each applies only when its preconditions hold, and each has been
+checked on hundreds of problems. Still, the hidden set may hold an IR shape
+that no rewrite foresaw. So `compile_file` catches any failure of the
+optimizing lowering, and also a module longer than the runner's 2,000,000
+characters. It prints the traceback to stderr and lowers the kernel again
+with `Lowerer(plain=True)`. That lowering is one rule per statement, in the
+IR's order, with loops unrolled only when the IR asks. None of the optional
+rewrites run: no early loads, fusion, regrouping, congruent accumulators,
+lane splits or blocks, dealt loops, spread cells, partial unrolling or
+vector-load merging. The builder's local work (folding, ranges, value
+numbering, LICM) stays. `compile.py --plain` forces this lowering, so it is
+tested like the main one: all 364 problems of the open set, the corpus, the
+held-out set and the schedule sweep pass with it, and so does every GPU test.
+It is slower, because lanes no longer share work (the open set's 64×64
+attention takes 81 µs instead of 9), but it computes the same results.
 
 ## 4. Lanes that compute the same thing
 
@@ -364,7 +382,11 @@ attention kernels 25-40% faster.
   (best of 5 runs) on the problems it affects.
 * `tests/` holds unit tests of the builder and of the rewrites, the lane-level
   interpreter for lane blocking, end-to-end compile checks, and hand-built IR
-  run on the GPU against numpy models (`EMMY_RUNNER` enables them).
+  run on the GPU against numpy models (`EMMY_RUNNER` enables them). The
+  compile checks and the GPU tests run every kernel through both the
+  optimizing and the plain lowering. Two tests make the optimizing lowering
+  fail on purpose, once by raising and once by producing too long a module,
+  and check that the fallback takes over.
 
 ## 9. Not supported
 

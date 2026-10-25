@@ -23,10 +23,11 @@ launch from `meta.json`:
 | Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **162 / 162** pass |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
+| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **364 / 364** pass (every problem above) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.28x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.3 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded float64) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) |
-| Tests | 80 (17 run hand-built IR on the GPU) |
+| Tests | 114 (34 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -68,6 +69,10 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   equal accumulators are merged, repeated arithmetic removed, independent
   sibling loops fused, and the online softmax's merge of two partial states is
   derived from the IR's own update.
+* **A fallback.** If the optimizing lowering fails on an IR shape it did not
+  foresee, or its module is longer than the runner accepts, the kernel is
+  lowered again plainly: one rule per statement, without the optional
+  rewrites. That lowering is slower but passes every problem above too.
 * **Numerics.** Elementwise arithmetic is IEEE single with explicit
   round-to-nearest, so pointwise kernels reproduce numpy bit for bit.
   `exp`, `log`, `tanh`, `erf`, `sin`, `cos` and `pow` are accurate routines
@@ -104,8 +109,9 @@ docs/DESIGN.md
 # unit + compile tests; set EMMY_RUNNER=http://runner.riftstack.ai:48701 to also run the GPU tests
 python -m pytest tests
 
-# compile, run and check problem folders on the runner (margin = share of the tolerance used)
-python tools/run_suite.py <problems-dir> [--bench]
+# compile, run and check problem folders on the runner (margin = share of the tolerance used);
+# --plain checks the fallback lowering instead (compile.py --plain)
+python tools/run_suite.py <problems-dir> [--bench] [--plain]
 
 # build the wider corpus with the organisers' generator (needs torch)
 python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --out corpus

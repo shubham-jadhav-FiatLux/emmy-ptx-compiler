@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile problem folders with compile.py, run them on the runner, check them.
 
-    python tools/run_suite.py PROBLEMS_DIR [PROBLEMS_DIR ...] [--jobs 4] [--bench]
+    python tools/run_suite.py PROBLEMS_DIR [PROBLEMS_DIR ...] [--jobs 4] [--bench] [--plain]
 
 Each argument is a problem folder (with meta.json) or a directory of them.
 Every kernel is compiled exactly the way the evaluator does it (a fresh
@@ -10,6 +10,7 @@ outputs are compared with expected.npz under the problem's rtol/atol. The
 table also shows how close each result came to its tolerance ("margin": the
 largest |got-ref| / (atol + rtol*|ref|), so <= 1 passes) and the worst error
 in ulps, which says far more than PASS/FAIL about numerical health.
+``--plain`` compiles with ``compile.py --plain`` (the fallback lowering).
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ def ulp_error(got: np.ndarray, ref: np.ndarray) -> float:
     return float(np.max(np.abs(ordered(g[ok]) - ordered(r[ok]))))
 
 
-def run_problem(pdir: Path, server: str, bench: bool) -> dict:
+def run_problem(pdir: Path, server: str, bench: bool, plain: bool = False) -> dict:
     meta = json.loads((pdir / "meta.json").read_text())
     expected = dict(np.load(pdir / "expected.npz")) if (pdir / "expected.npz").exists() else {}
     row = {"id": pdir.name, "ok": True, "us": 0.0, "regs": [], "compile_s": 0.0, "margin": 0.0, "ulp": 0.0, "err": ""}
@@ -68,7 +69,8 @@ def run_problem(pdir: Path, server: str, bench: bool) -> dict:
     for k in meta["kernels"]:
         ir = pdir / f"{k['entry']}.ir.json"
         t0 = time.time()
-        r = subprocess.run([sys.executable, str(COMPILER), str(ir)], capture_output=True, text=True)
+        cmd = [sys.executable, str(COMPILER), *(["--plain"] if plain else []), str(ir)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         row["compile_s"] += time.time() - t0
         if r.returncode != 0:
             return {**row, "ok": False, "err": "compile: " + (r.stderr.strip().splitlines() or ["?"])[-1][:160]}
@@ -128,11 +130,12 @@ def main() -> int:
     ap.add_argument("--server", default=RUNNER)
     ap.add_argument("--bench", action="store_true", help="time 20 launches after 3 warm-ups")
     ap.add_argument("--json", help="also write the rows to this file")
+    ap.add_argument("--plain", action="store_true", help="compile with the fallback lowering (compile.py --plain)")
     args = ap.parse_args()
 
     dirs = problem_dirs(args.paths)
     with ThreadPoolExecutor(args.jobs) as pool:
-        rows = list(pool.map(lambda d: _safe(d, args.server, args.bench), dirs))
+        rows = list(pool.map(lambda d: _safe(d, args.server, args.bench, args.plain), dirs))
     print(f"{'problem':<34} {'result':<6} {'us':>9} {'regs':>8} {'margin':>8} {'ulp':>8} {'compile':>8}")
     for r in rows:
         regs = "/".join(str(x) for x in r["regs"]) or "-"
@@ -147,9 +150,9 @@ def main() -> int:
     return 0 if passed == len(rows) else 1
 
 
-def _safe(d: Path, server: str, bench: bool) -> dict:
+def _safe(d: Path, server: str, bench: bool, plain: bool) -> dict:
     try:
-        return run_problem(d, server, bench)
+        return run_problem(d, server, bench, plain)
     except Exception as e:  # noqa: BLE001 - one broken problem must not stop the suite
         return {"id": d.name, "ok": False, "us": 0.0, "regs": [], "compile_s": 0.0, "margin": 0.0, "ulp": 0.0,
                 "err": f"harness: {type(e).__name__}: {e}"}
