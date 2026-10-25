@@ -318,11 +318,29 @@ thread folds the W totals.
 
 ## 6. Numerics (`elementwise.py`, `mathlib.py`)
 
-* **Basic arithmetic is IEEE single, round to nearest** (`add.rn`, `mul.rn`,
-  `div.rn`, `sqrt.rn`, `rcp.rn`). Written with `.rn`, ptxas may not contract a
-  multiply and an add into an FMA, so pointwise kernels match numpy's float32
-  results bit for bit (several problems demand `rtol = atol = 0`; nvcc's own
-  build of the reference CUDA fails some of them because it contracts).
+* **Basic arithmetic is IEEE, round to nearest** (`add.rn`, `mul.rn`,
+  `div.rn`, `sqrt.rn`, `rcp.rn`), in the precision of each operation's result
+  type. Written with `.rn`, ptxas may not contract a multiply and an add into
+  an FMA, so pointwise kernels match numpy bit for bit (several problems
+  demand `rtol = atol = 0`; nvcc's own build of the reference CUDA fails some
+  of them because it contracts).
+* **Float64.** Emmy's CUDA backend has no double arithmetic: it declares every
+  loaded value and temporary `float`, so its build of an f64 problem computes
+  in single precision. Numpy, whose answers the problems are checked against,
+  computes in double. We compute every f64 result in double precision
+  (`add.rn.f64` …), and keep float literals and constant buffers at full
+  precision, so f64 pointwise kernels match numpy bit for bit. `exp`, `log`
+  and `sigmoid` have double-precision versions; `tanh`, `erf`, `sin`, `cos`
+  and `pow` compute an f64 result in single precision. Reductions follow the
+  IR's types, and emmy gives an f64 sum an f32 accumulator, f32 shuffles and
+  a `float` shared array, so those results carry f32 accuracy whatever the
+  backend. A 64-bit shuffle moves as two 32-bit halves, and a split-K f64
+  matmul adds with `red.global.add.f64`. On float64 problems generated with
+  the organisers' tool and read back at full precision (scale and shift,
+  division, `where`, `relu`/`max`, `rsqrt`, `exp`, `log`, `sigmoid`, softmax,
+  layernorm, matmul), every pointwise result is bit-exact or within 2 ulp.
+  (The evaluator reads outputs back as float32, so for it any f64 tolerance
+  below float32 precision is out of reach in any case.)
 * **Reductions contract on purpose**: `acc += a*b` becomes `fma`, as nvcc
   does: faster and more accurate, and those problems carry a tolerance.
 * **Regrouped sums.** Splitting a reduction across lanes, or updating an
@@ -343,11 +361,15 @@ thread folds the W totals.
   | `sin`, `cos` | three-constant Cody-Waite reduction by π/2 with FMAs; float64 reduction beyond 105615 | ≤ 1 ulp up to 1e9 |
   | `pow` | `2^(y·log2|x|)` in float64 (atanh series, Taylor 2^t) plus the C99 special cases; small constant exponents as products | correctly rounded in practice |
   | `sigmoid` | emmy's spelling `1/(1+exp(-x))` | ≤ 3 ulp |
+  | `exp` (f64) | `x = j·ln2 + r` (fdlibm's split `ln2`, two FMAs); Taylor series of `e^r` to `r^13`; `2^j` as two exact factors, so subnormal results round once | ≤ 1 ulp |
+  | `log` (f64) | `x = m·2^e`, `m ∈ [√½, √2)`; fdlibm's `log(1+f) = f - (f²/2 - s(f²/2 + R))`, `s = f/(2+f)`, `R` the `atanh` series | ≤ 1 ulp, subnormals included |
+  | `sigmoid` (f64) | `1/(1+exp(-x))` with the f64 `exp` | ≤ 2 ulp |
 
   The polynomial coefficients are minimax fits produced by
   `tools/fit_poly.py`, which simulates the GPU's FMA evaluation to report each
   kernel's worst ulp error; `tools/mathtest.py` measures the finished routines
-  on the GPU over about a million inputs per range.
+  on the GPU over about a million inputs per range (the f64 ones against an
+  extended-precision reference).
 
 ## 7. Launch hints
 
@@ -393,4 +415,5 @@ attention kernels 25-40% faster.
 The statements TASK.md marks as outside the scope (tensor-core fragments,
 TMA/mbarrier, `SetMaxNReg`, `Carry`/`Pre` recurrences) raise a clear error.
 Emmy only produces them for tensor-core schedules (for example half-precision
-matmul) and warp-specialized pipelines.
+matmul) and warp-specialized pipelines. Double-precision `tanh`, `erf`, `sin`,
+`cos` and `pow` are computed in single precision (section 6).

@@ -105,6 +105,20 @@ def test_float_constants_fold_with_ieee_single_rounding():
     assert s.const == 1.0  # 1 + 2^-30 rounds back to 1 in float32
 
 
+def test_float64_arithmetic_stays_in_double_precision():
+    k, b = make()
+    s = b.fbin("+", b.float_const(0.1, "f64"), b.float_const(0.2, "f64"))
+    assert s.type == "f64" and s.const == 0.1 + 0.2  # folded in double, not via float32
+    x = b.pure("ld.global.f64", "f64", (Imm(0, "u64"),))
+    y = b.fbin("*", x, b.f32_const(0.5))  # an f32 operand is widened, not x narrowed
+    z = b.fbin("/", x, b.float_const(2.0**-600, "f64"))  # 1/2^-600 is a normal double: a multiply
+    assert (y.type, z.type) == ("f64", "f64")
+    assert b.fcmp("<", x, b.f32_const(1.0)).type == "pred"
+    assert b.select(b.fcmp("<", x, y), x, b.f32_const(0.0)).type == "f64"
+    assert b.convert(b.int_const(3), "f64").const == 3.0
+    assert ops(k) == ["ld.global.f64", "mul.rn.f64", "mul.rn.f64", "setp.lt.f64", "setp.lt.f64", "selp.f64"]
+
+
 def test_dead_code_elimination_keeps_effects():
     k, b = make()
     x = ranged(b, 0, 9)

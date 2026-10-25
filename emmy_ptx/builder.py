@@ -12,9 +12,10 @@ The lowering never writes PTX opcodes for arithmetic directly; it calls the
 * widens integer arithmetic to 64 bits only when a range could overflow 32.
 
 Integer semantics are C's (``/`` truncates, ``%`` is the C remainder), which
-is what Emmy's index expressions mean. Float arithmetic is IEEE single with
-round-to-nearest (``.rn``): spelled that way, ptxas may not contract a
-multiply and an add into one FMA, so results match numpy bit for bit.
+is what Emmy's index expressions mean. Float arithmetic is IEEE with
+round-to-nearest (``.rn``), in single precision, or double when an operand is
+f64: spelled that way, ptxas may not contract a multiply and an add into one
+FMA, so results match numpy bit for bit.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg
 
 INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
 WARP = 32
+NUMPY_FLOAT = {"f32": np.float32, "f64": np.float64}
 
 
 @dataclass(frozen=True)
@@ -326,6 +328,10 @@ class Builder:
     def f32_const(self, x: float) -> Value:
         return Value("f32", Imm(_f32(x), "f32"))
 
+    def float_const(self, x: float, type_: str) -> Value:
+        """``x`` as an f64 constant, or rounded to an f32 one for any other type."""
+        return Value("f64", Imm(float(x), "f64")) if type_ == "f64" else self.f32_const(x)
+
     def pred_const(self, b: bool) -> Value:
         return Value("pred", Imm(bool(b), "pred"))
 
@@ -409,17 +415,17 @@ class Builder:
             lo, hi = INT_RANGE["s32"]
             keep = v.lo is not None and lo <= v.lo and v.hi <= hi
             return self.pure("cvt.u32.u64", "s32", (v,), v.lo if keep else None, v.hi if keep else None)
-        if v.is_int and type_ == "f32":
+        if v.is_int and type_ in ("f32", "f64"):
             if v.const is not None:
-                return self.f32_const(float(v.const))
-            return self.pure(f"cvt.rn.f32.{v.type}", "f32", (v,))
+                return self.float_const(float(v.const), type_)
+            return self.pure(f"cvt.rn.{type_}.{v.type}", type_, (v,))
         if v.is_float and type_ in INT_RANGE:
-            if v.type != "f32":
+            if v.type == "f16":
                 v = self.convert(v, "f32")
-            return self.pure(f"cvt.rzi.{type_}.f32", type_, (v,))
+            return self.pure(f"cvt.rzi.{type_}.{v.type}", type_, (v,))
         if v.is_float and type_ in ("f16", "f32", "f64"):
-            if v.type == "f32" and v.const is not None and type_ == "f64":
-                return Value("f64", Imm(float(v.const), "f64"))
+            if v.const is not None and v.type in NUMPY_FLOAT and type_ in NUMPY_FLOAT:
+                return self.float_const(v.const, type_)
             rnd = ".rn" if _float_rank(type_) < _float_rank(v.type) else ""
             return self.pure(f"cvt{rnd}.{type_}.{v.type}", type_, (self.in_reg(v),))
         raise TypeError(f"cannot convert {v.type} to {type_}")
@@ -633,33 +639,36 @@ class Builder:
             a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
             lo, hi = min(a.lo, b.lo), max(a.hi, b.hi)
         else:
-            t = a.type if a.type == b.type else "f32"
+            t = a.type if a.type == b.type else float_type(a, b)
             a, b, lo, hi = self.convert(a, t), self.convert(b, t), None, None
         return self.pure(f"selp.{_mov_type(t)}", t, (a, b, p), lo, hi)
 
     # -- float arithmetic (IEEE, round to nearest) ------------------------------
 
     def fbin(self, op: str, a: Value, b: Value) -> Value:
-        """``+ - * /`` on f32, folded when both operands are constants."""
-        a, b = self.convert(a, "f32"), self.convert(b, "f32")
+        """``+ - * /`` on f32 (f64 when an operand is f64), folded when both
+        operands are constants."""
+        t = float_type(a, b)
+        a, b = self.convert(a, t), self.convert(b, t)
         if a.const is not None and b.const is not None:
-            x, y = np.float32(a.const), np.float32(b.const)
+            x, y = NUMPY_FLOAT[t](a.const), NUMPY_FLOAT[t](b.const)
             with np.errstate(all="ignore"):
                 r = {"+": x + y, "-": x - y, "*": x * y, "/": x / y}[op]
-            return self.f32_const(float(r))
+            return self.float_const(float(r), t)
         # identities exact for every x, NaN and -0 included (x + 0 is not: -0 + 0 = +0)
         if (op == "*" and b.const == 1.0) or (op == "/" and b.const == 1.0) or (op == "-" and _is_plus_zero(b)):
             return a
-        if op == "/" and _exact_inverse(b.const) is not None:
+        if op == "/" and _exact_inverse(b.const, t) is not None:
             # x / 2^k == x * 2^-k exactly (both scale by a power of two, rounding alike)
-            return self.fbin("*", a, self.f32_const(_exact_inverse(b.const)))
+            return self.fbin("*", a, self.float_const(_exact_inverse(b.const, t), t))
         if op == "*" and a.const == 1.0:
             return b
         name = {"+": "add.rn", "-": "sub.rn", "*": "mul.rn", "/": "div.rn"}[op]
-        return self.pure(f"{name}.f32", "f32", (a, b), commutative=op in "+*")
+        return self.pure(f"{name}.{t}", t, (a, b), commutative=op in "+*")
 
     def fma(self, a: Value, b: Value, c: Value) -> Value:
-        return self.pure("fma.rn.f32", "f32", tuple(self.convert(x, "f32") for x in (a, b, c)))
+        t = float_type(a, b, c)
+        return self.pure(f"fma.rn.{t}", t, tuple(self.convert(x, t) for x in (a, b, c)))
 
     def fop(self, op: str, *args, type_: str = "f32") -> Value:
         """Any other pure instruction, e.g. ``fop("sqrt.rn.f32", x)``."""
@@ -676,13 +685,15 @@ class Builder:
         return self.pure("mov.b32", "f32", (i,))
 
     def fcmp(self, op: str, a: Value, b: Value) -> Value:
-        """C float comparison -> predicate (ordered, except ``!=``)."""
-        a, b = self.convert(a, "f32"), self.convert(b, "f32")
+        """C float comparison -> predicate (ordered, except ``!=``), in f32
+        unless an operand is f64."""
+        t = float_type(a, b)
+        a, b = self.convert(a, t), self.convert(b, t)
         if a.const is not None and b.const is not None:
             x, y = a.const, b.const
             return self.pred_const({"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y, "==": x == y, "!=": x != y}[op])
         code = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "neu"}[op]
-        return self.pure(f"setp.{code}.f32", "pred", (a, b))
+        return self.pure(f"setp.{code}.{t}", "pred", (a, b))
 
     # -- control flow ---------------------------------------------------------------
 
@@ -722,14 +733,21 @@ def _decide(op, alo, ahi, blo, bhi):
     return None
 
 
-def _exact_inverse(c) -> float | None:
-    """1/c when c is a power of two whose inverse is a normal float, else None."""
+def _exact_inverse(c, type_: str = "f32") -> float | None:
+    """1/c when c is a power of two whose inverse is a normal float of
+    ``type_``, else None."""
     if c is None or c == 0 or not math.isfinite(c):
         return None
     m, e = math.frexp(abs(c))
-    if m != 0.5 or not -125 <= 1 - e <= 127:
+    low, high = (-1021, 1023) if type_ == "f64" else (-125, 127)
+    if m != 0.5 or not low <= 1 - e <= high:
         return None
     return math.copysign(2.0 ** (1 - e), c)
+
+
+def float_type(*values: Value) -> str:
+    """The type float arithmetic on ``values`` is done in: f64 if any is, else f32."""
+    return "f64" if any(v.type == "f64" for v in values) else "f32"
 
 
 def _is_plus_zero(v: Value) -> bool:

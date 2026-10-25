@@ -26,8 +26,8 @@ launch from `meta.json`:
 | Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **364 / 364** pass (every problem above) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.28x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.3 ms against 78.1 ms |
-| Math library accuracy (against correctly rounded float64) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) |
-| Tests | 114 (34 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
+| Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
+| Tests | 119 (38 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -73,10 +73,12 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   foresee, or its module is longer than the runner accepts, the kernel is
   lowered again plainly: one rule per statement, without the optional
   rewrites. That lowering is slower but passes every problem above too.
-* **Numerics.** Elementwise arithmetic is IEEE single with explicit
-  round-to-nearest, so pointwise kernels reproduce numpy bit for bit.
+* **Numerics.** Elementwise arithmetic is IEEE with explicit round-to-nearest,
+  in the precision of each result (an f64 result in double, which emmy's own
+  CUDA does not do), so pointwise kernels reproduce numpy bit for bit.
   `exp`, `log`, `tanh`, `erf`, `sin`, `cos` and `pow` are accurate routines
-  built from minimax polynomials and exact argument reductions. Splitting a
+  built from minimax polynomials and exact argument reductions (`exp`, `log`
+  and `sigmoid` also in double precision). Splitting a
   reduction regroups its sum (well within the tolerances); folds that are not
   split keep the IR's order.
 
@@ -96,7 +98,7 @@ emmy_ptx/
   builder.py           typed values, folding, ranges, value numbering, LICM, DCE
   vectorize.py         adjacent scalar loads -> ld.v2 / ld.v4
   elementwise.py       Assign/Accum operations and emmy's dtype rules
-  mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid
+  mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid (exp, log, sigmoid also in float64)
   ptx.py               registers, operands, instructions, module text
 tests/                 unit tests (builder, rewrites, a lane-level IR interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy

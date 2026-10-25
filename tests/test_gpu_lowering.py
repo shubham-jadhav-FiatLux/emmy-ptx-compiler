@@ -14,7 +14,7 @@ import pytest
 import requests
 
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F32
+from emmy.compiler.dtype import F32, F64
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import Smem, Sync, Tile, TreeHalve, WarpShuffle
@@ -44,22 +44,26 @@ def B(op, a, b):
     return BinaryExpr(op, a, b)
 
 
-def run(body, inputs: dict, outputs: dict, grid: int, block: int) -> dict:
+DTYPE = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64", np.dtype(np.int32): "i32"}
+
+
+def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str = "f32") -> dict:
     """Compile ``body`` as a kernel and run it; inputs/outputs map names to arrays/shapes."""
-    buffers = {n: Buffer(n, a.shape, "f32" if a.dtype == np.float32 else "i32") for n, a in inputs.items()}
-    buffers.update({n: Buffer(n, s, "f32") for n, s in outputs.items()})
+    buffers = {n: Buffer(n, a.shape, DTYPE[a.dtype]) for n, a in inputs.items()}
+    buffers.update({n: Buffer(n, s, out_dtype) for n, s in outputs.items()})
     params = tuple(inputs) + tuple(outputs)
     src = KernelSource("k_test", tuple(body), params, buffers, Launch(grid, block, 0), frozenset(outputs))
     ptx = Lowerer(src, plain=PLAIN).run().render(PTX_VERSION, TARGET)
     c = requests.post(f"{RUNNER}/compile", json={"ptx": ptx}, timeout=120).json()
     assert c.get("ok"), c.get("stderr")
     args = [dict(name=n, dtype=buffers[n].dtype, shape=list(a.shape), data=a.ravel().tolist()) for n, a in inputs.items()]
-    args += [dict(name=n, dtype="f32", shape=list(s), output=True) for n, s in outputs.items()]
+    args += [dict(name=n, dtype=out_dtype, shape=list(s), output=True) for n, s in outputs.items()]
     r = requests.post(f"{RUNNER}/run", json={
         "cubin_id": c["cubin_id"], "entry": "k_test", "grid": [grid, 1, 1], "block": [block, 1, 1], "smem_bytes": 0,
         "zero_outputs": [], "args": args, "warmup": 0, "iters": 1, "max_return": 1 << 16}, timeout=120).json()
     assert r.get("ok"), r.get("stderr")
-    return {n: np.array(r["outputs"][n]["values"], np.float32).reshape(s) for n, s in outputs.items()}
+    numpy_type = np.float64 if out_dtype == "f64" else np.float32
+    return {n: np.array(r["outputs"][n]["values"], numpy_type).reshape(s) for n, s in outputs.items()}
 
 
 rng = np.random.default_rng(7)
@@ -345,3 +349,42 @@ def test_integer_elementwise_ops():
     m = a - s * b
     want = (s + m + (a ^ b)).astype(np.float32)
     assert np.array_equal(got, want)
+
+
+def test_float64_results_are_computed_in_double_precision():
+    """The IEEE operations bit for bit like numpy's float64 (a float literal
+    of an f64 Let included); exp, log and sigmoid within 2 ulp."""
+    n = 256
+    x, y = rng.standard_normal(n), rng.standard_normal(n)
+    ops = [("add", "x", "y"), ("subtract", "x", "y"), ("multiply", "x", "y"), ("divide", "x", "y"),
+           ("abs", "y"), ("maximum", "x", "y"), ("reciprocal", "y"), ("multiply", "x", "tenth"),
+           ("exp", "x"), ("log", "v0"), ("sigmoid", "x"), ("sqrt", "v4")]
+    stmts = [Load(name="x", input="xs", index=(Var("i"),)), Load(name="y", input="ys", index=(Var("i"),)),
+             Let(name="tenth", value=Literal(0.1), dtype=F64)]
+    stmts += [Assign(f"v{k}", op, args, dtype=F64) for k, (op, *args) in enumerate(ops)]
+    stmts += [Write("out", (I(k), Var("i")), f"v{k}") for k in range(len(ops))]
+    body = [Tile(axes=(Axis("i", Dim(n)),), body=tuple(stmts))]
+    got = run(body, {"xs": x, "ys": y}, {"out": (len(ops), n)}, 1, n, out_dtype="f64")["out"]
+    exact = [x + y, x - y, x * y, x / y, abs(y), np.maximum(x, y), 1 / y, x * 0.1]
+    assert np.array_equal(got[:8], np.array(exact))
+    with np.errstate(invalid="ignore"):  # log(x + y) is NaN where x + y < 0
+        want = np.array([np.exp(x), np.log(x + y), 1 / (1 + np.exp(-x)), np.sqrt(abs(y))])
+    close = np.abs(got[8:] - want) <= 2 * np.spacing(np.abs(want))
+    assert np.all(close | (np.isnan(got[8:]) & np.isnan(want)))
+
+
+def test_float64_warp_sum_and_atomic_add():
+    """A float64 butterfly moves both halves of each value; lane 0 of each warp
+    then adds its warp's sum into one float64 output atomically."""
+    x = rng.standard_normal(256)
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(256)),), body=(
+        Load(name="x0", input="x", index=(t,)),
+        Init("acc", 0.0, dtype=F64),
+        Accum("acc", "x0", dtype=F64),
+        WarpShuffle(state=("acc",), state_b=("acc__o",), length=32, dtype=F64,
+                    combine_states=(Assign("acc", "add", ("acc", "acc__o"), dtype=F64),)),
+        Cond(cond=B("==", B("%", t, I(32)), I(0)), body=(Write("out", (I(0),), "acc", atomic=True),)),
+    ))]
+    got = run(body, {"x": x}, {"out": (1,)}, 1, 256, out_dtype="f64")["out"][0]
+    assert abs(got - x.sum()) <= 1e-13 * np.abs(x).sum()

@@ -57,6 +57,9 @@ VALUE_TYPE = {
     "s16": "s32", "u16": "s32", "s8": "s32", "u8": "s32",
 }
 
+# memory type -> the red.add that adds a value to it (an integer add is the same for either sign)
+ATOMIC_ADD = {"f32": "f32", "f64": "f64", "f16": "noftz.f16", "s32": "s32", "u32": "u32", "s64": "u64", "u64": "u64"}
+
 STATIC_SMEM_LIMIT = 48 * 1024
 # Alignment (bytes) assumed for every buffer base: cudaMalloc returns 256-byte
 # aligned memory and emmy's own float4 accesses rely on 16; shared arrays are
@@ -431,20 +434,22 @@ class Lowerer:
 
     # ------------------------------------------------------------- expressions
 
-    def expr(self, e) -> Value:
+    def expr(self, e, ftype: str = "f32") -> Value:
+        """The value of expression ``e``; float literals in it are ``ftype``
+        constants (f64 in the value of an f64 Let)."""
         kind = type(e).__name__
         b = self.b
         if kind == "Var":
             return self.value(e.name)
         if kind == "Literal":
             if isinstance(e.value, float) or e.dtype == "float":
-                return b.f32_const(float(e.value))
+                return b.float_const(float(e.value), ftype)
             return b.int_const(int(e.value))
         if kind == "BinaryExpr":
-            return self._binary(e.op, e.left, e.right)
+            return self._binary(e.op, e.left, e.right, ftype)
         if kind == "TernaryExpr":
             p = self.pred(e.cond)
-            t, f = self.expr(e.if_true), self.expr(e.if_false)
+            t, f = self.expr(e.if_true, ftype), self.expr(e.if_false, ftype)
             t, f = _promote_pair(b, t, f)
             return b.select(p, t, f)
         if kind == "CastExpr":
@@ -463,12 +468,12 @@ class Lowerer:
     def pred(self, e) -> Value:
         return self.b.truthy(self.expr(e))
 
-    def _binary(self, op: str, left, right) -> Value:
+    def _binary(self, op: str, left, right, ftype: str = "f32") -> Value:
         b = self.b
         if op in ("&&", "||"):
             x, y = self.pred(left), self.pred(right)
             return b.pand(x, y) if op == "&&" else b.por(x, y)
-        x, y = self.expr(left), self.expr(right)
+        x, y = self.expr(left, ftype), self.expr(right, ftype)
         x = b.convert(x, "s32") if x.type == "pred" else x
         y = b.convert(y, "s32") if y.type == "pred" else y
         if op in ("<", "<=", ">", ">=", "==", "!="):
@@ -1386,7 +1391,8 @@ class Lowerer:
         if s.dtype is None:
             v = self.expr(s.value)
         else:
-            v = self.b.convert(self.expr(s.value), elementwise.value_type(s.dtype.name))
+            vtype = elementwise.value_type(s.dtype.name)
+            v = self.b.convert(self.expr(s.value, "f64" if vtype == "f64" else "f32"), vtype)
         self.define(s.name, v)
 
     def stmt_Init(self, s) -> None:
@@ -1443,7 +1449,10 @@ class Lowerer:
         if isinstance(buf, GlobalBuffer) and s.input in self.src.constants and s.is_scalar:
             value = self.src.constants[s.input]  # a 1-element buffer holds exactly this
             vtype = VALUE_TYPE[mtype]
-            const = self.b.int_const(int(value), vtype) if vtype in INT_RANGE else self.b.convert(self.b.f32_const(value), vtype)
+            if vtype in INT_RANGE:
+                const = self.b.int_const(int(value), vtype)
+            else:
+                const = self.b.convert(self.b.float_const(value, vtype), vtype)
             self.define(s.names[0], const)
             return
         values = self.load(buf, mtype, s.index, len(s.names))
@@ -1487,11 +1496,10 @@ class Lowerer:
         shared = isinstance(buf, SharedArray)
         space = "shared" if shared else "global"
         if s.atomic:
-            if buf.type != "f32" and buf.type != "s32":
+            if buf.type not in ATOMIC_ADD:
                 raise LoweringError(f"atomic add on {buf.type} is not supported")
             addr = self.address(buf, flat=base, swizzle=s.swizzle)
-            op = "red.global.add.f32" if buf.type == "f32" else "red.global.add.s32"
-            b.emit(op if not shared else op.replace("global", "shared"), addr, values[0])
+            b.emit(f"red.{space}.add.{ATOMIC_ADD[buf.type]}", addr, values[0])
             return
         k = 0
         while k < len(values):
@@ -1575,15 +1583,32 @@ class Lowerer:
             with self.block():
                 for st, sb in zip(state, state_b):
                     cur = b.in_reg(b.convert(self.value(st), vtype))
-                    out = self.kernel.reg(vtype)
-                    b.emit("shfl.sync.bfly.b32", out, cur, Imm(lane_mask, "u32"), Imm(31, "u32"), mask, ndefs=1, effect=False)
-                    self.define(sb, Value(vtype, out))
+                    self.define(sb, self._shuffle_xor(cur, lane_mask, mask))
                 self.merge(program, state, vtype)
             lane_mask //= 2
         for st in state:  # the butterfly leaves each aligned group of `length` lanes agreeing
             var = self.scope.lookup(st)
             if isinstance(var, Variable):
                 var.ug = max(var.ug, min(WARP, length))
+
+    def _shuffle_xor(self, v: Value, lane_mask: int, mask) -> Value:
+        """``v`` of the lane ``lane_mask`` away (``shfl.sync.bfly``, which moves
+        32 bits): a 64-bit value moves as its two halves, a 16-bit one as f32."""
+        b = self.b
+        size = SIZEOF.get(v.type, 4)
+        if size == 2:
+            return b.convert(self._shuffle_xor(b.convert(v, "f32"), lane_mask, mask), v.type)
+        out = self.kernel.reg(v.type)
+        if size == 4:
+            b.emit("shfl.sync.bfly.b32", out, v, Imm(lane_mask, "u32"), Imm(31, "u32"), mask, ndefs=1, effect=False)
+            return Value(v.type, out)
+        halves = tuple(self.kernel.reg("s32") for _ in range(2))
+        moved = tuple(self.kernel.reg("s32") for _ in range(2))
+        b.emit("mov.b64", Vec(halves), v, ndefs=1, effect=False)
+        for src, dst in zip(halves, moved):
+            b.emit("shfl.sync.bfly.b32", dst, src, Imm(lane_mask, "u32"), Imm(31, "u32"), mask, ndefs=1, effect=False)
+        b.emit("mov.b64", out, Vec(moved), ndefs=1, effect=False)
+        return Value(v.type, out)
 
     def stmt_LaneSlot(self, s) -> None:
         """``(lane % group) / share``, alike on the ``share`` lanes of a slot."""

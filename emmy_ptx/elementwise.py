@@ -1,13 +1,18 @@
 """Elementwise operations (``Assign``, ``Accum`` and combine programs).
 
 Semantics follow emmy's CUDA rendering (``op_to_expr`` plus the CUDA math
-library). Basic arithmetic is IEEE single precision rounded to nearest, so a
-pointwise kernel reproduces numpy's float32 results bit for bit; the
-transcendental functions come from :mod:`emmy_ptx.mathlib`.
+library). Basic arithmetic is IEEE rounded to nearest, so a pointwise kernel
+reproduces numpy's results bit for bit; the transcendental functions come from
+:mod:`emmy_ptx.mathlib`.
 
-Result types follow emmy's ``dtype_promote``: integer arithmetic and bit
-operations on integer operands stay integer, all-f16 operands stay f16 (we
-compute them in f32 and round once), everything else is f32.
+Result types follow emmy's ``dtype_promote`` unless the IR gives one:
+integer arithmetic and bit operations on integer operands stay integer,
+all-f16 operands stay f16 (we compute them in f32 and round once), everything
+else is f32. An operation is computed in its result's type: an f64 result in
+double precision (emmy's CUDA computes those in float too; numpy, whose
+answers the problems check, does not). Of the transcendental functions only
+exp, log and sigmoid have double-precision versions; the others compute an
+f64 result in single precision.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import mathlib
-from .builder import Builder, Value
+from .builder import NUMPY_FLOAT, Builder, Value, float_type
 
 INTEGER_DTYPES = frozenset({"i16", "i32", "i64", "u8", "u16", "u32", "u64"})
 INTEGER_OPS = frozenset({
@@ -55,20 +60,16 @@ def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     if out_type in ("s32", "s64") and op in _INT:
         args = [b.convert(a, out_type) for a in args]
         return _INT[op](b, *args)
-    fn = _FLOAT.get(op)
+    double = out_type == "f64" and (op in _DOUBLE or op not in _SINGLE)
+    fn = _DOUBLE.get(op, _FLOAT.get(op)) if double else _FLOAT.get(op)
     if fn is None:
         raise NotImplementedError(f"elementwise op {op!r}")
+    ftype = "f64" if double else "f32"
     if op in ("where",):  # the condition keeps its own type; C tests it for non-zero
-        args = [args[0], *(b.convert(a, "f32") for a in args[1:])]
+        args = [args[0], *(b.convert(a, ftype) for a in args[1:])]
     else:
-        args = [b.convert(a, "f32") for a in args]
+        args = [b.convert(a, ftype) for a in args]
     return b.convert(fn(b, *args), out_type)
-
-
-def _f32_div(a: float, b: float) -> float:
-    """IEEE single division, as ``div.rn.f32`` computes it."""
-    with np.errstate(all="ignore"):
-        return float(np.float32(a) / np.float32(b))
 
 
 def _as_float(b: Builder, p: Value) -> Value:
@@ -81,21 +82,31 @@ def _cmp(op: str):
 
 
 def _unary(opcode: str, fold):
+    """One instruction, ``opcode.f32`` or ``opcode.f64`` by the operand's type;
+    ``fold`` computes it on a constant (a numpy scalar of that type)."""
     def fn(b: Builder, x: Value) -> Value:
         if x.const is not None and fold is not None:
-            return b.f32_const(fold(x.const))
-        return b.fop(opcode, b.in_reg(x))
+            with np.errstate(all="ignore"):
+                return b.float_const(float(fold(NUMPY_FLOAT[x.type](x.const))), x.type)
+        return b.fop(f"{opcode}.{x.type}", b.in_reg(x), type_=x.type)
     return fn
 
 
 def _minmax(opcode: str, pick):
     def fn(b: Builder, x: Value, y: Value) -> Value:
+        t = float_type(x, y)
+        x, y = b.convert(x, t), b.convert(y, t)
         if x.const is not None and y.const is not None:
-            return b.f32_const(pick(x.const, y.const))
+            return b.float_const(pick(x.const, y.const), t)
         if x.const is not None:
             x, y = y, x
-        return b.pure(opcode, "f32", (x, y), commutative=True)
+        return b.pure(f"{opcode}.{t}", t, (x, y), commutative=True)
     return fn
+
+
+def _sqrt(v):
+    """IEEE square root of a numpy scalar (NaN below zero)."""
+    return np.sqrt(v) if v >= 0 else np.nan
 
 
 _FLOAT = {
@@ -103,17 +114,17 @@ _FLOAT = {
     "subtract": lambda b, x, y: b.fbin("-", x, y),
     "multiply": lambda b, x, y: b.fbin("*", x, y),
     "divide": lambda b, x, y: b.fbin("/", x, y),
-    "maximum": _minmax("max.f32", max),
-    "minimum": _minmax("min.f32", min),
-    "negative": _unary("neg.f32", lambda v: -v),
-    "abs": _unary("abs.f32", abs),
+    "maximum": _minmax("max", max),
+    "minimum": _minmax("min", min),
+    "negative": _unary("neg", lambda v: -v),
+    "abs": _unary("abs", abs),
     "copy": lambda b, x: x,
     "pad": lambda b, x: x,
     "square": lambda b, x: b.fbin("*", x, x),
-    "reciprocal": _unary("rcp.rn.f32", lambda v: _f32_div(1.0, v)),
-    "relu": lambda b, x: _minmax("max.f32", max)(b, x, b.f32_const(0.0)),
-    "sqrt": _unary("sqrt.rn.f32", lambda v: float(np.sqrt(np.float32(v))) if v >= 0 else float("nan")),
-    "rsqrt": _unary("rsqrt.approx.f32", None),
+    "reciprocal": _unary("rcp.rn", lambda v: 1 / v),
+    "relu": lambda b, x: _minmax("max", max)(b, x, b.f32_const(0.0)),
+    "sqrt": _unary("sqrt.rn", _sqrt),
+    "rsqrt": _unary("rsqrt.approx", None),
     "exp": mathlib.exp,
     "exp_fast": mathlib.exp_fast,
     "log": mathlib.log,
@@ -133,6 +144,16 @@ _FLOAT = {
     "bitwise_and": lambda b, x, y: _as_float(b, b.pand(b.truthy(x), b.truthy(y))),
     "bitwise_or": lambda b, x, y: _as_float(b, b.por(b.truthy(x), b.truthy(y))),
     "bitwise_not": lambda b, x: _as_float(b, b.fcmp("==", x, b.f32_const(0.0))),
+}
+# the single-precision routines of _FLOAT (the rest work in either precision), and the
+# double-precision versions that exist
+_SINGLE = frozenset({"rsqrt", "exp", "exp_fast", "log", "sigmoid", "tanh", "erf", "sin", "cos", "pow"})
+_DOUBLE = {
+    "rsqrt": lambda b, x: _FLOAT["reciprocal"](b, _FLOAT["sqrt"](b, x)),
+    "exp": mathlib.exp64,
+    "exp_fast": mathlib.exp64,
+    "log": mathlib.log64,
+    "sigmoid": mathlib.sigmoid64,
 }
 
 _INT = {

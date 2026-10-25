@@ -1,4 +1,5 @@
-"""Accurate single-precision math functions, built from PTX primitives.
+"""Accurate math functions, built from PTX primitives: single precision, plus
+double-precision exp, log and sigmoid.
 
 The hardware offers fast approximations (``ex2.approx``, ``lg2.approx``,
 ``sin.approx`` ...) whose error grows with the argument. Each function here
@@ -47,6 +48,12 @@ PIO2_A, PIO2_B, PIO2_C = 1.5707963705062866, -4.371138828673793e-08, -1.71512451
 TWO_OVER_PI = 0.6366197723675814
 TRIG_FAST_LIMIT = 105615.0  # beyond this the float32 reduction loses bits; use float64
 PIO2_HI_D, PIO2_LO_D = 1.5707963267948966, 6.123233995736766e-17
+
+# float64: ln 2 = LN2_HI_D + LN2_LO_D, LN2_HI_D with 32 significant bits so k * LN2_HI_D is
+# exact for |k| < 2^21 (fdlibm's split)
+LN2_HI_D, LN2_LO_D = 6.93147180369123816490e-01, 1.90821492927058770002e-10
+SQRT_HALF_BITS = 0x3FE6A09E667F3BCD  # float64 bits of sqrt(1/2)
+DBL_MIN = 2.2250738585072014e-308  # smallest normal float64
 
 
 def _c(b: Builder, x: float) -> Value:
@@ -242,9 +249,7 @@ def _reduce_half_pi(b: Builder, x: Value):
 
 
 def _f64(b: Builder, v: float) -> Value:
-    from .ptx import Imm
-
-    return Value("f64", Imm(float(v), "f64"))
+    return b.float_const(v, "f64")
 
 
 def _sincos_kernels(b: Builder, r: Value):
@@ -274,6 +279,100 @@ def cos(b: Builder, x: Value) -> Value:
     v = b.select(b.icmp("!=", b.bitop("&", k, b.int_const(1)), b.int_const(0)), s, c)
     neg = b.icmp("!=", b.bitop("&", b.add(k, b.int_const(1)), b.int_const(2)), b.int_const(0))
     return b.select(neg, b.fop("neg.f32", v), v)
+
+
+# ---------------------------------------------------------------- float64 exp, log
+
+
+def _fold64(b: Builder, fn, x: Value) -> Value | None:
+    if x.const is None:
+        return None
+    try:
+        return _f64(b, fn(float(x.const)))
+    except (OverflowError, ValueError):
+        return None
+
+
+def _horner64(b: Builder, coeffs, u: Value) -> Value:
+    acc = _f64(b, coeffs[-1])
+    for c in reversed(coeffs[:-1]):
+        acc = b.fma(acc, u, _f64(b, c))
+    return acc
+
+
+def _pow2_64(b: Builder, k: Value) -> Value:
+    """2^k as a float64, for an int k in the normal exponent range."""
+    return b.pure("mov.b64", "f64", (b.shl(b.convert(b.add(k, b.int_const(1023)), "s64"), b.int_const(52)),))
+
+
+def _exp_or_inf(v: float) -> float:
+    try:
+        return math.exp(v)
+    except OverflowError:
+        return INF
+
+
+EXP64 = tuple(1.0 / math.factorial(k) for k in range(14))  # e^r to r^13: below 0.02 ulp on |r| <= ln2/2
+
+
+def exp64(b: Builder, x: Value) -> Value:
+    """e^x in float64: 2^j * e^r with j = rint(x * log2 e), r = x - j*ln2 by
+    two FMAs against fdlibm's split ln 2, and e^r by its Taylor series.
+
+    x is first clamped to [-746, 710], past which e^x rounds to 0 or inf, so j
+    stays in [-1077, 1025]; 2^j is applied as two powers of two, so a result in
+    the subnormal range is rounded once, by the last multiply.
+    """
+    folded = _fold64(b, _exp_or_inf, x)
+    if folded is not None:
+        return folded
+    xc = b.fop("min.f64", b.fop("max.f64", b.in_reg(x), _f64(b, -746.0), type_="f64"), _f64(b, 710.0), type_="f64")
+    j = b.fop("cvt.rni.f64.f64", b.fbin("*", xc, _f64(b, 1.0 / math.log(2.0))), type_="f64")
+    nj = b.fop("neg.f64", j, type_="f64")
+    r = b.fma(nj, _f64(b, LN2_HI_D), xc)
+    r = b.fma(nj, _f64(b, LN2_LO_D), r)
+    k = b.assume(b.fop("cvt.rzi.s32.f64", j, type_="s32"), -1077, 1025)
+    half = b.shr(k, b.int_const(1))
+    y = b.fbin("*", b.fbin("*", _horner64(b, EXP64, r), _pow2_64(b, half)), _pow2_64(b, b.sub(k, half)))
+    return _keep_nan(b, x, y)
+
+
+# log(1 + f) = 2 atanh(s), s = f / (2 + f): R(z) = sum 2 z^k / (2k + 1), z = s^2 <= 0.0295
+LOG64 = tuple(2.0 / (2 * k + 1) for k in range(1, 12))
+
+
+def log64(b: Builder, x: Value) -> Value:
+    """log x in float64: x = m * 2^e with m in [sqrt(1/2), sqrt(2)) (subnormals
+    scaled by 2^54 first), and log m = log(1 + f) = f - (f^2/2 - s(f^2/2 + R))
+    with s = f / (2 + f), fdlibm's arrangement, in which the large term f is
+    exact and only small corrections round."""
+    folded = _fold64(b, math.log, x)
+    if folded is not None:
+        return folded
+    tiny = b.fcmp("<", x, _f64(b, DBL_MIN))
+    xs = b.select(tiny, b.fbin("*", x, _f64(b, 2.0**54)), x)
+    i = b.bitop("&", b.pure("mov.b64", "s64", (b.in_reg(xs),)), b.int_const((1 << 63) - 1, "s64"))
+    t = b.sub(i, b.int_const(SQRT_HALF_BITS, "s64"))
+    e = b.shr(t, b.int_const(52))
+    m = b.pure("mov.b64", "f64", (b.add(b.bitop("&", t, b.int_const((1 << 52) - 1, "s64")),
+                                        b.int_const(SQRT_HALF_BITS, "s64")),))
+    ef = b.fbin("-", b.convert(e, "f64"), b.select(tiny, _f64(b, 54.0), _f64(b, 0.0)))
+    f = b.fbin("-", m, _f64(b, 1.0))
+    s = b.fbin("/", f, b.fbin("+", f, _f64(b, 2.0)))
+    z = b.fbin("*", s, s)
+    hfsq = b.fbin("*", _f64(b, 0.5), b.fbin("*", f, f))
+    r = b.fbin("*", z, _horner64(b, LOG64, z))
+    log1p = b.fbin("-", f, b.fbin("-", hfsq, b.fbin("*", s, b.fbin("+", hfsq, r))))
+    y = b.fma(ef, _f64(b, LN2_HI_D), b.fma(ef, _f64(b, LN2_LO_D), log1p))
+    y = b.select(b.fcmp("==", x, _f64(b, INF)), _f64(b, INF), y)
+    y = b.select(b.fcmp("==", x, _f64(b, 0.0)), _f64(b, -INF), y)
+    return b.select(b.fcmp(">=", x, _f64(b, 0.0)), y, _f64(b, NAN))  # x < 0 or NaN
+
+
+def sigmoid64(b: Builder, x: Value) -> Value:
+    """emmy's spelling, 1 / (1 + e^(0 - x)), in float64."""
+    e = exp64(b, b.fbin("-", _f64(b, 0.0), x))
+    return b.fop("rcp.rn.f64", b.fbin("+", _f64(b, 1.0), e), type_="f64")
 
 
 # ---------------------------------------------------------------- pow
