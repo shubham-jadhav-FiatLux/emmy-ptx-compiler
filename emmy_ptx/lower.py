@@ -158,6 +158,7 @@ class Lowerer:
         self.converged = False  # every lane of each warp is executing the current statement
         self.shared = self._layout_shared()
         self.globals = self._prologue()
+        self._readonly = frozenset(n for n, g in self.globals.items() if g.readonly)
 
     # ------------------------------------------------------------------ driver
 
@@ -170,7 +171,7 @@ class Lowerer:
         return self.kernel
 
     def body(self, stmts) -> None:
-        for s in stmts:
+        for s in _issue_loads_early(stmts, self._readonly):
             handler = getattr(self, "stmt_" + type(s).__name__, None)
             if handler is None:
                 raise LoweringError(f"unsupported statement {type(s).__name__}")
@@ -1128,6 +1129,38 @@ def _body_size(stmts) -> int:
         else:
             total += 1
     return max(total, 1)
+
+
+def _issue_loads_early(stmts, readonly: frozenset) -> tuple:
+    """``stmts`` with every load of read-only global memory moved up past the
+    statements before it that do not produce any name its index reads.
+
+    Nothing can change read-only memory, so the load computes the same value
+    earlier; issuing loads before the arithmetic between them lets their
+    latencies overlap (and lets adjacent ones merge into one vector load),
+    which matters most when that arithmetic contains branches.
+    """
+    out: list = []
+    for s in stmts:
+        if type(s).__name__ == "Load" and s.input in readonly:
+            needs = {v for e in s.index for v in e.free_vars()}
+            pos = len(out)
+            while pos > 0 and type(out[pos - 1]).__name__ != "Load" and not (_produces(out[pos - 1]) & needs):
+                pos -= 1
+            out.insert(pos, s)
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _produces(s) -> set[str]:
+    """Names a statement declares or reassigns that later statements can see."""
+    kind = type(s).__name__
+    if kind == "Load":
+        return set(s.names)
+    if kind in ("Assign", "Let", "Init", "Select", "Accum", "Smem"):
+        return {s.name}
+    return _assigned_in((s,)) | ({"*"} if kind in ("WarpShuffle", "TreeHalve") else set())
 
 
 def _lowbit(n: int) -> int:
