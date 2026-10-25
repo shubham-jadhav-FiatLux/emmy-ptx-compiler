@@ -163,6 +163,7 @@ class Builder:
         self._ug: dict[str, int] = {}  # register -> uniform group of its value (see Value.ug)
         self.align: dict[str, int] = {}  # address register -> known byte alignment
         self._defs: dict = {}  # value key -> (opcode, operands) of the instruction that made it
+        self._vars: dict[str, Variable] = {}  # register -> the variable it holds
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -364,9 +365,18 @@ class Builder:
     def variable(self, type_: str, init: Value | None = None, lo=None, hi=None) -> Variable:
         var = Variable(self.k.reg(type_), type_, lo, hi)
         self._level[var.reg.name] = 1 << 30  # reassigned: invariant in no loop
+        self._vars[var.reg.name] = var
         if init is not None:
             self.assign(var, init)
         return var
+
+    def current(self, v: Value) -> bool:
+        """Does ``v`` still hold what was read? Always for an immutable value; a
+        read of a variable only until the next write to it (or merge point)."""
+        if not v.mutable:
+            return True
+        var = self._vars.get(v.op.name)
+        return var is not None and v.version is not None and var.version == v.version
 
     def assign(self, var: Variable, v: Value) -> None:
         v = self.convert(v, var.type)

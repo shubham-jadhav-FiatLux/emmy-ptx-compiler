@@ -36,6 +36,8 @@ from dataclasses import replace
 from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.stmt.leaves import Let
 
+from .mapping import reads
+
 _SUPPORTED = ("Load", "Assign", "Let", "Init", "Accum", "Loop", "StridedLoop", "Select", "Write", "Cond")
 _REDUCE = {"add": "add", "sum": "add", "multiply": "multiply", "prod": "multiply",
            "maximum": "maximum", "amax": "maximum", "fmax": "maximum", "minimum": "minimum", "fmin": "minimum"}
@@ -246,6 +248,29 @@ def merge_congruent(body, members: dict[str, str]):
         if kind == "Accum" and s.name in rename and s.name in reps:
             del rename[s.name]  # the representative now holds its updated value
     return tuple(out)
+
+
+def drop_needless_snapshots(body) -> tuple:
+    """``body`` without the snapshots ``Let r$top = r`` (from merge_congruent)
+    whose every read comes before ``r``'s own update: up to there ``r`` still
+    holds the snapshot's value, so those reads can name ``r`` itself. (A
+    snapshot some read needs after the update stays, and keeps all its reads,
+    so equal computations of members and representative stay equal.)"""
+    body = tuple(body)
+    first = {}
+    for i, s in enumerate(body):
+        if type(s).__name__ == "Accum":
+            first.setdefault(s.name, i)
+    drop = {}
+    for s in body:
+        if type(s).__name__ == "Let" and s.name.endswith("$top") and type(s.value).__name__ == "Var":
+            r = s.value.name
+            readers = [i for i, x in enumerate(body) if s.name in reads((x,))]
+            if all(i <= first.get(r, -1) for i in readers):
+                drop[s.name] = r
+    if not drop:
+        return body
+    return tuple(_renamed(s, drop) for s in body if not (type(s).__name__ == "Let" and s.name in drop))
 
 
 def _renamed(s, rename: dict[str, str]):

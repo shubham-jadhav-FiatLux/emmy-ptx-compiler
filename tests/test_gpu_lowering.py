@@ -178,6 +178,54 @@ def test_reduction_shared_by_lanes_is_split_across_them(cols, trips):
     assert np.allclose(got, want, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("cols", [256, 96])
+def test_online_softmax_over_matmul_rows_is_split_across_lanes(cols):
+    """softmax(x @ w)'s normalizer, the way emmy fuses it: every lane of a warp
+    needs its row's running max and sum over all matmul columns. The compiler
+    splits the column loop across the lanes (each lane computes whole dot
+    products, reading w coalesced), merges the online-softmax states with the
+    derived combine, and computes the two identical copies of the row's state
+    (per output column, as emmy emits them) only once."""
+    rows, k = 8, 64
+    x = rng.standard_normal((rows, k)).astype(np.float32)
+    w = rng.standard_normal((k, cols)).astype(np.float32)
+
+    def normalizer(c):
+        j, kk = Axis(f"j{c}", Dim(cols)), Axis(f"k{c}", Dim(k))
+        return Loop(axis=j, body=(
+            Loop(axis=kk, body=(
+                Load(name=f"xv{c}", input="x", index=(Var("r"), Var(kk.name))),
+                Load(name=f"wv{c}", input="w", index=(Var(kk.name), Var(j.name))),
+                Assign(f"p{c}", "multiply", (f"xv{c}", f"wv{c}")),
+                Accum(f"s{c}", f"p{c}"),
+            )),
+            Let(name=f"one{c}", value=Literal(1.0), dtype=F32),
+            Assign(f"gn{c}", "maximum", (f"s{c}", f"m{c}")),
+            Assign(f"dg{c}", "subtract", (f"m{c}", f"gn{c}")),
+            Assign(f"alpha{c}", "exp", (f"dg{c}",)),
+            Assign(f"dgo{c}", "subtract", (f"s{c}", f"gn{c}")),
+            Assign(f"beta{c}", "exp", (f"dgo{c}",)),
+            Assign(f"sa{c}", "multiply", (f"alpha{c}", f"l{c}")),
+            Assign(f"sb{c}", "multiply", (f"beta{c}", f"one{c}")),
+            Accum(f"l{c}", f"sb{c}", base=f"sa{c}"),
+            Accum(f"m{c}", f"s{c}", op="maximum"),
+        ))
+
+    body = [Tile(axes=(Axis("r", Dim(rows)), Axis("c", Dim(32))), body=(
+        normalizer(0),
+        Write("out_m", (Var("r"), Var("c")), "m0"),
+        normalizer(1),
+        Assign("lsum", "add", ("l0", "l1")),
+        Write("out_l", (Var("r"), Var("c")), "lsum"),
+    ))]
+    got = run(body, {"x": x, "w": w}, {"out_m": (rows, 32), "out_l": (rows, 32)}, 1, 256)
+    s = x.astype(np.float64) @ w.astype(np.float64)
+    m = s.max(1)
+    l = np.exp(s - m[:, None]).sum(1)
+    assert np.allclose(got["out_m"], np.repeat(m[:, None], 32, 1), rtol=1e-5, atol=1e-5)
+    assert np.allclose(got["out_l"], np.repeat(2 * l[:, None], 32, 1), rtol=1e-5, atol=1e-5)
+
+
 def test_integer_elementwise_ops():
     a = rng.integers(-1000, 1000, 256).astype(np.int32)
     b = rng.integers(1, 50, 256).astype(np.int32)
