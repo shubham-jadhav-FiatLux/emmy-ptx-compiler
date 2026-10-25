@@ -12,6 +12,8 @@ compute them in f32 and round once), everything else is f32.
 
 from __future__ import annotations
 
+import numpy as np
+
 from . import mathlib
 from .builder import Builder, Value
 
@@ -63,6 +65,12 @@ def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     return b.convert(fn(b, *args), out_type)
 
 
+def _f32_div(a: float, b: float) -> float:
+    """IEEE single division, as ``div.rn.f32`` computes it."""
+    with np.errstate(all="ignore"):
+        return float(np.float32(a) / np.float32(b))
+
+
 def _as_float(b: Builder, p: Value) -> Value:
     """A C comparison used as a value: 1.0 or 0.0."""
     return b.select(p, b.f32_const(1.0), b.f32_const(0.0))
@@ -102,9 +110,9 @@ _FLOAT = {
     "copy": lambda b, x: x,
     "pad": lambda b, x: x,
     "square": lambda b, x: b.fbin("*", x, x),
-    "reciprocal": _unary("rcp.rn.f32", None),
+    "reciprocal": _unary("rcp.rn.f32", lambda v: _f32_div(1.0, v)),
     "relu": lambda b, x: _minmax("max.f32", max)(b, x, b.f32_const(0.0)),
-    "sqrt": _unary("sqrt.rn.f32", None),
+    "sqrt": _unary("sqrt.rn.f32", lambda v: float(np.sqrt(np.float32(v))) if v >= 0 else float("nan")),
     "rsqrt": _unary("rsqrt.approx.f32", None),
     "exp": mathlib.exp,
     "exp_fast": mathlib.exp_fast,

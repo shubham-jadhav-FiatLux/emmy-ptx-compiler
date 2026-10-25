@@ -637,6 +637,9 @@ class Builder:
         # identities exact for every x, NaN and -0 included (x + 0 is not: -0 + 0 = +0)
         if (op == "*" and b.const == 1.0) or (op == "/" and b.const == 1.0) or (op == "-" and _is_plus_zero(b)):
             return a
+        if op == "/" and _exact_inverse(b.const) is not None:
+            # x / 2^k == x * 2^-k exactly (both scale by a power of two, rounding alike)
+            return self.fbin("*", a, self.f32_const(_exact_inverse(b.const)))
         if op == "*" and a.const == 1.0:
             return b
         name = {"+": "add.rn", "-": "sub.rn", "*": "mul.rn", "/": "div.rn"}[op]
@@ -704,6 +707,16 @@ def _decide(op, alo, ahi, blo, bhi):
         d = _decide("==", alo, ahi, blo, bhi)
         return None if d is None else not d
     return None
+
+
+def _exact_inverse(c) -> float | None:
+    """1/c when c is a power of two whose inverse is a normal float, else None."""
+    if c is None or c == 0 or not math.isfinite(c):
+        return None
+    m, e = math.frexp(abs(c))
+    if m != 0.5 or not -125 <= 1 - e <= 127:
+        return None
+    return math.copysign(2.0 ** (1 - e), c)
 
 
 def _is_plus_zero(v: Value) -> bool:

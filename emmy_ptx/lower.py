@@ -872,6 +872,12 @@ class Lowerer:
     def stmt_Load(self, s) -> None:
         buf = self.buffer(s.input)
         mtype = MEM_TYPE[s.dtype.name] if s.dtype is not None else buf.type
+        if isinstance(buf, GlobalBuffer) and s.input in self.src.constants and s.is_scalar:
+            value = self.src.constants[s.input]  # a 1-element buffer holds exactly this
+            vtype = VALUE_TYPE[mtype]
+            const = self.b.int_const(int(value), vtype) if vtype in INT_RANGE else self.b.convert(self.b.f32_const(value), vtype)
+            self.define(s.names[0], const)
+            return
         values = self.load(buf, mtype, s.index, len(s.names))
         for name, v in zip(s.names, values):
             self.define(name, v)

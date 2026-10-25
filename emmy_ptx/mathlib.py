@@ -279,6 +279,37 @@ def cos(b: Builder, x: Value) -> Value:
 # ---------------------------------------------------------------- pow
 
 
+def _pow_const(b: Builder, x: Value, y: float) -> Value | None:
+    """x^y for a compile-time exponent with a short exact-or-nearly-exact form.
+
+    Integer powers are products (x*x is correctly rounded, x*x*x within
+    1.5 ulp), and the IEEE products already give C's special cases for
+    zeros, infinities and NaN. Half powers use the correctly rounded sqrt,
+    with the two inputs where C's pow and sqrt disagree (-0 and -inf) fixed up.
+    """
+    if y == 0:
+        return _c(b, 1.0)  # pow(x, 0) is 1 even for NaN
+    if y == 1:
+        return x
+    if y == 2:
+        return b.fbin("*", x, x)
+    if y == 3:
+        return b.fbin("*", b.fbin("*", x, x), x)
+    if y == 4:
+        sq = b.fbin("*", x, x)
+        return b.fbin("*", sq, sq)
+    if y == -1:
+        return b.fop("rcp.rn.f32", b.in_reg(x))
+    if y == -2:
+        return b.fop("rcp.rn.f32", b.fbin("*", x, x))
+    if y in (0.5, 1.5, -0.5):
+        root = b.fbin("+", b.fop("sqrt.rn.f32", b.in_reg(x)), _c(b, 0.0))  # +0 for -0, as pow gives
+        r = root if y == 0.5 else b.fbin("*", x, root) if y == 1.5 else b.fop("rcp.rn.f32", root)
+        minus_inf = b.fcmp("==", x, _c(b, -INF))  # pow(-inf, y) is +inf (y > 0) or +0 (y < 0)
+        return b.select(minus_inf, _c(b, INF if y > 0 else 0.0), r)
+    return None
+
+
 def pow(b: Builder, x: Value, y: Value) -> Value:
     """C ``powf``: |x|^y = 2^(y * log2|x|) evaluated in float64, plus the C99
     special cases (zeros, infinities, NaNs, negative bases with integer y).
@@ -290,6 +321,10 @@ def pow(b: Builder, x: Value, y: Value) -> Value:
     folded = _fold(b, lambda u, v: math.pow(u, v), x, y)
     if folded is not None:
         return folded
+    if y.const is not None:
+        special = _pow_const(b, x, float(y.const))
+        if special is not None:
+            return special
     ax = b.fop("abs.f32", b.in_reg(x))
     ef, m = _split_mantissa(b, ax)
     md = b.convert(m, "f64")

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from emmy.compiler.graph import Graph
@@ -46,6 +46,7 @@ class KernelSource:
     buffers: dict[str, Buffer]
     launch: Launch
     written: frozenset[str]  # global buffers this kernel stores to
+    constants: dict = field(default_factory=dict)  # scalar ConstantOp buffers -> value (compile-time constants)
 
 
 def load(ir_path: str | Path) -> KernelSource:
@@ -64,6 +65,15 @@ def load(ir_path: str | Path) -> KernelSource:
             shape = tuple(int(d.as_static()) for d in t.shape)
             buffers[t.name] = Buffer(t.name, shape, t.dtype.name)
 
+    # A scalar ConstantOp is part of the program: its value is in the graph (the
+    # runner passes the same value in a 1-element buffer, which stays a parameter).
+    constants = {}
+    for n in graph.nodes.values():
+        value = getattr(n.op, "value", None) if type(n.op).__name__ == "ConstantOp" else None
+        if (isinstance(value, (int, float)) and not isinstance(value, bool) and getattr(n.op, "source_path", None) is None
+                and len(n.outputs) == 1 and math.prod(int(d.as_static()) for d in n.outputs[0].shape) == 1):
+            constants[n.outputs[0].name] = value
+
     shared = {s.name for s in _walk(body) if type(s).__name__ == "Smem"}
     written = frozenset(_written_buffers(body) - shared)
 
@@ -79,7 +89,7 @@ def load(ir_path: str | Path) -> KernelSource:
               file=sys.stderr)
         params = _signature_order(body, shared)
         launch = _derived_launch(body)
-    return KernelSource(op.name, body, params, buffers, launch, written)
+    return KernelSource(op.name, body, params, buffers, launch, written, constants)
 
 
 def _walk(stmts):
