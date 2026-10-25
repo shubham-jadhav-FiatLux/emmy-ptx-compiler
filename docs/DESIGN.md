@@ -13,6 +13,7 @@ evaluation runner (RTX 5090), each problem with its own launch.
       │                         per loop: split across lanes, lane-blocked, dealt, unrolled or rolled
       │                         (should that fail: lowered again plainly, without the optional rewrites, §3)
       │      ├─ mapping / congruence / regroup   loop-body analyses and IR-to-IR rewrites
+      │      ├─ tensorcore                       the mma.sync fragment statements
       │      ├─ builder.Builder                  folding · ranges · uniformity · value numbering · LICM
       │      └─ elementwise / mathlib
       ▼
@@ -98,13 +99,14 @@ register.
 | `Loop`, `StridedLoop` | seed the immediate body's accumulators when `seed`, then one of the shapes below |
 | `Cond` | predicated branch, or no branch at all when the predicate is decided by ranges |
 | `Load` / `Write` | affine address, `ld/st[.v2/.v4]`, `ld.global.nc` for read-only buffers, `red.global.add` for atomic writes |
-| `Assign`, `Accum`, `Init`, `Let`, `Select` | elementwise semantics (section 6); an `Accum` add whose base or value is a product becomes one FMA |
+| `Assign`, `Accum`, `Init`, `Let`, `Select` | elementwise semantics (section 7); an `Accum` add whose base or value is a product becomes one FMA |
 | `Smem` | static `.shared` arrays up to 48 KiB in total, else one `.extern .shared` pool packed exactly like emmy's `pack_smem` |
 | `Sync` | `bar.sync 0`, `bar.sync id, count`, `bar.warp.sync -1` |
 | `WarpShuffle` | `activemask` + `shfl.sync.bfly` butterfly, the combine program run per step |
 | `TreeHalve` | every thread folds the partials itself, pairing them exactly as the halving tree would, after the barrier that precedes it: one barrier instead of one per step (4.7) |
 | `CpAsyncCopy/Commit/Wait` | `cp.async.{cg,ca}.shared.global`, `commit_group`, `wait_group N` |
 | `ZeroPrologue` | CTA 0 zeroes the delegated accumulator |
+| `RegFragment`, `LdmatrixLoad`, `MmaSyncPtx`, `Fragment*`, `RegStore` | tensor cores (section 6) |
 
 **The shape of a loop** (`Lowerer._loop_body`), tried in this order:
 
@@ -371,7 +373,41 @@ thread folds the W totals.
   `exp(m - max(m, s))` and `exp(s - max(m, s))` have one exponent exactly 0,
   so both come from one `exp` of their sum (`mathlib._rescale_pair`).
 
-## 6. Numerics (`elementwise.py`, `mathlib.py`)
+## 6. Tensor cores (`tensorcore.py`)
+
+For f16 matmuls and attention, emmy schedules the tensor cores the way CUTLASS
+does on Ampere and later: a warp holds each operand tile in per-lane registers
+and multiplies 16x8x16 tiles with `mma.sync`. Lane l owns fixed elements of
+each tile (rows `l/4` and `l/4 + 8`, columns `2(l%4)` and `2(l%4) + 1` of the
+f32 accumulator; the 16-bit operands two to a register in the same map). The
+IR spells the computation out in eight statements, each lowered to the PTX it
+names:
+
+| Statement | Lowering |
+|---|---|
+| `RegFragment` | 4 (A), 2 (B) or 4 f32 (C) registers a lane, a family of them when arrayed; an accumulator starts at zero |
+| `LdmatrixLoad` | `ldmatrix.sync.aligned.m8n8.x4`/`.x2` (`.trans` for a K x N slab) from shared memory, each lane addressing one 16-byte row through the slab's XOR swizzle, the same one its `cp.async` fill used; two B fragments in one `x4` where emmy pairs them. From global memory: the same lane map, element by element, the lane's row clamped at a masked tile's edge and K elements past a masked extent read as zero |
+| `MmaSyncPtx` | `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` (or bf16, or the f16-accumulate form), accumulating in place |
+| `FragmentApply` | the op per C element: a softmax's scale, subtraction and exp, a mask from the element's coordinates, a bias read at them |
+| `FragmentRowReduce` | each lane folds its two rows across the chunk's fragments, then two `shfl.sync.bfly` steps across the four lanes that hold a row |
+| `FragmentRepack` | `cvt.rn.f16x2.f32`: two C fragments become an A operand without leaving the registers (the P of P @ V) |
+| `FragmentPromote` | an f16 accumulator's halves added into its f32 shadow, which is then zeroed |
+| `RegStore` | per lane, a row's two columns as one `st.v2.f32` or packed `f16x2` store (`red.add.noftz.f16x2` when split-K adds them), through the fused epilogue and the row and column guards |
+
+A fragment is an array of registers, so a loop that indexes one by its
+variable is always unrolled. The fragment statements count as cross-thread,
+because a fragment's elements are spread over its warp's lanes, so none of the
+rewrites of sections 4 and 5 moves, deals or places them.
+
+Twenty f16 problems were generated with the organisers' tool, and all of them
+pass. They cover matmuls of odd and batched shapes, `x @ w.T`, fused
+bias/relu/gelu epilogues, flash attention, and causal and multi-head SDPA. On
+19 of them we take 0.76x the time of nvcc's build of emmy's reference CUDA
+(geometric mean, never slower; the causal SDPA 10.9 µs against 133.8). Two GPU
+tests build tensor-core IR by hand, for the forms the problems do not use: an
+f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
+
+## 7. Numerics (`elementwise.py`, `mathlib.py`)
 
 * **Basic arithmetic is IEEE, round to nearest** (`add.rn`, `mul.rn`,
   `div.rn`, `sqrt.rn`, `rcp.rn`), in the precision of each operation's result
@@ -426,7 +462,7 @@ thread folds the W totals.
   on the GPU over about a million inputs per range (the f64 ones against an
   extended-precision reference).
 
-## 7. Launch hints
+## 8. Launch hints
 
 `.maxntid` carries the block size (like CUDA's `__launch_bounds__`), so ptxas
 never uses more registers than a block can launch with. When the whole grid
@@ -435,7 +471,7 @@ also says `.minnctapersm 1`: extra registers then cannot cost occupancy, and
 ptxas uses them to keep more loads in flight, which makes the latency-bound
 attention kernels 25-40% faster.
 
-## 8. Validation
+## 9. Validation
 
 * `tools/run_suite.py` compiles problem folders exactly as the evaluator does
   and checks them on the runner, reporting how much of the tolerance each
@@ -466,10 +502,14 @@ attention kernels 25-40% faster.
   fail on purpose, once by raising and once by producing too long a module,
   and check that the fallback takes over.
 
-## 9. Not supported
+## 10. Not supported
 
-The statements TASK.md marks as outside the scope (tensor-core fragments,
-TMA/mbarrier, `SetMaxNReg`, `Carry`/`Pre` recurrences) raise a clear error.
-Emmy only produces them for tensor-core schedules (for example half-precision
-matmul) and warp-specialized pipelines. Double-precision `tanh`, `erf`, `sin`,
-`cos` and `pow` are computed in single precision (section 6).
+These raise a clear error (and so cannot reach the GPU half-lowered):
+* Hopper's `wgmma`, which the RTX 5090 lacks.
+* TMA descriptors and mbarriers; a TMA descriptor is built on the host, which
+  the runner's API cannot pass.
+* `SetMaxNReg`, `Carry` and `Pre`.
+* The Volta m8n8k4 fragment layout, and fp8/fp4 block-scaled fragments.
+
+Emmy produces these only for other GPUs and for warp-specialized pipelines. Double-precision `tanh`, `erf`, `sin`,
+`cos` and `pow` are computed in single precision (section 7).

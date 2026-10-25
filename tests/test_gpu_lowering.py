@@ -15,10 +15,12 @@ import requests
 from kernels import rasterized_row_scale, shared_sum_added_atomically, three_column_attention
 
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F32, F64
+from emmy.compiler.dtype import F16, F32, F64
+from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
-from emmy.compiler.ir.kernel.ir import Smem, Sync, Tile, TreeHalve, WarpShuffle
+from emmy.compiler.ir.kernel.ir import (FragmentApply, FragmentPromote, LdmatrixLoad, MmaSyncPtx, RegFragment, RegStore,
+                                       Smem, Sync, Tile, TreeHalve, WarpShuffle)
 from emmy.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from emmy.compiler.ir.stmt.leaves import Init, Let
 
@@ -45,7 +47,8 @@ def B(op, a, b):
     return BinaryExpr(op, a, b)
 
 
-DTYPE = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64", np.dtype(np.int32): "i32"}
+DTYPE = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64", np.dtype(np.float16): "f16",
+         np.dtype(np.int32): "i32"}
 
 
 def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str = "f32") -> dict:
@@ -63,7 +66,7 @@ def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str
         "cubin_id": c["cubin_id"], "entry": "k_test", "grid": [grid, 1, 1], "block": [block, 1, 1], "smem_bytes": 0,
         "zero_outputs": [], "args": args, "warmup": 0, "iters": 1, "max_return": 1 << 16}, timeout=120).json()
     assert r.get("ok"), r.get("stderr")
-    numpy_type = np.float64 if out_dtype == "f64" else np.float32
+    numpy_type = {"f64": np.float64, "f16": np.float16}.get(out_dtype, np.float32)
     return {n: np.array(r["outputs"][n]["values"], numpy_type).reshape(s) for n, s in outputs.items()}
 
 
@@ -420,3 +423,65 @@ def test_rasterized_cells_are_placed_to_share_their_rows():
     x = rng.standard_normal((16, 24)).astype(np.float32)
     got = run(rasterized_row_scale(16, 24, 24, 4), {"x": x}, {"out": (16, 24)}, 3, 128)["out"]
     assert np.allclose(got, x * (x.astype(np.float64) ** 2).sum(1, keepdims=True), rtol=1e-5, atol=1e-5)
+
+
+def _one_warp_mma(acc_dtype, tail: tuple) -> list:
+    """One warp computing a 16x8 tile on the tensor cores: A (16x16) and B stored
+    N x K (8x16) staged in shared memory by plain stores, ldmatrix x4 for A and
+    x2 for B (no .trans: an N x K slab is already the mma's column-major B),
+    one mma into ``acc``, then ``tail``."""
+    lane, shape = Var("_lane"), (16, 8, 16)
+
+    def at(cols):  # lane l stages row l / (16 / cols), ``cols`` columns from (l % (16 / cols)) * cols
+        per = 16 // cols
+        return lambda j: (B("/", lane, I(per)), B("+", B("*", B("%", lane, I(per)), I(cols)), I(j)))
+
+    fill = []
+    for name, src, cols in (("a_s", "a", 8), ("b_s", "bt", 4)):
+        for j in range(cols):
+            fill += [Load(name=f"{name}{j}", input=src, index=at(cols)(j)), Write(name, at(cols)(j), f"{name}{j}")]
+    return [Tile(axes=(Axis("_lane", Dim(32)),), body=(
+        Smem("a_s", (16, 16), "__half", 16), Smem("b_s", (8, 16), "__half", 16), *fill, Sync(),
+        RegFragment("fa", "a", shape, F16), RegFragment("fb", "b", shape, F16), RegFragment("acc", "c", shape, acc_dtype),
+        LdmatrixLoad("fa", "a_s", (I(0), I(0)), "a", ldm=16),
+        LdmatrixLoad("fb", "b_s", (I(0), I(0)), "b", ldm=16, b_trans=True),
+        MmaSyncPtx("acc", "fa", "fb", shape, c_dtype=acc_dtype.name),
+        *tail,
+    ))]
+
+
+def _tile_inputs():
+    a = (rng.standard_normal((16, 16)) / 4).astype(np.float16)
+    bt = (rng.standard_normal((8, 16)) / 4).astype(np.float16)
+    return a, bt, a.astype(np.float64) @ bt.astype(np.float64).T
+
+
+def test_tensor_core_tile_with_coordinate_mask_bias_and_f16_accumulator():
+    """An f16-accumulate mma folded into an f32 fragment, a mask from each
+    element's coordinates (column > row becomes -1) and a bias read at them."""
+    a, bt, prod = _tile_inputs()
+    bias = rng.standard_normal((16, 8)).astype(np.float32)
+    shape = (16, 8, 16)
+    tail = (
+        RegFragment("c", "c", shape, F32),
+        FragmentPromote("c", "acc"),
+        FragmentApply("c", ElementwiseImpl("where"), (B(">", Var("__fcol"), Var("__frow")), Literal(-1.0), "c"),
+                      ("coord", "uniform", "frag"), in_place=True, row_base=I(0), col_base=I(0)),
+        FragmentApply("c", ElementwiseImpl("add"), ("c", ("bias", (Var("__frow"), Var("__fcol")))), ("frag", "gmem"),
+                      in_place=True, row_base=I(0), col_base=I(0)),
+        RegStore("out", (I(0), I(0)), "c", shape),
+    )
+    got = run(_one_warp_mma(F16, tail), {"a": a, "bt": bt, "bias": bias}, {"out": (16, 8)}, 1, 32)["out"]
+    rows, cols = np.indices((16, 8))
+    want = np.where(cols > rows, -1.0, prod.astype(np.float16)) + bias
+    assert np.allclose(got, want, rtol=2e-3, atol=2e-3)
+
+
+def test_tensor_core_tile_added_atomically_as_f16_pairs():
+    """The f32 tile stored twice into an f16 output with atomic adds (packed
+    f16x2 pairs, the split-K finish)."""
+    a, bt, prod = _tile_inputs()
+    shape = (16, 8, 16)
+    tail = (RegStore("out", (I(0), I(0)), "acc", shape, atomic=True), RegStore("out", (I(0), I(0)), "acc", shape, atomic=True))
+    got = run(_one_warp_mma(F32, tail), {"a": a, "bt": bt}, {"out": (16, 8)}, 1, 32, out_dtype="f16")["out"]
+    assert np.allclose(got.astype(np.float64), 2 * prod, rtol=5e-3, atol=5e-3)

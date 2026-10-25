@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg
+from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg, Vec
 
 INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
 WARP = 32
@@ -226,6 +226,8 @@ class Builder:
             if x.mutable:
                 return len(self._loops)
             x = x.op
+        if isinstance(x, Vec):
+            return max((self._depth_of(r) for r in x.items), default=0)
         if isinstance(x, Mem):
             x = x.base
         return self._level.get(x.name, 0) if isinstance(x, Reg) else 0
@@ -241,13 +243,16 @@ class Builder:
     def pure(self, op: str, type_: str, args: tuple, lo=None, hi=None, commutative=False) -> Value:
         """Emit, or reuse, a side-effect-free instruction with one result."""
         keys = tuple(_operand_key(a) for a in args)
+        # a variable's register in a vector operand may hold something else next time
+        changing = any(isinstance(a, Vec) and any(isinstance(r, Reg) and r.name in self._vars for r in a.items)
+                       for a in args)
         if commutative:
             order = sorted(range(len(args)), key=lambda i: repr(keys[i]))
             args, keys = tuple(args[i] for i in order), tuple(keys[i] for i in order)
             # PTX reads best with the immediate last
             if len(args) == 2 and isinstance(args[0], Value) and args[0].const is not None:
                 args, keys = args[::-1], keys[::-1]
-        key = None if None in keys else (op, keys)
+        key = None if changing or None in keys else (op, keys)
         if key is not None:
             hit = self._lookup(key)
             if hit is not None:
@@ -282,6 +287,8 @@ class Builder:
         """Uniform group of an operand (a Value, an address, a symbol, a special register)."""
         if isinstance(x, Value):
             return x.ug
+        if isinstance(x, Vec):
+            return min((self.ug_of(r) for r in x.items), default=WARP)
         if isinstance(x, Mem):
             x = x.base
         if isinstance(x, Reg):
@@ -386,6 +393,12 @@ class Builder:
             return True
         var = self._vars.get(v.op.name)
         return var is not None and v.version is not None and var.version == v.version
+
+    def overwritten(self, var: Variable) -> None:
+        """The instruction just emitted wrote ``var``'s register itself (an
+        ``mma`` accumulating in place): what it held is gone."""
+        var.ug, var.last = 1, None
+        var.version += 1
 
     def assign(self, var: Variable, v: Value) -> None:
         v = self.convert(v, var.type)

@@ -20,14 +20,15 @@ launch from `meta.json`:
 | | |
 |---|---|
 | Open problem set | **15 / 15** pass (all five categories); the four pointwise problems are bit-exact |
-| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **180 / 180** pass |
+| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **200 / 200** pass |
+| Tensor cores (float16: emmy's `mma.sync` matmul, flash-attention and SDPA schedules) | **20 / 20** of the corpus's f16 problems pass; 0.76x the time of nvcc's build (geometric mean of 19, never slower) |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
-| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **382 / 382** pass (every problem above) |
+| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (every problem above) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 132 (44 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
+| Tests | 136 (48 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -75,6 +76,13 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   equal accumulators are merged, repeated arithmetic removed, independent
   sibling loops fused, and the online softmax's merge of two partial states is
   derived from the IR's own update.
+* **Tensor cores** (`emmy_ptx/tensorcore.py`). Emmy's f16 matmul and attention
+  schedules hold their tiles in per-lane register fragments. These are filled
+  by `ldmatrix` from swizzled shared memory or straight from global memory,
+  multiplied with `mma.sync.m16n8k16`, put through the softmax's row
+  reductions and repacked into the next mma's operand, and stored by fused
+  epilogues. The compiler lowers each statement to the PTX instruction it
+  names, unrolling every loop that indexes a fragment.
 * **A fallback.** If the optimizing lowering fails on an IR shape it did not
   foresee, or its module is longer than the runner accepts, the kernel is
   lowered again plainly: one rule per statement, without the optional
@@ -101,6 +109,7 @@ emmy_ptx/
   mapping.py           loop-body analyses and rewrites (fusion, online softmax, lane blocking)
   congruence.py        accumulators that always hold the same value
   regroup.py           cooperative reductions in contiguous chunks
+  tensorcore.py        tensor-core fragments: ldmatrix, mma.sync, fragment softmax, fragment stores
   builder.py           typed values, folding, ranges, value numbering, LICM, DCE
   vectorize.py         adjacent scalar loads -> ld.v2 / ld.v4
   elementwise.py       Assign/Accum operations and emmy's dtype rules

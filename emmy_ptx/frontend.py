@@ -105,6 +105,8 @@ def _written_buffers(body) -> set[str]:
         kind = type(s).__name__
         if kind == "Write":
             out.add(s.output)
+        elif kind == "RegStore":
+            out.add(s.dst_buffer)
         elif kind == "ZeroPrologue":
             out.add(s.dst)
     return out

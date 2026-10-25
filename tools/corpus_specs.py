@@ -414,3 +414,69 @@ OPEN += [
     sigmoid_attn("sig_64x48", 64, 64, 48, 48),
     sigmoid_attn("sig_96x32", 96, 128, 32, 32),
 ]
+
+
+# ---- round 5: float16 on the tensor cores (emmy's mma.sync schedules) -----------------------
+def _h(fn):
+    """Reference computed in float64, rounded once to float16."""
+    return lambda *a: [np.asarray(fn(*(x.astype(f64) for x in a))).astype(np.float16)]
+
+
+H = "dtype=torch.float16"
+
+
+def mm16(id, m, k, n):
+    return dict(id=f"m_f16_{id}", code=f"torch.randn({m}, {k}, {H}) @ torch.randn({k}, {n}, {H})",
+                ref=_h(lambda a, b: a @ b), rtol=1e-2, atol=1e-2)
+
+
+def sdpa16(id, shape, causal=False):
+    b, h, n, d = shape
+    t = f"torch.randn({b}, {h}, {n}, {d}, {H})"
+    code = (f"q = {t}; k = {t}; v = {t}; "
+            f"torch.nn.functional.scaled_dot_product_attention(q, k, v{', is_causal=True' if causal else ''})")
+    if causal:
+        ref = _h(lambda q, k, v: _causal(q, k, v, np.sqrt(d)))
+    else:
+        ref = _h(lambda q, k, v: _softmax(q @ np.swapaxes(k, -1, -2) / np.sqrt(d)) @ v)
+    return dict(id=f"a_f16_{id}", code=code, ref=ref, rtol=2e-2, atol=2e-2)
+
+
+def attn16(id, nq, nk, d, scale):
+    code = (f"q = torch.randn({nq}, {d}, {H}); kt = torch.randn({d}, {nk}, {H}); v = torch.randn({nk}, {d}, {H}); "
+            f"torch.softmax(q @ kt / {scale}, dim=-1) @ v")
+    return dict(id=f"a_f16_{id}", code=code, ref=_h(lambda q, kt, v: _softmax((q @ kt) / scale) @ v),
+                rtol=2e-2, atol=2e-2)
+
+
+OPEN += [
+    mm16("128", 128, 128, 128),
+    mm16("256", 256, 256, 256),
+    mm16("64x512x128", 64, 512, 128),
+    mm16("512x64x512", 512, 64, 512),
+    mm16("96x200x72", 96, 200, 72),
+    mm16("33x77x55", 33, 77, 55),
+    mm16("1x256x128", 1, 256, 128),
+    mm16("200x40x24", 200, 40, 24),
+    dict(id="m_f16_bmm", code=f"torch.randn(4, 64, 96, {H}) @ torch.randn(4, 96, 80, {H})",
+         ref=_h(lambda a, b: a @ b), rtol=1e-2, atol=1e-2),
+    dict(id="m_f16_bt", code=f"x = torch.randn(128, 96, {H}); w = torch.randn(64, 96, {H}); x @ w.t()",
+         ref=_h(lambda x, w: x @ w.T), rtol=1e-2, atol=1e-2),
+    dict(id="m_f16_scale", code=f"x = torch.randn(64, 128, {H}); w = torch.randn(128, 96, {H}); (x @ w) * 0.125",
+         ref=_h(lambda x, w: (x @ w) * 0.125), rtol=1e-2, atol=1e-2),
+    dict(id="f_f16_linear_relu", code=f"x = torch.randn(128, 128, {H}); w = torch.randn(128, 64, {H}); "
+                                      f"b = torch.randn(64, {H}); torch.relu(x @ w + b)",
+         ref=_h(lambda x, w, b: np.maximum(x @ w + b, 0)), rtol=1e-2, atol=1e-2),
+    dict(id="f_f16_linear_gelu", code=f"x = torch.randn(64, 256, {H}); w = torch.randn(256, 128, {H}); "
+                                      f"torch.nn.functional.gelu(x @ w)",
+         ref=_h(lambda x, w: 0.5 * (x @ w) * (1 + _erf((x @ w) / math.sqrt(2)))), rtol=1e-2, atol=1e-2),
+    dict(id="f_f16_residual", code=f"x = torch.randn(96, 64, {H}); w = torch.randn(64, 64, {H}); x @ w + x",
+         ref=_h(lambda x, w: x @ w + x), rtol=1e-2, atol=1e-2),
+    attn16("64x128", 64, 128, 64, 8.0),
+    attn16("128", 128, 128, 64, 8.0),
+    attn16("d32", 64, 256, 32, 5.656854),
+    sdpa16("sdpa", (1, 1, 128, 64)),
+    sdpa16("sdpa_causal", (1, 1, 128, 64), causal=True),
+    sdpa16("sdpa_heads", (2, 4, 64, 32)),
+    # not included: a causal (1, 2, 96, 48) sdpa, whose two kernels the generator lists consumer first
+]

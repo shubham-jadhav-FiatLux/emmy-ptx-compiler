@@ -61,8 +61,10 @@ from emmy.compiler.ir.stmt.leaves import Let
 LOOPS = ("Loop", "StridedLoop")
 # what a pure loop may contain: values and folds, nothing another thread or the output sees
 PURE = ("Load", "Assign", "Let", "Accum", "Select", *LOOPS)
+# (a tensor-core fragment's elements are spread over its warp's lanes: its statements too)
 CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "LaneBroadcast",
-                "LaneButterfly", "LaneStash")
+                "LaneButterfly", "LaneStash", "RegFragment", "LdmatrixLoad", "MmaSyncPtx", "FragmentApply",
+                "FragmentRowReduce", "FragmentRepack", "FragmentPromote", "RegStore")
 _BUTTERFLIES = ("WarpShuffle", "TreeHalve", "LaneButterfly")  # statements that reassign their ``state``
 _EFFECTS = ("Write", "ZeroPrologue", "Init", "Smem", *CROSS_THREAD)
 _MAX = ("maximum", "amax", "fmax")
@@ -162,6 +164,8 @@ def written(stmts) -> set[str]:
             out.add(s.output)
         elif kind(s) == "CpAsyncCopy":
             out.add(s.smem)
+        elif kind(s) == "RegStore":
+            out.add(s.dst_buffer)
     return out
 
 

@@ -34,6 +34,7 @@ from .frontend import DEFAULT_BLOCK, KernelSource
 from .mapping import LOOPS, LaneSlot, assigned, kind, produced, reads, walk
 from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, Mem, Sym, Vec
 from .regroup import fully_combined, regroup
+from .tensorcore import TensorCoreLowering, fragment_index, fragment_refs
 from .vectorize import vectorize_loads
 
 # emmy dtype names (graph tensors) -> PTX memory types
@@ -207,7 +208,7 @@ class Placement:
     groups: int  # cells / the axis's extent
 
 
-class Lowerer:
+class Lowerer(TensorCoreLowering):
     def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False):
         self.src = src
         self.spread = spread  # do idle threads join the cells (_spread)?
@@ -356,6 +357,7 @@ class Lowerer:
             var = self.scope.lookup(name)
             if isinstance(var, Variable):
                 var.forget()
+        self.forget_fragments(stmts)
 
     # ------------------------------------------------------------- set-up
 
@@ -898,7 +900,8 @@ class Lowerer:
             self._lower_blocked(blocked)
         elif dealt:
             self._deal(s, start, step, end, trips[0], dealt)
-        elif trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= self._auto_unroll(s)):
+        elif trips is not None and (_indexes_fragments(s) or trips[1] * size <= UNROLL_BUDGET
+                                    and (s.unroll or trips[1] <= self._auto_unroll(s))):
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
                 self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
@@ -1914,6 +1917,13 @@ def _reassigned_names(body) -> set[str]:
         elif kind in ("WarpShuffle", "TreeHalve"):
             out.update(s.state)
     return out
+
+
+def _indexes_fragments(loop) -> bool:
+    """Does a fragment reference in ``loop`` take the loop variable as its index
+    (``_c0_[_r0]``)? Such a loop is unrolled, whatever its size: a register
+    array has no runtime index."""
+    return any(fragment_index(r) == loop.axis.name for x in walk(loop.body) for r in fragment_refs(x))
 
 
 def _body_size(stmts) -> int:
