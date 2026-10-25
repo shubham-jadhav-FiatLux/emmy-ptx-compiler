@@ -352,6 +352,12 @@ attention kernels 25-40% faster.
   `scaled_dot_product_attention` (causal and multi-head);
   `tools/corpus_knobs.py` forces the same expressions through many emmy
   schedules.
+* `tools/corpus_holdout.py` is a held-out set written after the compiler, in the style of
+  the open expressions (new shapes and op mixes in all five categories, the open set's
+  tolerances and reduction schedule), to estimate the hidden set: 81 of 81 pass on first
+  run, the largest error 10.5% of its tolerance. Launching the kernels that use shared
+  memory or barriers eight times each gives bit-identical outputs (apart from atomic
+  split-K sums), so no result depends on a race.
 * `tools/ref_bench.py` races our PTX against nvcc's build of emmy's reference
   CUDA on identical launches. Timings move by about 2 µs from run to run, so
   every scheduling decision above was kept only after an A/B comparison
