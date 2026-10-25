@@ -82,6 +82,8 @@ LINE_BYTES = 128
 JAM_ACCUMULATORS = 64
 # Sibling loops are fused only while the fused body stays this small (statements).
 FUSE_BUDGET = 512
+# Registers of an SM (and so of one CTA), and the most one thread can address.
+REGISTER_FILE, THREAD_REGISTERS = 65536, 256
 
 # identities of the reduction combines (emmy's ElementwiseImpl table)
 IDENTITY = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "minimum": 1e30}
@@ -685,14 +687,18 @@ class Lowerer:
         body = merge_congruent(s.body, members) if members else None
         if body is None:
             return s, {}
-        # what fed only the dropped updates (a member's own inner loops, say) is now dead
-        return replace(s, body=drop_needless_snapshots(mapping.prune_dead(body))), members
+        # what fed only the dropped updates (a member's own inner loops, say) is now dead, and the
+        # members' copies of the representative's arithmetic are repeats
+        return replace(s, body=drop_needless_snapshots(mapping.cse(mapping.prune_dead(body)))), members
 
     def _loop_body(self, s, start: Value, step: Value, end: Value, trips, size: int) -> None:
         """Pick the loop's shape: split across lanes, unrolled, or rolled."""
         plan = self._split_plan(s, start, step, end, trips)
+        blocked = self._blocked(s, start, step, end, trips) if plan is None else None
         if plan is not None:
             self._split_reduction(s, start, step, end, trips[0], plan)
+        elif blocked is not None:
+            self._lower_blocked(blocked)
         elif trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
@@ -735,7 +741,7 @@ class Lowerer:
         nested = self._nested_split_cost(s, n, group)
         if nested is None:  # a straight-line body: each lane takes one contiguous chunk
             return SplitPlan(fold, group, n // group if n % group == 0 else 1, 1)
-        deltas = self._deltas(s, step.const)
+        deltas = self._deltas(s.body, s.axis.name, step.const)
         if nested < n / group * _line_cost(deltas, group) + math.log2(group) * _merge_cost(fold):
             return None
         vector = _split_vector(deltas, n, group)
@@ -773,6 +779,20 @@ class Lowerer:
             if id(st) not in in_group and mapping.own_reads(st) & hidden - own:
                 return None
         loop_ug = min(start.ug, step.ug, end.ug)
+        of_name = self._uniformity(s, loop_ug)
+        folded = [st.value for st in plain.values()] + [x for g in groups for x in (g.s, *(w for _, _, w in g.sums))]
+        group = min([loop_ug] + [of_name(x) for x in folded])
+        merges = [((st.name,), (Assign(st.name, REDUCE_CANON[st.op.name], (st.name, f"{st.name}$b"), st.dtype),))
+                  for st in plain.values()]
+        for g in groups:
+            merges.append(((g.m, *(l for l, _, _ in g.sums)),
+                           mapping.combine_program(g, lambda n: f"{n}$b", lambda n: f"{n}$c")))
+        return Fold(group, states, tuple(merges))
+
+    def _uniformity(self, s, loop_ug: int):
+        """``ug(name)`` for the values one iteration of loop ``s`` computes: how
+        many aligned lanes compute each alike when the loop variable is uniform
+        over ``loop_ug`` lanes (a name bound outside the loop keeps its own)."""
         env: dict[str, int] = {s.axis.name: loop_ug}
 
         def of_name(n: str) -> int:
@@ -806,24 +826,81 @@ class Lowerer:
                     visit(st.body)
 
         visit(s.body)
-        folded = [st.value for st in plain.values()] + [x for g in groups for x in (g.s, *(w for _, _, w in g.sums))]
-        group = min([loop_ug] + [of_name(x) for x in folded])
-        merges = [((st.name,), (Assign(st.name, REDUCE_CANON[st.op.name], (st.name, f"{st.name}$b"), st.dtype),))
-                  for st in plain.values()]
-        for g in groups:
-            merges.append(((g.m, *(l for l, _, _ in g.sums)),
-                           mapping.combine_program(g, lambda n: f"{n}$b", lambda n: f"{n}$c")))
-        return Fold(group, states, tuple(merges))
+        return of_name
 
-    def _deltas(self, loop, step: int) -> list:
+    def _blocked(self, s, start: Value, step: Value, end: Value, trips) -> mapping.Blocked | None:
+        """Loop ``s`` dealt to the lanes that share part of each iteration, in
+        blocks (mapping.blocked), or None.
+
+        In attention every lane holding the same query rows computes the same
+        scores, but folds them into its own output columns, so the loop is no
+        lane-shared reduction (``_split_plan``). Instead the G lanes of each
+        group take the block's iterations in turn for the scores and broadcast
+        the results; G is the largest group (a power of two, at most the trip
+        count) for which the shared part still holds an inner loop.
+
+        Lanes taking consecutive iterations read the shared inputs the
+        iteration stride apart: with the keys stored row by row (k[t, d]
+        rather than kt[d, t]) each lane reads its own key's row, a cache line
+        per lane. That trades L1 bandwidth for fewer instructions and
+        shorter dependence chains, a loss only when the SM is full enough to
+        hide the shuffle latency of the split dot product (measured: causal
+        attention in 1024-thread blocks slower, 256 and 512 faster)."""
+        if not self.converged or trips is None or trips[0] != trips[1] or None in (start.const, step.const):
+            return None
+        if not s.seed or not mapping.is_pure_loop(s):
+            return None
+        accs = [st for st in s.body if kind(st) == "Accum"]
+        if not accs or any(st.dtype is not None and st.dtype.name != "f32" for st in accs):
+            return None
+        if assigned(s.body) - mapping.local_names(s.body) != {st.name for st in accs}:
+            return None  # a nested fold updates some outer name
+        n = trips[0]
+        of_name = self._uniformity(s, min(start.ug, step.ug, end.ug))
+        group = min(WARP, 1 << (n.bit_length() - 1))
+        while group >= 2:
+            plan = mapping.blocked(s, n, int(start.const), int(step.const), group, lambda x, g=group: of_name(x) >= g)
+            if plan is not None:
+                apart = [d for _, d, _ in self._deltas(plan.shared, s.axis.name, int(step.const)) if d != 0]
+                full = self.src.launch.block // WARP * -(-self.src.launch.grid // TARGET_SMS) >= WARP  # warps per SM
+                return None if full and any(d is None or abs(d) >= LINE_BYTES for d in apart) else plan
+            group //= 2
+        return None
+
+    def _lower_blocked(self, plan: mapping.Blocked) -> None:
+        """The blocks of a lane-blocked loop, then the lanes' partial sums merged.
+
+        A lane reads whole query rows for its own iteration of each block, the
+        same values in every block. Unrolled blocks keep them in registers
+        (value numbering shares them), which pays while they take at most half
+        the registers a thread of this launch may have (measured); beyond that
+        the blocks run as a rolled loop that leaves those loads in place
+        (ptxas still keeps what fits)."""
+        self.mutable |= plan.mutable
+        loop = plan.loop
+        if loop is not None:
+            b = self.b
+            n, size = int(loop.axis.extent.as_static()), _body_size(loop.body)
+            registers = min(THREAD_REGISTERS, REGISTER_FILE // self.src.launch.block)
+            if (loop.unroll or n <= AUTO_UNROLL_TRIPS) and n * size <= UNROLL_BUDGET and plan.invariant <= registers // 2:
+                with self.block(dominated=True):
+                    self._loop_body(loop, b.int_const(0), b.int_const(1), b.int_const(n), (n, n), size)
+            else:
+                self._rolled(loop, b.int_const(0), b.int_const(1), b.int_const(n), (n, n), 1, hoist_loads=False)
+        with self.block(dominated=True):
+            self.body(plan.rest)
+        for merge in plan.merges:
+            self.stmt_WarpShuffle(merge)
+
+    def _deltas(self, stmts, var: str, step: int) -> list:
         """``(runs per iteration, bytes between the addresses of consecutive
-        iterations or None, element bytes)`` for every load in ``loop``'s body."""
-        lets = mapping.index_lets(loop.body)
+        iterations of ``var`` or None, element bytes)`` for every load in ``stmts``."""
+        lets = mapping.index_lets(stmts)
         out = []
-        for ld, runs in mapping.weighted_loads(loop.body):
+        for ld, runs in mapping.weighted_loads(stmts):
             buf = self.buffer(ld.input)
             size = SIZEOF.get(MEM_TYPE[ld.dtype.name] if ld.dtype is not None else buf.type, 1)
-            c = mapping.flat_coefficient(ld.index, buf.shape, loop.axis.name, lets)
+            c = mapping.flat_coefficient(ld.index, buf.shape, var, lets)
             out.append((runs, None if c is None else c * step * size, size))
         return out
 
@@ -837,7 +914,7 @@ class Lowerer:
         for st in inner:
             runs = mapping.trip_estimate(st)
             step = st.step.value if kind(st) == "StridedLoop" and kind(st.step) == "Literal" else 1
-            deltas = self._deltas(st, int(step))
+            deltas = self._deltas(st.body, st.axis.name, int(step))
             accs = len({x.name for x in st.body if kind(x) == "Accum"})
             if st.seed and accs and mapping.is_pure_loop(st):
                 cost += trips * (runs / group * _line_cost(deltas, group) + math.log2(group) * 2 * accs)
@@ -924,13 +1001,13 @@ class Lowerer:
         for name in fold.states:
             self.lookup(name).ug = group  # every lane of the group now holds the whole fold
 
-    def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
+    def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int, hoist_loads: bool = True) -> None:
         try:
-            self._rolled_loops(s, start, step, end, trips, factor)
+            self._rolled_loops(s, start, step, end, trips, factor, hoist_loads)
         finally:
             self._pessimize(s.body)  # the exit merges every trip count's final values
 
-    def _rolled_loops(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
+    def _rolled_loops(self, s, start: Value, step: Value, end: Value, trips, factor: int, hoist_loads: bool) -> None:
         b = self.b
         name = s.axis.name
         type_ = "s64" if "s64" in (start.type, end.type, step.type) else "s32"
@@ -950,7 +1027,7 @@ class Lowerer:
             if first.const is not False:
                 if first.const is None:
                     b.branch(rest, first, negate=True)
-                with b.loop():
+                with b.loop(hoist_loads):
                     b.place(top)
                     with self.block():
                         # within one trip the counter is constant: let its uses be value-numbered
@@ -979,7 +1056,7 @@ class Lowerer:
         top, done = b.label("loop"), b.label("loop_end")
         if first.const is None:
             b.branch(done, first, negate=True)
-        with b.loop():
+        with b.loop(hoist_loads):
             b.place(top)
             with self.block():
                 self.scope.names[name] = Value(type_, counter.reg, start.lo, hi, ug=counter.ug)  # constant within a trip
@@ -1230,6 +1307,18 @@ class Lowerer:
             var = self.scope.lookup(st)
             if isinstance(var, Variable):
                 var.ug = max(var.ug, min(WARP, int(s.length)))
+
+    def stmt_LaneBroadcast(self, s) -> None:
+        """``name`` = ``value`` of lane ``lane`` in this lane's aligned group of
+        ``group`` (``shfl.sync.idx`` with the group as the shuffle segment)."""
+        b = self.b
+        v = self.value(s.value)
+        mask = b.pure("activemask.b32", "s32", ())  # the code runs converged: one mask serves every shuffle
+        out = self.kernel.reg(v.type)
+        segment = ((WARP - s.group) << 8) | (WARP - 1)
+        b.emit("shfl.sync.idx.b32", out, b.in_reg(v), Imm(s.lane, "u32"), Imm(segment, "u32"), mask,
+               ndefs=1, effect=False)
+        self.define(s.name, b.uniform(Value(v.type, out), s.group))
 
     def stmt_TreeHalve(self, s) -> None:
         b = self.b

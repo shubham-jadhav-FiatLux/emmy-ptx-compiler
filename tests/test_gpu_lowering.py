@@ -226,6 +226,59 @@ def test_online_softmax_over_matmul_rows_is_split_across_lanes(cols):
     assert np.allclose(got["out_l"], np.repeat(2 * l[:, None], 32, 1), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("keys", [44, 64])
+def test_attention_is_blocked_across_the_lanes_of_a_row(keys):
+    """softmax(q @ kt + mask) @ v as emmy fuses it: each lane holds one query
+    row and one output column, so the 8 lanes of a row compute the same
+    scores. Lane blocking computes each score on one lane and broadcasts its
+    weight (with 44 keys the last block is partial, and its idle lanes must
+    add nothing); masked keys fill whole blocks too."""
+    rows, d, cols = 8, 16, 8
+    q = rng.standard_normal((rows, d)).astype(np.float32)
+    kt = rng.standard_normal((d, keys)).astype(np.float32)
+    v = rng.standard_normal((keys, cols)).astype(np.float32)
+    mask = np.zeros(keys, np.float32)
+    mask[[3, 9, 16, 17, 18, 19, 20, 21, 22, 23, 40]] = -1e4  # keys 16..23: one whole block
+    t, k = Axis("t", Dim(keys)), Axis("k", Dim(d))
+    attention = Loop(axis=t, body=(
+        Loop(axis=k, body=(
+            Load(name="qk", input="q", index=(Var("r"), Var("k"))),
+            Load(name="kk", input="kt", index=(Var("k"), Var("t"))),
+            Assign("p", "multiply", ("qk", "kk")),
+            Accum("dot", "p"),
+        )),
+        Load(name="mk", input="mask", index=(Var("t"),)),
+        Let(name="scale", value=Literal(0.25), dtype=F32),
+        Assign("s0", "multiply", ("dot", "scale")),
+        Assign("s", "add", ("s0", "mk")),
+        Let(name="one", value=Literal(1.0), dtype=F32),
+        Assign("gn", "maximum", ("s", "m")),
+        Assign("dg", "subtract", ("m", "gn")),
+        Assign("alpha", "exp", ("dg",)),
+        Assign("dgo", "subtract", ("s", "gn")),
+        Assign("beta", "exp", ("dgo",)),
+        Assign("la", "multiply", ("alpha", "l")),
+        Assign("lb", "multiply", ("beta", "one")),
+        Accum("l", "lb", base="la"),
+        Assign("oa", "multiply", ("o", "alpha")),
+        Load(name="vv", input="v", index=(Var("t"), Var("c"))),
+        Assign("ob", "multiply", ("vv", "beta")),
+        Accum("o", "ob", base="oa"),
+        Accum("m", "s", op="maximum"),
+    ))
+    body = [Tile(axes=(Axis("r", Dim(rows)), Axis("c", Dim(cols))), body=(
+        attention,
+        Assign("inv", "reciprocal", ("l",)),
+        Assign("res", "multiply", ("o", "inv")),
+        Write("out", (Var("r"), Var("c")), "res"),
+    ))]
+    got = run(body, {"q": q, "kt": kt, "v": v, "mask": mask}, {"out": (rows, cols)}, 1, rows * cols)["out"]
+    s = (q.astype(np.float64) @ kt) * 0.25 + mask
+    p = np.exp(s - s.max(1, keepdims=True))
+    want = (p / p.sum(1, keepdims=True)) @ v
+    assert np.allclose(got, want, rtol=1e-4, atol=1e-5)
+
+
 def test_integer_elementwise_ops():
     a = rng.integers(-1000, 1000, 256).astype(np.int32)
     b = rng.integers(1, 50, 256).astype(np.int32)

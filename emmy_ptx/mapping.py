@@ -29,6 +29,15 @@ kernel computes.
 * :func:`jammed` is unroll-and-jam (Callahan, Carr & Kennedy, PLDI'90): copies
   of a loop body for consecutive iterations, renamed apart, so that fusing
   merges the inner loops of the copies.
+* :func:`blocked` is lane blocking, the work partitioning of FlashAttention-2
+  (Dao, ICLR'24) done by the compiler. When only part of each iteration is
+  the same on all lanes of a group (in attention, the scores of a query row;
+  each lane then folds them into its own output columns), the lanes take the
+  iterations of a block in turn for that part and send each other its
+  results with shuffles, so the shared part runs once per iteration, not
+  once per lane.
+* :func:`cse` removes repeated arithmetic from a loop body, so the analyses
+  above see that two merged cells share one online-softmax update.
 """
 
 from __future__ import annotations
@@ -36,16 +45,24 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
-from emmy.compiler.ir.expr import Var
-from emmy.compiler.ir.stmt import Assign
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
+from emmy.compiler.ir.kernel.ir import WarpShuffle
+from emmy.compiler.ir.stmt import Accum, Assign, Loop
+from emmy.compiler.ir.stmt.base import Stmt
+from emmy.compiler.ir.stmt.leaves import Let
 
 LOOPS = ("Loop", "StridedLoop")
 # what a pure loop may contain: values and folds, nothing another thread or the output sees
 PURE = ("Load", "Assign", "Let", "Accum", "Select", *LOOPS)
-CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve")
+CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "LaneBroadcast")
 _EFFECTS = ("Write", "ZeroPrologue", "Init", "Smem", *CROSS_THREAD)
 _MAX = ("maximum", "amax", "fmax")
 _ADD = ("add", "sum")
+# what :func:`renamed` can rename inside
+_RENAMABLE = ("Load", "Assign", "Let", "Accum", "Init", "Select", "Write", "Cond", "LaneBroadcast", *LOOPS)
 
 
 def kind(s) -> str:
@@ -78,6 +95,8 @@ def own_reads(s) -> set[str]:
     elif k in ("WarpShuffle", "TreeHalve"):
         out.update(s.state)
         out.update(x for a in s.combine_states for x in a.args)
+    elif k == "LaneBroadcast":
+        out.add(s.value)
     for e in getattr(s, "exprs", lambda: ())():
         out.update(e.free_vars())
     return out
@@ -105,7 +124,7 @@ def produced(s) -> set[str]:
     k = kind(s)
     if k == "Load":
         return set(s.names)
-    if k in ("Assign", "Let", "Init", "Select", "Accum", "Smem"):
+    if k in ("Assign", "Let", "Init", "Select", "Accum", "Smem", "LaneBroadcast"):
         return {s.name}
     return assigned((s,)) | ({"*"} if k in ("WarpShuffle", "TreeHalve") else set())
 
@@ -117,7 +136,7 @@ def binds(stmts) -> set[str]:
         k = kind(s)
         if k == "Load":
             out.update(s.names)
-        elif k in ("Assign", "Let", "Init", "Select", "Accum"):
+        elif k in ("Assign", "Let", "Init", "Select", "Accum", "LaneBroadcast"):
             out.add(s.name)
         elif k in LOOPS:
             out.add(s.axis.name)
@@ -165,6 +184,8 @@ def renamed(s, mapping: dict[str, str]):
                        axes=tuple(n(a) for a in s.axes))
     if k == "Init":
         return replace(s, name=n(s.name))
+    if k == "LaneBroadcast":
+        return replace(s, name=n(s.name), value=n(s.value))
     if k == "Select":
         return replace(s, name=n(s.name),
                        branches=tuple(replace(br, value=n(br.value), select=e(br.select)) for br in s.branches))
@@ -272,11 +293,46 @@ def local_names(body) -> set[str]:
         k = kind(s)
         if k == "Load":
             out.update(s.names)
-        elif k in ("Assign", "Let", "Init", "Select"):
+        elif k in ("Assign", "Let", "Init", "Select", "LaneBroadcast"):
             out.add(s.name)
         elif k in LOOPS and s.seed:
             out.update(x.name for x in s.body if kind(x) == "Accum")
     return out
+
+
+def cse(body) -> tuple:
+    """``body`` (a loop body) without the top-level Assigns, Lets and Selects that
+    repeat an earlier one's computation; their readers read the earlier name
+    (common-subexpression elimination). A repeat counts only while the names
+    it reads still hold what they held for the earlier statement."""
+    if any(kind(x) not in _RENAMABLE for x in walk(body)):
+        return tuple(body)
+    version: dict[str, int] = {}
+    seen: dict = {}
+    alias: dict[str, str] = {}
+    out = []
+    for s in body:
+        s = renamed(s, alias)
+        k, key = kind(s), None
+        if k == "Assign":
+            key = (s.op.name, tuple((a, version.get(a, 0)) for a in s.args), _dtype(s))
+        elif k == "Let":
+            key = (s.value, _dtype(s), tuple((v, version.get(v, 0)) for v in sorted(s.value.free_vars())))
+        elif k == "Select":
+            key = (s.branches, tuple((v, version.get(v, 0)) for v in sorted(own_reads(s))))
+        if key is not None and key in seen:
+            alias[s.name] = seen[key]
+            continue
+        if key is not None:
+            seen[key] = s.name
+        for name in assigned((s,)):
+            version[name] = version.get(name, 0) + 1
+        out.append(s)
+    return tuple(out)
+
+
+def _dtype(s):
+    return s.dtype.name if s.dtype is not None else None
 
 
 # ---------------------------------------------------------------- online softmax
@@ -312,7 +368,7 @@ def online_groups(body) -> list[OnlineGroup] | None:
     for m, sums in found.items():
         top = maxes[m]
         parts = {id(x): x for acc, update, _ in sums for x in (*update, acc)}
-        if any(pos[k] > pos[id(top)] for k in parts):
+        if any(pos[k] > pos[id(top)] for k, x in parts.items() if m in own_reads(x)):
             return None  # the update must read the max before the max moves
         if len({acc.value for acc, _, _ in sums}) != len(sums):
             return None  # two sums sharing one addend
@@ -468,3 +524,210 @@ def jammed(body, var: str, copies: int, keep: set[str]) -> tuple:
         mapping[var] = f"{var}${j}"
         out.extend(renamed(s, mapping) for s in body)
     return tuple(out)
+
+
+# ---------------------------------------------------------------- lane blocking
+
+
+@dataclass(frozen=True)
+class LaneBroadcast(Stmt):
+    """``name = value`` as lane ``lane`` of each aligned group of ``group`` lanes
+    holds it: one shuffle (made only by :func:`blocked`)."""
+
+    name: str
+    value: str
+    lane: int
+    group: int
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+
+@dataclass(frozen=True)
+class Blocked:
+    """A loop dealt to the lanes of a group in blocks (:func:`blocked`)."""
+
+    loop: object  # a Loop over the whole blocks, or None
+    rest: tuple  # the last, partial block as straight-line statements
+    merges: tuple  # WarpShuffles adding up the lanes' partial sums after the loop
+    mutable: frozenset  # names the new statements reassign
+    shared: tuple  # the shared part of an iteration (what one lane computes for the others)
+    invariant: float  # elements the shared part loads alike in every block (a query row, say)
+
+
+def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blocked | None:
+    """Loop ``loop`` (iterations ``start + i*step`` for ``i < trips``) dealt to
+    aligned groups of ``group`` lanes in blocks of ``group`` iterations, or None
+    when its body does not have that shape. ``uniform(name)`` says whether all
+    lanes of a group compute a body value alike in a given iteration.
+
+    The body splits in two. The *shared* part computes values the lanes agree
+    on without reading the loop's carried state, and must hold the expensive
+    work (an inner loop). The *own* part is the rest: the values that differ
+    between lanes and the folds. In each block, lane r computes the shared part
+    of the block's iteration r only. Then, for each iteration j of the block,
+    every lane receives from lane j the shared values the own part reads (one
+    LaneBroadcast each) and runs the own part, so plain folds fold the same
+    values in the same order as before.
+
+    An online softmax (:func:`online_groups`) is folded once per block: a
+    butterfly over the lanes' scores gives the block's max, each lane weighs
+    its own score against the new max, and each sum is rescaled once. A sum
+    whose weights the lanes share keeps one partial sum per lane (``merges``
+    adds them up after the loop); a sum with per-lane weights folds the weight
+    of every iteration of the block, times that iteration's broadcast beta.
+    """
+    body = tuple(loop.body)
+    groups = online_groups(body)
+    if groups is None:
+        return None
+    in_group = {id(x) for g in groups for x in g.stmts}
+    temps = {x.name for g in groups for x in g.stmts if kind(x) == "Assign"}
+    softmax_states = {g.m for g in groups} | {l for g in groups for l, _, _ in g.sums}
+    states = {s.name for s in body if kind(s) == "Accum"}
+    rest = [s for s in body if id(s) not in in_group]
+    shared = [s for s in rest if kind(s) in PURE and kind(s) != "Accum" and not reads((s,)) & (states | temps)
+              and all(uniform(n) for n in produced(s))]
+    shared_ids = {id(s) for s in shared}
+    from_shared = set().union(*(produced(s) for s in shared))
+    bound = binds(body)
+    varying, pooled = [], []
+    for g in groups:
+        if g.s not in from_shared:
+            return None
+        for l, addend, w in g.sums:
+            if not uniform(w):
+                varying.append((g, l, addend, w))
+            elif w in bound and w not in from_shared:
+                return None
+            else:
+                pooled.append(l)
+    plain = [s for s in rest if kind(s) == "Accum"]
+    if not varying and not plain:
+        return None  # all lanes fold the same values: a lane-split reduction instead
+    # the own part: what the per-lane weights and the plain folds need (Lets are recomputed, never sent)
+    own = _needed([s for s in rest if id(s) not in shared_ids or kind(s) == "Let"],
+                  {w for *_, w in varying} | {s.name for s in plain})
+    for s in own:
+        if reads((s,)) & (temps | softmax_states):
+            return None  # the per-iteration softmax values no longer exist
+    wanted = reads(own)
+    sent = [n for s in shared if kind(s) != "Let" for n in _names(s) if n in wanted]
+    work = _needed(shared, {g.s for g in groups} | {w for g in groups for l, _, w in g.sums if l in pooled} | set(sent))
+    if not any(kind(s) in LOOPS for s in work):
+        return None  # nothing worth sharing
+    t = loop.axis.name
+    copies = binds(own) - states
+    assigns = {x.name: x for g in groups for x in g.stmts if kind(x) == "Assign"}
+    rank = Var("lane") if group == 32 else BinaryExpr("&", Var("lane"), _int(group - 1))
+
+    def iteration(i):
+        return BinaryExpr("+", _int(start), BinaryExpr("*", i, _int(step)))
+
+    def block(index, count: int) -> list:
+        first = BinaryExpr("*", index, _int(group))
+        mine = BinaryExpr("+", first, rank)
+        out = [Let(f"{t}${j}", iteration(BinaryExpr("+", first, _int(j)))) for j in range(count)]
+        valid = None
+        if count < group:  # lanes past the last iteration redo it and drop their scores
+            valid = BinaryExpr("<", mine, _int(trips))
+            mine = TernaryExpr(valid, mine, _int(trips - 1))
+        out.append(Let(t, iteration(mine)))
+        out.extend(work)
+        broadcast = list(sent)
+        betas = {}
+        for g in groups:
+            score = g.s
+            if valid is not None:
+                score = f"{g.s}$in"
+                out.append(Let(score, TernaryExpr(valid, Var(g.s), Literal(-math.inf)), F32))
+            update, names = _block_update(g, score, group, pooled)
+            out.extend(update)
+            betas[g.m] = names
+            for _, l, addend, w in (v for v in varying if v[0] is g):  # each iteration's beta, for its weights
+                beta = names[_other(assigns[addend], w)]
+                if beta not in broadcast:
+                    broadcast.append(beta)
+        for j in range(count):
+            out.extend(LaneBroadcast(f"{x}${j}", x, j, group) for x in broadcast)
+            rename = {**{n: f"{n}${j}" for n in copies}, t: f"{t}${j}", **{x: f"{x}${j}" for x in broadcast}}
+            out.extend(renamed(s, rename) for s in own)
+            for g, l, addend, w in varying:
+                sb = assigns[addend]
+                beta = _other(sb, w)
+                args = tuple(rename.get(a, a) if a == w else f"{betas[g.m][beta]}${j}" for a in sb.args)
+                out.append(Assign(f"{addend}${j}", sb.op, args, sb.dtype))
+                out.append(Accum(l, f"{addend}${j}", "add", dtype=_sum_of(g, l).dtype))
+        return out
+
+    full, left = divmod(trips, group)
+    index = f"{t}$blk"
+    main = None
+    if full:
+        main = Loop(axis=Axis(index, Dim(full)), body=tuple(block(Var(index), group)), unroll=loop.unroll, seed=False)
+    tail = tuple(block(_int(full), left)) if left else ()
+    merges = tuple(WarpShuffle((l,), (f"{l}$b",), (Assign(l, "add", (l, f"{l}$b"), F32),), group, F32)
+                   for l in pooled)
+    lets = index_lets(work)
+    invariant = sum(runs * len(ld.names) for ld, runs in weighted_loads(work)
+                    if all(coefficient(e, t, lets) == 0 for e in ld.index))
+    return Blocked(main, tail, merges, frozenset(f"{g.m}$blk" for g in groups), tuple(work), invariant)
+
+
+def _block_update(g: OnlineGroup, score: str, group: int, pooled) -> tuple[list, dict]:
+    """One block's update of online softmax ``g`` (see :func:`blocked`): the
+    group's own update with the max taken over the block (a butterfly of the
+    lanes' ``score``) and each lane's beta weighing its own score. The sums in
+    ``pooled`` fold that beta as the IR does; the others are only rescaled.
+    Returns the statements and the block's name for each update value."""
+    top = g.stmts[-1]
+    peak = f"{g.m}$blk"
+    names = {x.name: f"{x.name}$blk" for x in g.stmts if kind(x) == "Assign"}
+    out = [Let(peak, Var(score), F32),
+           WarpShuffle((peak,), (f"{peak}$b",), (Assign(peak, "maximum", (peak, f"{peak}$b"), F32),), group, F32)]
+    per_iteration = set()  # the products of the sums that are only rescaled here
+    for l, addend, _ in g.sums:
+        if l not in pooled:
+            per_iteration |= {_sum_of(g, l).base, addend}
+    for x in g.stmts:
+        if kind(x) != "Assign" or x.name in per_iteration:
+            continue
+        args = x.args
+        if x.op.name in _MAX and set(args) == {g.s, g.m}:  # the new max, over the block
+            args = tuple(peak if a == g.s else a for a in args)
+        out.append(Assign(names[x.name], x.op, tuple(score if a == g.s else names.get(a, a) for a in args), x.dtype))
+    assigns = {x.name: x for x in g.stmts if kind(x) == "Assign"}
+    for l, addend, _ in g.sums:
+        acc = _sum_of(g, l)
+        if l in pooled:
+            out.append(replace(acc, base=names[acc.base], value=names[addend]))
+        else:  # l * alpha, once per block
+            out.append(Accum(l, names[_other(assigns[acc.base], l)], "multiply", dtype=acc.dtype))
+    out.append(replace(top, value=peak))
+    return out, names
+
+
+def _sum_of(g: OnlineGroup, l: str):
+    return next(x for x in g.stmts if kind(x) == "Accum" and x.name == l)
+
+
+def _needed(stmts, roots) -> list:
+    """The statements of ``stmts`` that ``roots`` (names) depend on, in order."""
+    need, keep = set(roots), []
+    for s in reversed(stmts):
+        if produced(s) & need:
+            keep.append(s)
+            need |= reads((s,))
+    return keep[::-1]
+
+
+def _names(s) -> list:
+    """What statement ``s`` produces, in a stable order."""
+    return list(s.names) if kind(s) == "Load" else sorted(produced(s))
+
+
+def _int(v: int):
+    return Literal(v, "int")

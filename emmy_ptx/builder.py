@@ -144,6 +144,7 @@ class _Loop:
     table: int  # index of the value-numbering table live at the preheader
     guards: int  # conditional nesting depth when the loop opened
     budget: int  # instructions this preheader may still receive (register pressure)
+    loads: bool = True  # whether loads may be hoisted here
 
 
 class Builder:
@@ -177,14 +178,16 @@ class Builder:
             self._tables.pop()
 
     @contextlib.contextmanager
-    def loop(self):
+    def loop(self, hoist_loads: bool = True):
         """The body of a rolled loop (open it after the zero-trip check).
 
         Loop-invariant code motion: a pure instruction whose operands were all
         defined before an enclosing loop is emitted once, in that loop's
         preheader, instead of once per trip. Loads qualify only from read-only
         memory and only when no branch inside the loop guards them, so a
-        hoisted load never runs where the original would not have.
+        hoisted load never runs where the original would not have; with
+        ``hoist_loads`` False they stay in the loop (a value per trip is
+        cheaper than a register held for the whole loop when there are many).
 
         The preheader follows the zero-trip check, so it dominates the loop
         body but not the code after the loop: hoisted values are numbered in
@@ -193,7 +196,7 @@ class Builder:
         pre = Block()
         self.k.emit(pre)
         self._tables.append({})
-        self._loops.append(_Loop(pre.items, len(self._tables) - 1, self._guards, self.HOIST_BUDGET))
+        self._loops.append(_Loop(pre.items, len(self._tables) - 1, self._guards, self.HOIST_BUDGET, hoist_loads))
         try:
             yield
         finally:
@@ -229,7 +232,7 @@ class Builder:
         """The outermost open loop whose preheader can hold this instruction."""
         depth = max((self._depth_of(a) for a in args), default=0)
         for frame in self._loops[depth:]:
-            if frame.budget > 0 and (not op.startswith("ld.") or frame.guards == self._guards):
+            if frame.budget > 0 and (not op.startswith("ld.") or frame.loads and frame.guards == self._guards):
                 return frame
         return None
 
