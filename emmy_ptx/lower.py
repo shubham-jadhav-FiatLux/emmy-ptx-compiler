@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from . import elementwise
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .congruence import congruent_accumulators, merge_congruent
+from .regroup import fully_combined, regroup
 from .frontend import DEFAULT_BLOCK, KernelSource
 from .ptx import SIZEOF, Imm, Kernel, Mem, Reg, Sym, Vec
 from .vectorize import vectorize_loads
@@ -175,7 +176,10 @@ class Lowerer:
         return self.kernel
 
     def body(self, stmts) -> None:
-        for s in _issue_loads_early(stmts, self._readonly):
+        stmts = _issue_loads_early(stmts, self._readonly)
+        for i, s in enumerate(stmts):
+            if type(s).__name__ == "StridedLoop" and self.converged:
+                s = self._regrouped(stmts, i, s)
             handler = getattr(self, "stmt_" + type(s).__name__, None)
             if handler is None:
                 raise LoweringError(f"unsupported statement {type(s).__name__}")
@@ -200,6 +204,18 @@ class Lowerer:
         finally:
             self.scope = self.scope.parent
             self.converged = converged
+
+    def _regrouped(self, stmts, i: int, s):
+        """``s`` in chunked order when its accumulators flow straight into a full
+        combine across the cooperating threads (see regroup.py), else ``s``."""
+        accs = {st.name for st in s.body if type(st).__name__ == "Accum"}
+        step = _int_value(s.step)
+        if not accs or step is None or not fully_combined(stmts, i, accs, step):
+            return s
+        start = self.expr(s.start)
+        if start.lo != 0 or start.hi is None:
+            return s
+        return regroup(s, start.hi, step, int(s.axis.extent.as_static())) or s
 
     def _pessimize(self, stmts) -> None:
         """Forget the uniformity of the variables ``stmts`` reassign: at a merge
@@ -1147,14 +1163,40 @@ def _issue_loads_early(stmts, readonly: frozenset) -> tuple:
     out: list = []
     for s in stmts:
         if type(s).__name__ == "Load" and s.input in readonly:
-            needs = {v for e in s.index for v in e.free_vars()}
+            needs, defines = {v for e in s.index for v in e.free_vars()}, set(s.names)
             pos = len(out)
-            while pos > 0 and type(out[pos - 1]).__name__ != "Load" and not (_produces(out[pos - 1]) & needs):
+            while pos > 0 and type(out[pos - 1]).__name__ != "Load":
+                prev = out[pos - 1]
+                if _produces(prev) & (needs | defines) or _reads(prev) & defines:
+                    break  # a true, anti or output dependence
                 pos -= 1
             out.insert(pos, s)
         else:
             out.append(s)
     return tuple(out)
+
+
+def _reads(s) -> set[str]:
+    """Names a statement (and anything nested in it) reads."""
+    out = set()
+    for st in _walk((s,)):
+        kind = type(st).__name__
+        if kind == "Assign":
+            out.update(st.args)
+        elif kind == "Accum":
+            out.update(x for x in (st.name, st.value, st.base) if x is not None)
+        elif kind == "Write":
+            out.update(st.values)
+        elif kind == "Select":
+            out.update(br.value for br in st.branches)
+        elif kind in ("WarpShuffle", "TreeHalve"):
+            out.update(st.state)
+            out.update(x for a in st.combine_states for x in a.args)
+        for e in getattr(st, "exprs", lambda: ())():
+            out.update(e.free_vars())
+        if kind == "Load":
+            out.update(v for e in st.index for v in e.free_vars())
+    return out
 
 
 def _produces(s) -> set[str]:
@@ -1165,6 +1207,13 @@ def _produces(s) -> set[str]:
     if kind in ("Assign", "Let", "Init", "Select", "Accum", "Smem"):
         return {s.name}
     return _assigned_in((s,)) | ({"*"} if kind in ("WarpShuffle", "TreeHalve") else set())
+
+
+def _int_value(e):
+    """The value of an integer literal expression, else None."""
+    if type(e).__name__ == "Literal" and not isinstance(e.value, float):
+        return int(e.value)
+    return None
 
 
 def _lowbit(n: int) -> int:
