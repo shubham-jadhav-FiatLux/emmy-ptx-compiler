@@ -34,8 +34,10 @@ kernel computes.
   the same on all lanes of a group (in attention, the scores of a query row;
   each lane then folds them into its own output columns), the lanes take the
   iterations of a block in turn for that part and send each other its
-  results with shuffles, so the shared part runs once per iteration, not
-  once per lane.
+  results, so the shared part runs once per iteration, not once per lane.
+  When each iteration's inputs are a row of their own, a few lanes share an
+  iteration (a slot) to read it coalesced; the lowering may send the results
+  through shared memory (LaneStash) rather than shuffles.
 * :func:`cse` removes repeated arithmetic from a loop body, so the analyses
   above see that two merged cells share one online-softmax update.
 """
@@ -49,7 +51,6 @@ from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
-from emmy.compiler.ir.kernel.ir import WarpShuffle
 from emmy.compiler.ir.stmt import Accum, Assign, Loop
 from emmy.compiler.ir.stmt.base import Stmt
 from emmy.compiler.ir.stmt.leaves import Let
@@ -57,12 +58,15 @@ from emmy.compiler.ir.stmt.leaves import Let
 LOOPS = ("Loop", "StridedLoop")
 # what a pure loop may contain: values and folds, nothing another thread or the output sees
 PURE = ("Load", "Assign", "Let", "Accum", "Select", *LOOPS)
-CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "LaneBroadcast")
+CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "LaneBroadcast",
+                "LaneButterfly", "LaneStash")
+_BUTTERFLIES = ("WarpShuffle", "TreeHalve", "LaneButterfly")  # statements that reassign their ``state``
 _EFFECTS = ("Write", "ZeroPrologue", "Init", "Smem", *CROSS_THREAD)
 _MAX = ("maximum", "amax", "fmax")
 _ADD = ("add", "sum")
 # what :func:`renamed` can rename inside
-_RENAMABLE = ("Load", "Assign", "Let", "Accum", "Init", "Select", "Write", "Cond", "LaneBroadcast", *LOOPS)
+_RENAMABLE = ("Load", "Assign", "Let", "Accum", "Init", "Select", "Write", "Cond", "LaneBroadcast", "LaneSlot",
+              "LaneStash", *LOOPS)
 
 
 def kind(s) -> str:
@@ -92,11 +96,13 @@ def own_reads(s) -> set[str]:
         out.update(s.values)
     elif k == "Select":
         out.update(br.value for br in s.branches)
-    elif k in ("WarpShuffle", "TreeHalve"):
+    elif k in _BUTTERFLIES:
         out.update(s.state)
         out.update(x for a in s.combine_states for x in a.args)
     elif k == "LaneBroadcast":
         out.add(s.value)
+    elif k == "LaneStash":
+        out.update(s.values)
     for e in getattr(s, "exprs", lambda: ())():
         out.update(e.free_vars())
     return out
@@ -113,7 +119,7 @@ def assigned(stmts) -> set[str]:
     for s in walk(stmts):
         if kind(s) == "Accum":
             out.add(s.name)
-        elif kind(s) in ("WarpShuffle", "TreeHalve"):
+        elif kind(s) in _BUTTERFLIES:
             out.update(s.state)
     return out
 
@@ -124,9 +130,9 @@ def produced(s) -> set[str]:
     k = kind(s)
     if k == "Load":
         return set(s.names)
-    if k in ("Assign", "Let", "Init", "Select", "Accum", "Smem", "LaneBroadcast"):
+    if k in ("Assign", "Let", "Init", "Select", "Accum", "Smem", "LaneBroadcast", "LaneSlot"):
         return {s.name}
-    return assigned((s,)) | ({"*"} if k in ("WarpShuffle", "TreeHalve") else set())
+    return assigned((s,)) | ({"*"} if k in _BUTTERFLIES else set())
 
 
 def binds(stmts) -> set[str]:
@@ -136,7 +142,7 @@ def binds(stmts) -> set[str]:
         k = kind(s)
         if k == "Load":
             out.update(s.names)
-        elif k in ("Assign", "Let", "Init", "Select", "Accum", "LaneBroadcast"):
+        elif k in ("Assign", "Let", "Init", "Select", "Accum", "LaneBroadcast", "LaneSlot"):
             out.add(s.name)
         elif k in LOOPS:
             out.add(s.axis.name)
@@ -186,6 +192,10 @@ def renamed(s, mapping: dict[str, str]):
         return replace(s, name=n(s.name))
     if k == "LaneBroadcast":
         return replace(s, name=n(s.name), value=n(s.value))
+    if k == "LaneSlot":
+        return replace(s, name=n(s.name))
+    if k == "LaneStash":
+        return replace(s, values=tuple(n(v) for v in s.values))
     if k == "Select":
         return replace(s, name=n(s.name),
                        branches=tuple(replace(br, value=n(br.value), select=e(br.select)) for br in s.branches))
@@ -293,7 +303,7 @@ def local_names(body) -> set[str]:
         k = kind(s)
         if k == "Load":
             out.update(s.names)
-        elif k in ("Assign", "Let", "Init", "Select", "LaneBroadcast"):
+        elif k in ("Assign", "Let", "Init", "Select", "LaneBroadcast", "LaneSlot"):
             out.add(s.name)
         elif k in LOOPS and s.seed:
             out.update(x.name for x in s.body if kind(x) == "Accum")
@@ -527,12 +537,25 @@ def jammed(body, var: str, copies: int, keep: set[str]) -> tuple:
 
 
 # ---------------------------------------------------------------- lane blocking
+# The statements below exist only inside loops that :func:`blocked` rewrote.
+
+
+@dataclass(frozen=True)
+class LaneSlot(Stmt):
+    """``name`` = the slot of this lane in its aligned group of ``group`` lanes,
+    slots being runs of ``share`` lanes: ``(lane % group) / share``."""
+
+    name: str
+    group: int
+    share: int
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
 
 
 @dataclass(frozen=True)
 class LaneBroadcast(Stmt):
-    """``name = value`` as lane ``lane`` of each aligned group of ``group`` lanes
-    holds it: one shuffle (made only by :func:`blocked`)."""
+    """``name = value`` as lane ``lane`` of each aligned group of ``group`` lanes holds it."""
 
     name: str
     value: str
@@ -547,36 +570,69 @@ class LaneBroadcast(Stmt):
 
 
 @dataclass(frozen=True)
+class LaneStash(Stmt):
+    """``values`` are about to be broadcast within each aligned group of
+    ``group`` lanes (slots of ``share`` lanes holding each alike): the lowering
+    may store them to shared memory, so that each LaneBroadcast of them that
+    follows is one shared load instead of a shuffle."""
+
+    values: tuple[str, ...]
+    group: int
+    share: int
+
+    def deps(self) -> tuple[str, ...]:
+        return self.values
+
+
+@dataclass(frozen=True)
+class LaneButterfly(Stmt):
+    """WarpShuffle's butterfly over the lane distances ``group/2`` down to
+    ``low`` only: runs of ``low`` lanes already hold the state alike."""
+
+    state: tuple[str, ...]
+    state_b: tuple[str, ...]
+    combine_states: tuple
+    group: int
+    low: int
+
+    def deps(self) -> tuple[str, ...]:
+        return self.state
+
+
+@dataclass(frozen=True)
 class Blocked:
     """A loop dealt to the lanes of a group in blocks (:func:`blocked`)."""
 
     loop: object  # a Loop over the whole blocks, or None
     rest: tuple  # the last, partial block as straight-line statements
-    merges: tuple  # WarpShuffles adding up the lanes' partial sums after the loop
+    merges: tuple  # LaneButterflies adding up the lanes' partial sums after the loop
     mutable: frozenset  # names the new statements reassign
-    shared: tuple  # the shared part of an iteration (what one lane computes for the others)
+    shared: tuple  # the shared part of an iteration (what one slot computes for the others)
     invariant: float  # elements the shared part loads alike in every block (a query row, say)
 
 
-def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blocked | None:
+def blocked(loop, trips: int, start: int, step: int, group: int, share: int, uniform) -> Blocked | None:
     """Loop ``loop`` (iterations ``start + i*step`` for ``i < trips``) dealt to
-    aligned groups of ``group`` lanes in blocks of ``group`` iterations, or None
-    when its body does not have that shape. ``uniform(name)`` says whether all
-    lanes of a group compute a body value alike in a given iteration.
+    aligned groups of ``group`` lanes in blocks of ``group / share``
+    iterations, or None when its body does not have that shape.
+    ``uniform(name)`` says whether all lanes of a group compute a body value
+    alike in a given iteration.
 
     The body splits in two. The *shared* part computes values the lanes agree
     on without reading the loop's carried state, and must hold the expensive
     work (an inner loop). The *own* part is the rest: the values that differ
-    between lanes and the folds. In each block, lane r computes the shared part
-    of the block's iteration r only. Then, for each iteration j of the block,
-    every lane receives from lane j the shared values the own part reads (one
+    between lanes and the folds. The group's lanes form slots of ``share``
+    lanes, and in each block slot r computes the shared part of the block's
+    iteration r only (its lanes split the inner loops between them, like any
+    reduction lanes share). Then, for each iteration j of the block, every lane
+    receives from slot j the shared values the own part reads (one
     LaneBroadcast each) and runs the own part, so plain folds fold the same
     values in the same order as before.
 
     An online softmax (:func:`online_groups`) is folded once per block: a
-    butterfly over the lanes' scores gives the block's max, each lane weighs
+    butterfly over the slots' scores gives the block's max, each slot weighs
     its own score against the new max, and each sum is rescaled once. A sum
-    whose weights the lanes share keeps one partial sum per lane (``merges``
+    whose weights the lanes share keeps one partial sum per slot (``merges``
     adds them up after the loop); a sum with per-lane weights folds the weight
     of every iteration of the block, times that iteration's broadcast beta.
     """
@@ -620,19 +676,20 @@ def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blo
     if not any(kind(s) in LOOPS for s in work):
         return None  # nothing worth sharing
     t = loop.axis.name
+    slots = group // share
     copies = binds(own) - states
     assigns = {x.name: x for g in groups for x in g.stmts if kind(x) == "Assign"}
-    rank = Var("lane") if group == 32 else BinaryExpr("&", Var("lane"), _int(group - 1))
 
     def iteration(i):
         return BinaryExpr("+", _int(start), BinaryExpr("*", i, _int(step)))
 
     def block(index, count: int) -> list:
-        first = BinaryExpr("*", index, _int(group))
-        mine = BinaryExpr("+", first, rank)
+        first = BinaryExpr("*", index, _int(slots))
+        mine = BinaryExpr("+", first, Var(f"{t}$slot"))
         out = [Let(f"{t}${j}", iteration(BinaryExpr("+", first, _int(j)))) for j in range(count)]
+        out.append(LaneSlot(f"{t}$slot", group, share))
         valid = None
-        if count < group:  # lanes past the last iteration redo it and drop their scores
+        if count < slots:  # slots past the last iteration redo it and drop their scores
             valid = BinaryExpr("<", mine, _int(trips))
             mine = TernaryExpr(valid, mine, _int(trips - 1))
         out.append(Let(t, iteration(mine)))
@@ -644,15 +701,17 @@ def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blo
             if valid is not None:
                 score = f"{g.s}$in"
                 out.append(Let(score, TernaryExpr(valid, Var(g.s), Literal(-math.inf)), F32))
-            update, names = _block_update(g, score, group, pooled)
+            update, names = _block_update(g, score, group, share, pooled)
             out.extend(update)
             betas[g.m] = names
             for _, l, addend, w in (v for v in varying if v[0] is g):  # each iteration's beta, for its weights
                 beta = names[_other(assigns[addend], w)]
                 if beta not in broadcast:
                     broadcast.append(beta)
+        if broadcast:
+            out.append(LaneStash(tuple(broadcast), group, share))
         for j in range(count):
-            out.extend(LaneBroadcast(f"{x}${j}", x, j, group) for x in broadcast)
+            out.extend(LaneBroadcast(f"{x}${j}", x, j * share, group) for x in broadcast)
             rename = {**{n: f"{n}${j}" for n in copies}, t: f"{t}${j}", **{x: f"{x}${j}" for x in broadcast}}
             out.extend(renamed(s, rename) for s in own)
             for g, l, addend, w in varying:
@@ -663,13 +722,13 @@ def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blo
                 out.append(Accum(l, f"{addend}${j}", "add", dtype=_sum_of(g, l).dtype))
         return out
 
-    full, left = divmod(trips, group)
+    full, left = divmod(trips, slots)
     index = f"{t}$blk"
     main = None
     if full:
-        main = Loop(axis=Axis(index, Dim(full)), body=tuple(block(Var(index), group)), unroll=loop.unroll, seed=False)
+        main = Loop(axis=Axis(index, Dim(full)), body=tuple(block(Var(index), slots)), unroll=loop.unroll, seed=False)
     tail = tuple(block(_int(full), left)) if left else ()
-    merges = tuple(WarpShuffle((l,), (f"{l}$b",), (Assign(l, "add", (l, f"{l}$b"), F32),), group, F32)
+    merges = tuple(LaneButterfly((l,), (f"{l}$b",), (Assign(l, "add", (l, f"{l}$b"), F32),), group, share)
                    for l in pooled)
     lets = index_lets(work)
     invariant = sum(runs * len(ld.names) for ld, runs in weighted_loads(work)
@@ -677,17 +736,17 @@ def blocked(loop, trips: int, start: int, step: int, group: int, uniform) -> Blo
     return Blocked(main, tail, merges, frozenset(f"{g.m}$blk" for g in groups), tuple(work), invariant)
 
 
-def _block_update(g: OnlineGroup, score: str, group: int, pooled) -> tuple[list, dict]:
+def _block_update(g: OnlineGroup, score: str, group: int, share: int, pooled) -> tuple[list, dict]:
     """One block's update of online softmax ``g`` (see :func:`blocked`): the
     group's own update with the max taken over the block (a butterfly of the
-    lanes' ``score``) and each lane's beta weighing its own score. The sums in
+    slots' ``score``) and each slot's beta weighing its own score. The sums in
     ``pooled`` fold that beta as the IR does; the others are only rescaled.
     Returns the statements and the block's name for each update value."""
     top = g.stmts[-1]
     peak = f"{g.m}$blk"
     names = {x.name: f"{x.name}$blk" for x in g.stmts if kind(x) == "Assign"}
     out = [Let(peak, Var(score), F32),
-           WarpShuffle((peak,), (f"{peak}$b",), (Assign(peak, "maximum", (peak, f"{peak}$b"), F32),), group, F32)]
+           LaneButterfly((peak,), (f"{peak}$b",), (Assign(peak, "maximum", (peak, f"{peak}$b"), F32),), group, share)]
     per_iteration = set()  # the products of the sums that are only rescaled here
     for l, addend, _ in g.sums:
         if l not in pooled:

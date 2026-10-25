@@ -3,14 +3,15 @@ rewritten loop computes what each lane computes running the original alone.
 
 A small interpreter executes the IR over Python floats. ``run`` drives all
 lanes of a group statement by statement, so the cross-lane statements of the
-rewrite (WarpShuffle butterflies, LaneBroadcast) see every lane's values at
-the same point, as on the GPU.
+rewrite (butterflies, LaneBroadcast) see every lane's values at the same
+point, as on the GPU.
 """
 
 import math
 import random
 
 import numpy as np
+import pytest
 from emmy.compiler.dim import Dim
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import Literal, Var
@@ -38,9 +39,9 @@ def run(stmts, lanes: list[dict], arrays: dict) -> None:
                 for env in lanes:
                     env[s.axis.name] = i
                 run(s.body, lanes, arrays)
-        elif kind == "WarpShuffle":
-            width = s.length // 2
-            while width:
+        elif kind == "LaneButterfly":
+            width = s.group // 2
+            while width >= s.low:
                 before = [dict(env) for env in lanes]
                 for i, env in enumerate(lanes):
                     for st, sb in zip(s.state, s.state_b):
@@ -51,6 +52,11 @@ def run(stmts, lanes: list[dict], arrays: dict) -> None:
             before = [dict(env) for env in lanes]
             for i, env in enumerate(lanes):
                 env[s.name] = before[(i & ~(s.group - 1)) + s.lane][s.value]
+        elif kind == "LaneSlot":
+            for i, env in enumerate(lanes):
+                env[s.name] = (i % s.group) // s.share
+        elif kind == "LaneStash":
+            pass  # where the broadcasts read from: no change to any value
         else:
             for env in lanes:
                 step(s, env, arrays)
@@ -136,11 +142,12 @@ def together(plan: mapping.Blocked, arrays: dict, lanes: int, states: dict) -> l
 SOFTMAX = {"m": -1e30, "l": 0.0, "o": 0.0}
 
 
-def test_blocked_online_softmax_matches_each_lane_alone():
+@pytest.mark.parametrize("share", [1, 2, 4])
+def test_blocked_online_softmax_matches_each_lane_alone(share):
     for n, group in ((32, 8), (21, 8), (5, 8), (64, 32)):  # whole blocks, a partial last block, one partial block
         loop, arrays = attention(n), inputs(n, group)
-        plan = mapping.blocked(loop, n, 0, 1, group, lambda name: name not in PER_LANE)
-        assert plan is not None and len(plan.merges) == 1  # l is kept per lane, then added up
+        plan = mapping.blocked(loop, n, 0, 1, group, share, lambda name: name not in PER_LANE)
+        assert plan is not None and len(plan.merges) == 1  # l is kept per slot, then added up
         for lane, env in enumerate(together(plan, arrays, group, SOFTMAX)):
             want = alone(loop, arrays, lane, SOFTMAX)
             assert env["m"] == want["m"]
@@ -148,10 +155,11 @@ def test_blocked_online_softmax_matches_each_lane_alone():
             assert math.isclose(env["o"], want["o"], rel_tol=1e-12, abs_tol=1e-12)
 
 
-def test_blocked_plain_fold_is_bit_identical():
+@pytest.mark.parametrize("share", [1, 4])
+def test_blocked_plain_fold_is_bit_identical(share):
     n, group = 24, 8
     loop, arrays = sigmoid_attention(n), inputs(n, group)
-    plan = mapping.blocked(loop, n, 0, 1, group, lambda name: name not in PER_LANE)
+    plan = mapping.blocked(loop, n, 0, 1, group, share, lambda name: name not in PER_LANE)
     assert plan is not None and not plan.merges
     for lane, env in enumerate(together(plan, arrays, group, {"o": 0.0})):
         assert env["o"] == alone(loop, arrays, lane, {"o": 0.0})["o"]  # same values, same order
@@ -161,9 +169,10 @@ def test_blocking_needs_shared_work_and_shared_scores():
     n = 16
     flat = Loop(axis=Axis("t", Dim(n)), body=tuple(s for s in attention(n).body if type(s).__name__ != "Loop")
                 + (Load(name="dot", input="w", index=(Var("t"),)),))
-    assert mapping.blocked(flat, n, 0, 1, 8, lambda name: name not in PER_LANE) is None  # no inner loop to share
+    assert mapping.blocked(flat, n, 0, 1, 8, 1, lambda name: name not in PER_LANE) is None  # no inner loop to share
     # scores that differ between lanes cannot be computed by one lane for the others
-    assert mapping.blocked(attention(n), n, 0, 1, 8, lambda name: name not in PER_LANE | {"qk", "p", "dot", "s"}) is None
+    varying = PER_LANE | {"qk", "p", "dot", "s"}
+    assert mapping.blocked(attention(n), n, 0, 1, 8, 1, lambda name: name not in varying) is None
 
 
 def test_cse_merges_repeats_until_an_operand_changes():
@@ -194,7 +203,7 @@ def test_random_scores_with_masked_keys():
     masked = Loop(axis=loop.axis, body=tuple(body))
     arrays["mask"] = np.array([-math.inf if 8 <= t < 16 or random.random() < 0.3 else 0.0 for t in range(n)])
     arrays["mask"][0] = 0.0
-    plan = mapping.blocked(masked, n, 0, 1, group, lambda name: name not in PER_LANE)
+    plan = mapping.blocked(masked, n, 0, 1, group, 2, lambda name: name not in PER_LANE)
     assert plan is not None
     for lane, env in enumerate(together(plan, arrays, group, SOFTMAX)):
         want = alone(masked, arrays, lane, SOFTMAX)

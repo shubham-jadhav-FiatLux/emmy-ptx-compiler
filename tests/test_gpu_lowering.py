@@ -279,6 +279,45 @@ def test_attention_is_blocked_across_the_lanes_of_a_row(keys):
     assert np.allclose(got, want, rtol=1e-4, atol=1e-5)
 
 
+def test_few_cells_spread_over_idle_threads():
+    """Emmy's thread-serial schedules: 4 cells (rows) on 256 threads, each
+    folding a 3001-element row and then storing the row divided by its sum.
+    Each cell runs on 32 lanes: the row sum is split across them (rolled
+    rounds of 4-element vectors, then the odd tail) and the stores are dealt."""
+    rows, n = 4, 3001
+    x = rng.standard_normal((rows, n)).astype(np.float32) + 2
+    body = [Tile(axes=(Axis("r", Dim(rows)),), body=(
+        Loop(axis=Axis("k", Dim(n)), body=(
+            Load(name="xv", input="x", index=(Var("r"), Var("k"))),
+            Accum("total", "xv"),
+        )),
+        Write("sums", (Var("r"),), "total"),
+        Assign("inv", "reciprocal", ("total",)),
+        Loop(axis=Axis("j", Dim(n)), body=(
+            Load(name="xj", input="x", index=(Var("r"), Var("j"))),
+            Assign("yj", "multiply", ("xj", "inv")),
+            Write("out", (Var("r"), Var("j")), "yj"),
+        )),
+    ))]
+    got = run(body, {"x": x}, {"sums": (rows,), "out": (rows, n)}, 1, 256)
+    total = x.astype(np.float64).sum(1)
+    assert np.allclose(got["sums"], total, rtol=1e-5)
+    assert np.allclose(got["out"], x / total[:, None], rtol=1e-5, atol=1e-7)
+
+
+def test_one_cell_max_on_a_whole_block():
+    n = 70000
+    x = rng.standard_normal(n).astype(np.float32)
+    body = [Tile(axes=(), body=(
+        Loop(axis=Axis("k", Dim(n)), body=(
+            Load(name="xv", input="x", index=(Var("k"),)),
+            Accum("top", "xv", op="maximum"),
+        )),
+        Write("out", (), "top"),
+    ))]
+    assert run(body, {"x": x}, {"out": (1,)}, 1, 256)["out"][0] == x.max()
+
+
 def test_integer_elementwise_ops():
     a = rng.integers(-1000, 1000, 256).astype(np.int32)
     b = rng.integers(1, 50, 256).astype(np.int32)
