@@ -51,6 +51,7 @@ class Value:
     hi: int | None = None
     mutable: bool = False
     ug: int = 1
+    version: int | None = None  # for a read of a variable: which write it sees
 
     def __post_init__(self):
         if isinstance(self.op, Imm):
@@ -73,9 +74,12 @@ class Value:
         return self.lo is not None and self.lo >= 0
 
     def key(self):
-        """Identity of the value for value numbering (``None``: never reuse)."""
+        """Identity of the value for value numbering (``None``: never reuse).
+
+        A read of a variable is identified by the write it sees: two reads
+        with no write (or merge point) between them are the same value."""
         if self.mutable:
-            return None
+            return None if self.version is None else ("var", self.op.name, self.version)
         if isinstance(self.op, Imm):
             return ("imm", self.op.type, self.op.value)
         return ("reg", self.op.name)
@@ -90,12 +94,18 @@ class Variable:
     lo: int | None = None
     hi: int | None = None
     ug: int = 1  # uniformity of the value it holds now (see Value.ug)
+    last: object = None  # value-numbering key of the value it holds now, when known
+    version: int = 0  # bumped by every write and every merge point
 
     def read(self) -> Value:
         lo, hi = (self.lo, self.hi) if self.type in INT_RANGE else (None, None)
         if self.type in INT_RANGE and lo is None:
             lo, hi = INT_RANGE[self.type]
-        return Value(self.type, self.reg, lo, hi, mutable=True, ug=self.ug)
+        return Value(self.type, self.reg, lo, hi, mutable=True, ug=self.ug, version=self.version)
+
+    def forget(self) -> None:
+        """A merge point or loop head: the value held is no longer known."""
+        self.ug, self.last, self.version = 1, None, self.version + 1
 
 
 def _is_pow2(n) -> bool:
@@ -152,6 +162,7 @@ class Builder:
         self._linear: dict = {}  # value key -> (terms, const): value = sum(coeff * term) + const
         self._ug: dict[str, int] = {}  # register -> uniform group of its value (see Value.ug)
         self.align: dict[str, int] = {}  # address register -> known byte alignment
+        self._defs: dict = {}  # value key -> (opcode, operands) of the instruction that made it
 
     # -- dominance scopes for value numbering --------------------------------
 
@@ -254,7 +265,12 @@ class Builder:
         v = Value(type_, reg, lo, hi, ug=ug)
         if key is not None:
             table[key] = v
+            self._defs[v.key()] = (op, args)
         return v
+
+    def def_of(self, v: Value):
+        """``(opcode, operands)`` of the pure instruction that computed ``v``."""
+        return self._defs.get(v.key()) if v.key() is not None else None
 
     def ug_of(self, x) -> int:
         """Uniform group of an operand (a Value, an address, a symbol, a special register)."""
@@ -275,7 +291,7 @@ class Builder:
             return v
         if isinstance(v.op, Reg):
             self._ug[v.op.name] = ug
-        return Value(v.type, v.op, v.lo, v.hi, v.mutable, ug)
+        return Value(v.type, v.op, v.lo, v.hi, v.mutable, ug, v.version)
 
     def emit(self, op: str, *args, ndefs: int = 0, effect: bool = True, guard: Value | None = None, negate=False,
              ug: int = 1):
@@ -320,7 +336,11 @@ class Builder:
         that will be reassigned."""
         if not v.mutable:
             return v
-        return self.pure(f"mov.{_mov_type(v.type)}", v.type, (v,), v.lo, v.hi)
+        reg = self.k.reg(v.type)  # a real copy: never value-numbered back onto the variable
+        self.k.emit(Instr(f"mov.{_mov_type(v.type)}", (reg, v.op)))
+        self._ug[reg.name] = v.ug
+        self._level[reg.name] = len(self._loops)
+        return Value(v.type, reg, v.lo, v.hi, ug=v.ug)
 
     def note_align(self, reg: Reg, align: int) -> None:
         """Record that the address in ``reg`` is a multiple of ``align`` bytes."""
@@ -331,7 +351,7 @@ class Builder:
         done in floating point before the conversion to int)."""
         if v.const is not None:
             return v
-        return Value(v.type, v.op, max(lo, v.lo), min(hi, v.hi), v.mutable, v.ug)
+        return Value(v.type, v.op, max(lo, v.lo), min(hi, v.hi), v.mutable, v.ug, v.version)
 
     def in_reg(self, v: Value) -> Value:
         """``v`` in a register (stores and some instructions take no immediates)."""
@@ -351,6 +371,8 @@ class Builder:
     def assign(self, var: Variable, v: Value) -> None:
         v = self.convert(v, var.type)
         var.ug = v.ug
+        var.last = v.key()
+        var.version += 1
         self.k.emit(Instr(f"mov.{_mov_type(var.type)}", (var.reg, v.op)))
 
     # -- conversions -------------------------------------------------------------

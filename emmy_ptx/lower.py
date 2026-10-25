@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import elementwise
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
+from .congruence import congruent_accumulators, merge_congruent
 from .frontend import DEFAULT_BLOCK, KernelSource
 from .ptx import SIZEOF, Imm, Kernel, Mem, Reg, Sym, Vec
 from .vectorize import vectorize_loads
@@ -125,6 +126,15 @@ class Scope:
             scope = scope.parent
         return None
 
+    def rebind(self, name: str, value) -> None:
+        """Point ``name`` at ``value`` in the scope that declares it."""
+        scope = self
+        while scope is not None:
+            if name in scope.names:
+                scope.names[name] = value
+                return
+            scope = scope.parent
+
 
 class LoweringError(Exception):
     pass
@@ -192,7 +202,7 @@ class Lowerer:
         for name in _assigned_in(stmts):
             var = self.scope.lookup(name)
             if isinstance(var, Variable):
-                var.ug = 1
+                var.forget()
 
     # ------------------------------------------------------------- set-up
 
@@ -565,18 +575,38 @@ class Lowerer:
         """
         trips = _trip_range(start, step, end)
         size = _body_size(s.body)
+        s, aliases = self._merge_congruent(s)
         with self.block(dominated=True):
             if end_name:  # the hoisted bound is visible to the body
                 self.scope.names[end_name] = end
-            group = self._split_plan(s, start, step, end, trips)
-            if group:
-                self._split_reduction(s, start, step, end, trips[0], group)
-                return
-            if trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
-                for k in range(trips[1]):
-                    v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
-                    self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
-                return
+            self._loop_body(s, start, step, end, trips, size)
+        for member, rep_ in aliases.items():  # equal at every iteration, so equal after the loop
+            self.scope.rebind(member, self.lookup(rep_))
+
+    def _merge_congruent(self, s):
+        """``s`` with provably equal accumulators sharing one representative
+        (see congruence.py), and the members to alias after the loop."""
+        start = {}
+        for st in s.body:
+            if type(st).__name__ == "Accum":
+                var = self.scope.lookup(st.name)
+                start[st.name] = var.last if isinstance(var, Variable) else None
+        members = congruent_accumulators(s, start)
+        body = merge_congruent(s.body, members) if members else None
+        if body is None:
+            return s, {}
+        return replace(s, body=body), members
+
+    def _loop_body(self, s, start: Value, step: Value, end: Value, trips, size: int) -> None:
+        """Pick the loop's shape: split across lanes, unrolled, or rolled."""
+        group = self._split_plan(s, start, step, end, trips)
+        if group:
+            self._split_reduction(s, start, step, end, trips[0], group)
+        elif trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
+            for k in range(trips[1]):
+                v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
+                self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
+        else:
             factor = _unroll_factor(size) if step.const is not None else 1
             self._rolled(s, start, step, end, trips, factor)
 
@@ -675,6 +705,12 @@ class Lowerer:
             var.ug = group  # every lane of the group now holds the whole fold
 
     def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
+        try:
+            self._rolled_loops(s, start, step, end, trips, factor)
+        finally:
+            self._pessimize(s.body)  # the exit merges every trip count's final values
+
+    def _rolled_loops(self, s, start: Value, step: Value, end: Value, trips, factor: int) -> None:
         b = self.b
         name = s.axis.name
         type_ = "s64" if "s64" in (start.type, end.type, step.type) else "s32"
@@ -796,6 +832,7 @@ class Lowerer:
         dtype = s.dtype.name if s.dtype is not None else elementwise.promote(op, [_dtype_of(a) for a in args])
         v = elementwise.apply(self.b, op, args, dtype)
         if (op == "multiply" and v.type == "f32" and v.const is None and all(a.type == "f32" for a in args)
+                and not any(a.mutable for a in args)  # its factors are still those values at the fold
                 and v.key() not in [a.key() for a in args]):  # a real product (x * 1 folds away)
             self.products[v.key()] = (args[0], args[1])  # an Accum may fuse it into an FMA
         self.define(s.name, v)

@@ -92,6 +92,41 @@ def exp(b: Builder, x: Value) -> Value:
     folded = _fold(b, lambda v: math.exp(v) if v < 709 else INF, x)
     if folded is not None:
         return folded
+    pair = _rescale_pair(b, x)
+    if pair is not None:
+        return pair
+    return _exp(b, x)
+
+
+def _rescale_pair(b: Builder, x: Value) -> Value | None:
+    """exp(x) for x = u - max(u, w): one of an online-softmax step's two
+    rescaling factors, exp(u - m) and exp(w - m) with m = max(u, w).
+
+    One of the two exponents is exactly 0 (m is u or w), so their sum is
+    exactly the other exponent, and both factors come from one exponential
+    of that sum: exp(x) = 1 if x == 0, else exp(x + (w - m)). The sum is the
+    same value for both factors, so value numbering shares the exponential.
+    Bit for bit what the two separate exponentials compute.
+    """
+    d = b.def_of(x)
+    if d is None or d[0] != "sub.rn.f32":
+        return None
+    u, m = d[1]
+    md = b.def_of(m)
+    if md is None or md[0] != "max.f32":
+        return None
+    p, q = md[1]
+    if u.key() == p.key():
+        w = q
+    elif u.key() == q.key():
+        w = p
+    else:
+        return None
+    other = b.fbin("+", x, b.fbin("-", w, m))
+    return b.select(b.fcmp("==", x, _c(b, 0.0)), _c(b, 1.0), _exp(b, other))
+
+
+def _exp(b: Builder, x: Value) -> Value:
     t = b.fbin("*", x, _c(b, LOG2E_HI))
     j = b.fop("cvt.rni.f32.f32", t)
     j = b.fop("min.f32", b.fop("max.f32", j, _c(b, -126.0)), _c(b, 126.0))
