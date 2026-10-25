@@ -23,9 +23,9 @@ launch from `meta.json`:
 | Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **162 / 162** pass |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
-| Speed against nvcc's build of emmy's reference CUDA (278 problems, same launches) | **0.59x the time** (geometric mean): attention 0.13x, chained 0.27x, fused 0.53x, reductions 0.69x, matmul 0.91x, pointwise 1.00x (launch-bound); total 3.3 ms against 76.9 ms |
+| Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.28x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.3 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded float64) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) |
-| Tests | 78 (17 run hand-built IR on the GPU) |
+| Tests | 80 (17 run hand-built IR on the GPU) |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -58,7 +58,11 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
     the work split of FlashAttention-2, derived from the IR;
   * *idle threads*: when a launch has far more threads than cells (emmy
     schedules that fold a whole row in one thread), each cell gets a group of
-    lanes, and its reductions and loops are split among them.
+    lanes, up to a whole block, and its reductions and loops are split among
+    them;
+  * *block reductions with one barrier*: every thread folds the warps'
+    partials itself, in the order emmy's halving tree would, instead of a
+    barrier per tree step.
 * **Loop-body rewrites** (`emmy_ptx/mapping.py`, `congruence.py`): provably
   equal accumulators are merged, repeated arithmetic removed, independent
   sibling loops fused, and the online softmax's merge of two partial states is

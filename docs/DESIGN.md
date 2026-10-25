@@ -101,7 +101,7 @@ register.
 | `Smem` | static `.shared` arrays up to 48 KiB in total, else one `.extern .shared` pool packed exactly like emmy's `pack_smem` |
 | `Sync` | `bar.sync 0`, `bar.sync id, count`, `bar.warp.sync -1` |
 | `WarpShuffle` | `activemask` + `shfl.sync.bfly` butterfly, the combine program run per step |
-| `TreeHalve` | unrolled shared-memory halving tree with barriers, then the broadcast |
+| `TreeHalve` | every thread folds the partials itself, pairing them exactly as the halving tree would, after the barrier that precedes it: one barrier instead of one per step (4.6) |
 | `CpAsyncCopy/Commit/Wait` | `cp.async.{cg,ca}.shared.global`, `commit_group`, `wait_group N` |
 | `ZeroPrologue` | CTA 0 zeroes the delegated accumulator |
 
@@ -112,7 +112,9 @@ register.
 2. *lane-blocked* (4.3): an iteration whose expensive part the lanes share but
    whose folds differ per lane (attention);
 3. *dealt* (4.4): independent iterations that a group of lanes would each run;
-4. *unrolled*: bounded and small, or marked `unroll`;
+4. *unrolled*: bounded and small (a loop over a shared-memory tile up to 128
+   trips, so all its loads take immediate offsets: a 256³ `cp.async` matmul
+   6.8 → 4.8 µs), or marked `unroll`;
 5. *rolled*: 4-8 iterations per trip plus the leftover (in one-wave grids even
    large bodies, by a divisor of the trip count).
 
@@ -240,7 +242,12 @@ r, r + G, .... A kernel is lowered with spread cells only if, lowered without,
 no loop shared work across lanes; a single-query attention, whose cells already
 share their scores, got slower with it.
 
-`x_sum` (one cell, 256 threads) 328 → 11 µs; `x_rms` 121 → 13 µs;
+When each block holds exactly one cell, the cell takes the whole block: its
+reductions are dealt over all the block's threads and merged in two stages, a
+butterfly within each warp and then the warps' totals through shared memory
+(4.6).
+
+`x_sum` (one cell, 256 threads) 328 → 6.8 µs; `x_rms` 121 → 13 µs;
 `x_softmax` 144 → 21 µs.
 
 ### 4.5 Cooperative reductions in contiguous chunks (`regroup.py`)
@@ -250,7 +257,24 @@ and then combine the partials across all of them. Each thread's partial is
 never observed alone, so thread t may fold the contiguous chunks
 `V*t + V*B*k + j` instead, which turns V scalar loads into one vector load. It
 applies only when the statements right after the loop are exactly such a full
-combine.
+combine. Emmy may also unroll the loop R times ("coop/r2": copy j reads
+`x[a + j*B]` into an accumulator of its own, all folded together before the
+combine); the chunks' elements are then dealt to the copies in turn, which
+keeps R independent chains (a 65,536-element sum on one warp: 25 → 8.9 µs, nvcc
+17 µs).
+
+### 4.6 Block reductions with one barrier
+
+Emmy combines a block's partials with a halving tree in shared memory: for
+h = W/2 ... 1, the threads below h combine slot i with slot i + h, then a
+barrier, and finally every thread reads slot 0. Each step costs a barrier and a
+divergent branch. Since every thread can read all W partials once they are
+written, each thread instead folds them itself, pairing them exactly as the
+tree would, so it computes the very value slot 0 would hold, bit for bit;
+one barrier at the end keeps the ordering the tree's last one gave the code
+after it. The same scheme merges a cell that spans a block's warps (4.4): each
+warp's butterfly total goes to shared memory, and after one barrier every
+thread folds the W totals.
 
 ## 5. Loop-body rewrites (`mapping.py`, `congruence.py`)
 

@@ -65,8 +65,9 @@ MAX_ALIGN = 16
 # Fully unroll an ``unroll`` loop only while the expanded body stays below this
 # many statements: past it the PTX grows faster than ptxas can schedule it.
 UNROLL_BUDGET = 4096
-# Loops this short are unrolled completely even when the IR does not ask.
-AUTO_UNROLL_TRIPS = 64
+# Loops this short are unrolled completely even when the IR does not ask (loops
+# over a shared-memory tile up to SMEM_UNROLL_TRIPS).
+AUTO_UNROLL_TRIPS, SMEM_UNROLL_TRIPS = 64, 128
 # Iterations per trip of a rolled loop, by body size (statements).
 UNROLL_TINY_BODY, UNROLL_TINY = 6, 8
 UNROLL_SMALL_BODY, UNROLL_SMALL = 24, 4
@@ -196,6 +197,7 @@ class Lowerer:
     def __init__(self, src: KernelSource, spread: bool = False):
         self.src = src
         self.spread = spread  # do idle threads join the cells (_spread)?
+        self.cell_threads = 1  # threads per cell when a cell spans warps (a whole block), else 1
         self.shared_loop = False  # did lanes share a loop's work in the Tile being lowered?
         self.wants_spread = False  # would a Tile gain from spread cells (see run)?
         # A grid that fits in one wave puts at most one CTA on each SM, so extra
@@ -272,10 +274,10 @@ class Lowerer:
         combine across the cooperating threads (see regroup.py), else ``s``."""
         accs = {st.name for st in s.body if type(st).__name__ == "Accum"}
         step = _int_value(s.step)
-        if not accs or step is None or not fully_combined(stmts, i, accs, step):
+        if not accs or step is None:
             return s
-        start = self.expr(s.start)
-        if start.lo != 0 or start.hi is None:
+        start = self.expr(s.start)  # the thread's rank among the cooperating threads
+        if start.lo != 0 or start.hi is None or not fully_combined(stmts, i, accs, start.hi + 1):
             return s
         return regroup(s, start.hi, step, int(s.axis.extent.as_static())) or s
 
@@ -301,7 +303,7 @@ class Lowerer:
         if group >= 2:
             return True
         extent = int(loop.axis.extent.as_static())
-        unrolls = loop.unroll or extent <= AUTO_UNROLL_TRIPS
+        unrolls = loop.unroll or extent <= self._auto_unroll(loop)
         return kind(loop) == "Loop" and unrolls and extent * _body_size(loop.body) <= UNROLL_BUDGET
 
     def _shared_by(self, s) -> int:
@@ -615,7 +617,7 @@ class Lowerer:
         block = self.src.launch.block
         self.converged = not s.aux_threads and (not needs_guard or (lanes % WARP == 0 and block % WARP == 0))
         cell = b.shr(gid, b.int_const(spread.bit_length() - 1)) if spread > 1 else gid
-        self.shared_loop = False
+        self.shared_loop, self.cell_threads = False, spread if spread > WARP else 1
         with self.block(guarded=needs_guard):
             for name, v in zip((a.name for a in s.axes), self._decode(s, cell, extents, spread)):
                 self.scope.names[name] = v
@@ -623,7 +625,7 @@ class Lowerer:
         # cells that already share their work across lanes (one query row for all, say) gain
         # nothing from more lanes each; cells that fold alone, one per lane, do (see run)
         self.wants_spread |= not self.shared_loop and self._spread(s, n, candidate=True) > 1
-        self.converged = False
+        self.converged, self.cell_threads = False, 1
         b.place(done)
 
     def _spread(self, s, n: int, candidate: bool = False) -> int:
@@ -643,8 +645,12 @@ class Lowerer:
             return 1
         if not any(kind(x) in LOOPS for x in walk(s.body)):
             return 1  # nothing to share
+        limit = min(WARP, _lowbit(launch.block))
+        room = self._static_smem is not None and self._static_smem + self._lane_bytes + 4096 <= STATIC_SMEM_LIMIT
+        if n == launch.grid and _lowbit(launch.block) == launch.block and room:
+            limit = launch.block  # one cell per block: it may span the warps (_merge_warps joins them)
         spread = 1
-        while spread < min(WARP, _lowbit(launch.block)) and n * spread * 2 <= launch.grid * launch.block:
+        while spread < limit and n * spread * 2 <= launch.grid * launch.block:
             spread *= 2
         return spread
 
@@ -759,13 +765,23 @@ class Lowerer:
             self._lower_blocked(blocked)
         elif dealt:
             self._deal(s, start, step, end, trips[0], dealt)
-        elif trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= AUTO_UNROLL_TRIPS):
+        elif trips is not None and trips[1] * size <= UNROLL_BUDGET and (s.unroll or trips[1] <= self._auto_unroll(s)):
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
                 self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
         else:
             factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS, trips) if step.const is not None else 1
             self._rolled(s, start, step, end, trips, factor)
+
+    def _auto_unroll(self, s) -> int:
+        """Trip counts up to which loop ``s`` unrolls completely without being
+        marked ``unroll``: more for a loop over a shared-memory tile (a matmul's
+        inner product), whose loads then all take immediate offsets (measured:
+        a 256x256 cp.async matmul 6.8 -> 4.8 us; unrolling every loop of up to
+        128 trips instead grew some kernels five times over)."""
+        tile = any(kind(x) == "Load" and isinstance(self.scope.lookup(x.input) or self.shared.get(x.input), SharedArray)
+                   for x in walk(s.body))
+        return SMEM_UNROLL_TRIPS if tile else AUTO_UNROLL_TRIPS
 
     def _split_plan(self, s, start: Value, step: Value, end: Value, trips) -> SplitPlan | None:
         """How to split reduction loop ``s`` across the lanes that share it, or None.
@@ -800,6 +816,8 @@ class Lowerer:
             return None
         nested = self._nested_split_cost(s, n, group)
         deltas = self._deltas(s.body, s.axis.name, step.const)
+        if nested is None and group == WARP and n >= 2 * self.cell_threads > 2 * WARP:
+            group = self.cell_threads  # a cell spanning the warps of its block: all of its threads split it
         if nested is None and n <= group * CHUNK_TRIPS:  # a short straight-line body: one contiguous chunk per lane
             return SplitPlan(fold, group, n // group if n % group == 0 else 1, 1)
         if nested is None:  # a long one: lanes side by side, a vector each (coalesced)
@@ -978,6 +996,8 @@ class Lowerer:
         of_name = self._uniformity(s, min(start.ug, step.ug, end.ug))
         names = (mapping.binds(s.body) | reads(s.body)) - {st.axis.name for st in walk(s.body) if kind(st) in LOOPS}
         group = min([WARP] + [of_name(n) for n in names])
+        if group == WARP and self.cell_threads > WARP:
+            group = self.cell_threads  # a cell spanning its block's warps
         return group if group >= 2 else 0
 
     def _deal(self, s, start: Value, step: Value, end: Value, trips: int, group: int) -> None:
@@ -1118,8 +1138,7 @@ class Lowerer:
         b = self.b
         group, vector = plan.group, plan.vector
         self.shared_loop = True
-        lane = self.value("lane")
-        rank = lane if group == WARP else b.bitop("&", lane, b.int_const(group - 1))
+        rank = self._rank(group)
         rounds = trips // (vector * group)
         if rounds > SPLIT_UNROLLED_ROUNDS:
             self._split_rounds(s, start, step, end, trips, plan, rank)
@@ -1176,12 +1195,14 @@ class Lowerer:
         """A butterfly over each aligned group of ``group`` lanes per independent
         merge, one after another (which measured better than stepping them
         together): each step swaps the merge's states with the lane ``width``
-        away and combines the pair with its program."""
+        away and combines the pair with its program. A group wider than a warp
+        (a cell spanning its block) then merges the warps' totals
+        (``_merge_warps``)."""
         b = self.b
         mask = self.kernel.reg("s32")
         b.emit("activemask.b32", mask, ndefs=1, effect=False)
         for states, program in fold.merges:
-            width = group // 2
+            width = min(group, WARP) // 2
             while width:
                 with self.block():
                     for name in states:
@@ -1192,8 +1213,52 @@ class Lowerer:
                         self.define(f"{name}$b", Value(var.type, other))
                     self.merge(program, states, "f32")
                 width //= 2
+        if group > WARP:
+            self._merge_warps(fold, group // WARP)
         for name in fold.states:
-            self.lookup(name).ug = group  # every lane of the group now holds the whole fold
+            self.lookup(name).ug = min(group, WARP)  # every lane of the group now holds the whole fold
+
+    def _merge_warps(self, fold: Fold, warps: int) -> None:
+        """The second stage of a fold split over the warps of a block (a cell
+        spanning them, ``_spread``): each warp's total, which the butterfly left
+        in all its lanes, goes to shared memory, and after one barrier every
+        thread combines the ``warps`` totals pairwise as a TreeHalve would, so
+        all threads hold the same result. A barrier before the stores lets an
+        enclosing loop reuse the slots."""
+        b = self.b
+        states = fold.states
+        offset = self._lane_bytes
+        self._lane_bytes += warps * len(states) * 4
+        base = b.add(b.pure("mov.u32", "s32", (Sym(LANE_BUFFER),), 0, 1 << 24), b.int_const(offset))
+        mine = b.in_reg(b.add(base, b.mul(self.value("warp"), b.int_const(len(states) * 4)))).op
+        b.emit("bar.sync", Imm(0, "u32"))
+        for c, name in enumerate(states):
+            b.emit("st.shared.f32", Mem(mine, c * 4), b.in_reg(self.lookup(name).read()))
+        b.emit("bar.sync", Imm(0, "u32"))
+        totals = b.in_reg(base).op
+        for part, program in fold.merges:
+            level = []
+            for w in range(warps):
+                row = []
+                for name in part:
+                    out = self.kernel.reg("f32")
+                    addr = Mem(totals, (w * len(states) + states.index(name)) * 4)
+                    b.emit("ld.shared.f32", out, addr, ndefs=1, effect=False)
+                    row.append(Value("f32", out))
+                level.append(row)
+            half = warps // 2
+            while half:
+                for i in range(half):
+                    with self.block():
+                        for name, v in zip(part, level[i]):
+                            self.define(name, v)
+                        for name, v in zip(part, level[i + half]):
+                            self.define(f"{name}$b", v)
+                        self.merge(program, part, "f32")
+                        level[i] = [self.value(name) for name in part]
+                half //= 2
+            for name, v in zip(part, level[0]):
+                self.reassign(name, v)
 
     def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int, hoist_loads: bool = True) -> None:
         try:
@@ -1512,10 +1577,18 @@ class Lowerer:
     def stmt_LaneSlot(self, s) -> None:
         """``(lane % group) / share``, alike on the ``share`` lanes of a slot."""
         b = self.b
-        lane = self.value("lane")
-        rank = lane if s.group == WARP else b.bitop("&", lane, b.int_const(s.group - 1))
+        rank = self._rank(s.group)
         slot = b.shr(rank, b.int_const(s.share.bit_length() - 1)) if s.share > 1 else rank
-        self.define(s.name, b.uniform(slot, s.share))
+        self.define(s.name, b.uniform(slot, min(s.share, WARP)))
+
+    def _rank(self, group: int) -> Value:
+        """This thread's rank in its aligned group of ``group`` threads (a group
+        wider than a warp: a cell spanning its block's warps)."""
+        b = self.b
+        if group > WARP:
+            return b.bitop("&", self.tid, b.int_const(group - 1))
+        lane = self.value("lane")
+        return lane if group == WARP else b.bitop("&", lane, b.int_const(group - 1))
 
     def stmt_LaneStash(self, s) -> None:
         """Store ``values`` for the LaneBroadcasts that follow, when the blocked
@@ -1568,37 +1641,40 @@ class Lowerer:
         self.define(s.name, b.uniform(Value(v.type, out), s.group))
 
     def stmt_TreeHalve(self, s) -> None:
+        """emmy's halving tree over the partials in shared memory, computed by
+        every thread on its own. After the barrier that precedes the tree (the
+        partials are written), each thread loads the ``length`` partials of its
+        tree and combines them pairwise exactly as the tree would (slot i with
+        slot i + h, for h = length/2 .. 1), so it holds the root's value without
+        the tree's barrier per step, its branches and its stores. One barrier at
+        the end keeps the ordering the tree's last barrier gave the code after
+        it; the partials themselves are not read again (the root is the tree's
+        only result)."""
         b = self.b
         vtype = elementwise.value_type(s.dtype.name)
-        t = self.value(s.tid_var)
         bufs = [self.buffer(name) for name in s.bufs]
-        half = int(s.length) // 2
-        while half > 0:
-            skip = b.label("tree_skip")
-            active = b.icmp("<", t, b.int_const(half))
-            b.branch(skip, active, negate=True)
-            with self.block(guarded=True, divergent=active.ug < WARP):
-                if s.inner is not None:
-                    iv, scale = self.value(s.inner[0]), b.int_const(int(s.inner[1]))
-                    slot = b.add(b.mul(t, scale), iv)
-                    other = b.add(b.mul(b.add(t, b.int_const(half)), scale), iv)
-                else:
-                    slot, other = t, b.add(t, b.int_const(half))
-                for buf, st, sb in zip(bufs, s.state, s.state_b):
-                    self.define(st, self.load_one(buf, slot, vtype))
-                    self.define(sb, self.load_one(buf, other, vtype))
-                self.merge(s.combine_states, s.state, vtype)
-                for buf, st in zip(bufs, s.state):
-                    self.store_one(buf, slot, self.value(st))
-            b.place(skip)
-            if s.barrier_id == 0:
-                b.emit("bar.sync", Imm(0, "u32"))
-            else:
-                b.emit("bar.sync", Imm(s.barrier_id, "u32"), Imm(int(s.barrier_count), "u32"))
+        length = int(s.length)
+        if s.inner is not None:
+            iv, scale = self.value(s.inner[0]), int(s.inner[1])
+            slots = [b.add(b.int_const(k * scale), iv) for k in range(length)]
+        else:
+            slots = [b.int_const(k) for k in range(length)]
+        level = [[self.load_one(buf, slot, vtype) for buf in bufs] for slot in slots]
+        half = length // 2
+        while half:
+            for i in range(half):
+                with self.block():  # the tree's temporaries shadow the outer state
+                    for name, v in zip((*s.state, *s.state_b), (*level[i], *level[i + half])):
+                        self.define(name, v)
+                    self.merge(s.combine_states, s.state, vtype)
+                    level[i] = [self.value(st) for st in s.state]
             half //= 2
-        root = self.value(s.inner[0]) if s.inner is not None else b.int_const(0)
-        for buf, st in zip(bufs, s.state):
-            self.reassign(st, self.load_one(buf, root, vtype))
+        if s.barrier_id == 0:
+            b.emit("bar.sync", Imm(0, "u32"))
+        else:
+            b.emit("bar.sync", Imm(s.barrier_id, "u32"), Imm(int(s.barrier_count), "u32"))
+        for st, v in zip(s.state, level[0]):
+            self.reassign(st, v)
 
     def merge(self, program, state, vtype: str) -> None:
         """Run a combine program: an Assign to a state name updates that
