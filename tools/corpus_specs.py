@@ -369,3 +369,48 @@ OPEN += [
                                     "torch.sigmoid(q @ kt / 5.656854) @ v",
          ref=_c(lambda q, kt, v: (1.0 / (1.0 + np.exp(-(q @ kt) / 5.656854))) @ v), rtol=1e-3, atol=1e-4),
 ]
+
+
+# ---- round 4: attention tilings that leave no aligned group of lanes one row (cell placement) ----
+def attn_v(id, nq, nk, d, dv, batch=None):
+    """softmax(q @ kt / sqrt(d)) @ v with v of width dv, batched when ``batch``."""
+    b = f"{batch}, " if batch else ""
+    scale = round(math.sqrt(d), 6)
+    code = (f"q = torch.randn({b}{nq}, {d}); kt = torch.randn({b}{d}, {nk}); v = torch.randn({b}{nk}, {dv}); "
+            f"torch.softmax(q @ kt / {scale}, dim=-1) @ v")
+    return dict(id=f"a_{id}", code=code, ref=_c(lambda q, kt, v: _softmax((q @ kt) / scale) @ v), rtol=1e-3, atol=1e-4)
+
+
+def relu_attn(id, nq, nk, d, dv):
+    code = f"q = torch.randn({nq}, {d}); kt = torch.randn({d}, {nk}); v = torch.randn({nk}, {dv}); torch.relu(q @ kt) @ v"
+    return dict(id=f"a_{id}", code=code, ref=_c(lambda q, kt, v: np.maximum(q @ kt, 0) @ v), rtol=1e-3, atol=1e-3)
+
+
+def sigmoid_attn(id, nq, nk, d, dv):
+    scale = round(math.sqrt(d), 6)
+    code = (f"q = torch.randn({nq}, {d}); kt = torch.randn({d}, {nk}); v = torch.randn({nk}, {dv}); "
+            f"torch.sigmoid(q @ kt / {scale}) @ v")
+    return dict(id=f"a_{id}", code=code, ref=_c(lambda q, kt, v: 1 / (1 + np.exp(-(q @ kt) / scale)) @ v),
+                rtol=1e-3, atol=1e-4)
+
+
+OPEN += [
+    attn_v("b2_64x32", 64, 64, 32, 32, batch=2),
+    attn_v("b3_32x32", 32, 48, 32, 32, batch=3),
+    attn_v("b4_64x48", 64, 64, 48, 48, batch=4),
+    attn_v("b2_128x32", 128, 128, 32, 32, batch=2),
+    attn_v("b8_32x32", 32, 32, 32, 32, batch=8),
+    attn_v("d40_k96", 64, 96, 40, 40),
+    attn_v("d48", 64, 160, 48, 48),
+    attn_v("d56", 64, 128, 56, 56),
+    attn_v("d72", 48, 128, 72, 72),
+    attn_v("d88", 32, 128, 88, 88),
+    attn_v("d40_q128", 128, 160, 40, 40),
+    attn_v("dv24", 64, 128, 32, 24),
+    attn_v("dv40", 64, 128, 64, 40),
+    relu_attn("relu_64x32", 64, 64, 32, 32),
+    relu_attn("relu_32x48", 32, 128, 32, 48),
+    relu_attn("relu_128x32", 128, 256, 32, 32),
+    sigmoid_attn("sig_64x48", 64, 64, 48, 48),
+    sigmoid_attn("sig_96x32", 96, 128, 32, 32),
+]

@@ -14,13 +14,7 @@ import traceback
 
 from .frontend import load
 from .lower import Lowerer
-
-# PTX ISA 8.0 (CUDA 12.0) for sm_89: every problem assembles for the RTX 4090
-# it was scheduled on, and ptxas compiles it unchanged for newer GPUs.
-PTX_VERSION = "8.0"
-TARGET = "sm_89"
-# The longest PTX module (characters) the evaluation runner accepts.
-PTX_LIMIT = 2_000_000
+from .ptx import PTX_LIMIT, PTX_VERSION, TARGET
 
 
 def compile_file(ir_path: str, plain: bool = False) -> str:

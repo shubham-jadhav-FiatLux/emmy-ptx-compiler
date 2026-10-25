@@ -32,7 +32,7 @@ from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_c
 from .congruence import congruent_accumulators, drop_needless_snapshots, merge_congruent
 from .frontend import DEFAULT_BLOCK, KernelSource
 from .mapping import LOOPS, LaneSlot, assigned, kind, produced, reads, walk
-from .ptx import SIZEOF, Imm, Kernel, Mem, Sym, Vec
+from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, Mem, Sym, Vec
 from .regroup import fully_combined, regroup
 from .vectorize import vectorize_loads
 
@@ -196,16 +196,31 @@ class SplitPlan:
     jam: int  # consecutive iterations of a lane lowered as one body
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Where the cells of a Tile run (see Lowerer._placement): grouped by every
+    coordinate but ``axis``'s, the cells of each group on aligned groups of
+    ``parts[k]`` lanes in region k, the regions one after another."""
+
+    axis: int  # the Tile axis whose coordinate varies within a group
+    parts: tuple[int, ...]  # lanes of a group in each region (powers of two, at most a warp)
+    groups: int  # cells / the axis's extent
+
+
 class Lowerer:
-    def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False):
+    def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False):
         self.src = src
         self.spread = spread  # do idle threads join the cells (_spread)?
+        self.place = place  # do cells run where their lanes share work (_placement)?
         # the fallback lowering (see compile_file): one rule per statement, in the IR's order, with
         # none of the optional rewrites (fusion, regrouping, lane splits, unrolling the IR does not ask for)
         self.plain = plain
         self.cell_threads = 1  # threads per cell when a cell spans warps (a whole block), else 1
         self.shared_loop = False  # did lanes share a loop's work in the Tile being lowered?
         self.wants_spread = False  # would a Tile gain from spread cells (see run)?
+        self.wants_place = False  # would one gain from placed cells (see run)?
+        self.placed_shared = False  # did a Tile with placed cells share a loop's work?
+        self.store_guard: Value | None = None  # only lanes for which this holds store (_placed_tile)
         # A grid that fits in one wave puts at most one CTA on each SM, so extra
         # registers per thread cannot cost occupancy: let ptxas spend them on
         # keeping more loads in flight (it otherwise caps registers to leave room
@@ -231,8 +246,17 @@ class Lowerer:
 
     def run(self) -> Kernel:
         self.body(self.src.body)
-        if self.wants_spread and not self.spread:
-            return Lowerer(self.src, spread=True).run()
+        if not (self.spread or self.place):
+            # cells that, as emmy lays them out, share no work with the lanes beside them may
+            # share it with more lanes each (_spread) or laid out anew (_placement)
+            if self.wants_spread:
+                return Lowerer(self.src, spread=True).run()
+            if self.wants_place:
+                placed = Lowerer(self.src, place=True)
+                kernel = placed.run()
+                # each region lowers the Tile's body again: keep it while the module fits the runner
+                if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
+                    return kernel
         self.b.emit("ret")
         if self._lane_bytes:
             self.kernel.decls.append(f".shared .align 16 .b8 {LANE_BUFFER}[{self._lane_bytes}];")
@@ -611,6 +635,12 @@ class Lowerer:
         n = math.prod(extents) if extents else 1
         cells = s.block_threads or DEFAULT_BLOCK
         spread = self._spread(s, n)
+        plan = self._placement(s, extents) if self.place and spread == 1 else None
+        if plan is not None:
+            self.shared_loop = False
+            self._placed_tile(s, plan, extents)
+            self.placed_shared |= self.shared_loop
+            return
         if s.aux_threads:
             per = b.int_const(s.block_threads)
             gid = b.add(b.mul(self.ctaid, per), b.rem(self.tid, per))
@@ -629,13 +659,18 @@ class Lowerer:
         self.converged = not s.aux_threads and (not needs_guard or (lanes % WARP == 0 and block % WARP == 0))
         cell = b.shr(gid, b.int_const(spread.bit_length() - 1)) if spread > 1 else gid
         self.shared_loop, self.cell_threads = False, spread if spread > WARP else 1
+        coords = self._decode(s, cell, extents, spread)
         with self.block(guarded=needs_guard):
-            for name, v in zip((a.name for a in s.axes), self._decode(s, cell, extents, spread)):
+            for name, v in zip((a.name for a in s.axes), coords):
                 self.scope.names[name] = v
             self.body(s.body)
         # cells that already share their work across lanes (one query row for all, say) gain
         # nothing from more lanes each; cells that fold alone, one per lane, do (see run)
         self.wants_spread |= not self.shared_loop and self._spread(s, n, candidate=True) > 1
+        plan = self._placement(s, extents) if spread == 1 else None
+        if plan is not None:  # worth it where every lane group would be larger than the lanes a group has now
+            alike = min((v.ug for i, v in enumerate(coords) if i != plan.axis and extents[i] > 1), default=WARP)
+            self.wants_place |= min(plan.parts) > alike
         self.converged, self.cell_threads = False, 1
         b.place(done)
 
@@ -654,6 +689,8 @@ class Lowerer:
         launch = self.src.launch
         if self.plain or not (self.spread or candidate) or s.aux_threads or not _thread_free(s.body):
             return 1
+        if any(kind(x) == "Write" and x.atomic for x in walk(s.body)):
+            return 1  # the lanes of a cell would each add its result
         if not any(kind(x) in LOOPS for x in walk(s.body)):
             return 1  # nothing to share
         limit = min(WARP, _lowbit(launch.block))
@@ -664,6 +701,89 @@ class Lowerer:
         while spread < limit and n * spread * 2 <= launch.grid * launch.block:
             spread *= 2
         return spread
+
+    def _placement(self, s, extents: list[int]) -> Placement | None:
+        """Where the cells of Tile ``s`` may run so that more lanes share work,
+        or None.
+
+        Emmy lays the cells out row-major, so lanes beside each other share a
+        query row only when the row's cells fill aligned groups of lanes. With
+        11 cells to a row (three output columns each, 32 columns), or cells
+        rasterized lane by lane (consecutive lanes on consecutive rows), no
+        group of lanes holds one row, and every lane computes its row's
+        scores itself. Cells that do not depend on which thread runs them may
+        run anywhere, though. Grouped by every coordinate but the fastest
+        axis's, a group's cells go to aligned groups of lanes of power-of-two
+        sizes: 20 = 16 + 4; 11 = 16 when there are threads enough, else 8 + 4
+        with one lane idle, else 8 + 2 + 1 (_placed_tile). Worth trying only
+        when some loop's work is the same along that axis."""
+        launch = self.src.launch
+        if self.plain or s.aux_threads or launch.block % WARP or not _thread_free(s.body):
+            return None
+        axis = max((i for i, e in enumerate(extents) if e > 1), default=None)
+        if axis is None:
+            return None
+        along = mapping.dependents(s.body, {s.axes[axis].name})
+        if not any(kind(x) in LOOPS and mapping.trip_estimate(x) >= SPLIT_MIN_TRIPS and not reads((x,)) & along
+                   for x in walk(s.body)):
+            return None  # no loop's work is the same for all cells of a group
+        groups = math.prod(extents) // extents[axis]
+        for parts in _decompositions(extents[axis]):
+            if sum(_round_up(groups * part, WARP) for part in parts) <= launch.grid * launch.block:
+                return Placement(axis, parts, groups)
+        return None
+
+    def _placed_tile(self, s, plan: Placement, extents: list[int]) -> None:
+        """Tile ``s`` with its cells where ``plan`` puts them. The regions are
+        whole warps, one after another: lane u of region k (P = plan.parts[k]
+        lanes a group) takes group u / P, and that group's cell number
+        (sum of the earlier parts) + u % P along the plan's axis. So every
+        other coordinate is the same on aligned groups of P lanes, and the
+        lowering of the body (lane splits and blocks) shares their work. A
+        lane past the last group or the last cell computes a copy of the last
+        one, so that whole groups take part, and stores nothing."""
+        b = self.b
+        names = [a.name for a in s.axes]
+        size = extents[plan.axis]
+        others = [i for i in range(len(extents)) if i != plan.axis]
+        stride = {i: math.prod(extents[j] for j in others if j > i) for i in others}
+        regions = [_round_up(plan.groups * part, WARP) for part in plan.parts]
+        gid = b.add(b.mul(self.ctaid, b.int_const(self.src.launch.block)), self.tid)
+        done = b.label("tile_end")
+        if gid.hi >= sum(regions):
+            b.branch(done, b.icmp(">=", gid, b.int_const(sum(regions))))
+        base = first = 0
+        for part, lanes in zip(plan.parts, regions):
+            after = b.label("cells_end")
+            if base + lanes < sum(regions):
+                b.branch(after, b.icmp(">=", gid, b.int_const(base + lanes)))  # whole warps: no divergence
+            self.converged = True
+            with self.block(guarded=True):
+                u = b.assume(b.sub(gid, b.int_const(base)), 0, lanes - 1)
+                group = b.shr(u, b.int_const(part.bit_length() - 1))
+                cell = b.add(b.bitop("&", u, b.int_const(part - 1)), b.int_const(first))
+                own = None  # does the lane hold a cell of its own?
+                clamped = lanes > plan.groups * part
+                if clamped:  # lanes past the last group
+                    own = b.icmp("<", group, b.int_const(plan.groups))
+                    group = b.imin(group, b.int_const(plan.groups - 1))
+                if first + part > size:  # lanes past the group's last cell
+                    real = b.icmp("<", cell, b.int_const(size))
+                    own = real if own is None else b.pand(own, real)
+                    cell = b.imin(cell, b.int_const(size - 1))
+                self.store_guard = own
+                self.scope.names[names[plan.axis]] = cell
+                for i in others:
+                    coord = b.rem(b.div(group, b.int_const(stride[i])), b.int_const(extents[i]))
+                    alike = part if clamped else part * _lowbit(stride[i])  # lanes holding the same coordinate
+                    self.scope.names[names[i]] = b.uniform(coord, min(WARP, alike))
+                self.body(s.body)
+            self.store_guard = None
+            b.branch(done)
+            b.place(after)
+            base, first = base + lanes, first + part
+        self.converged = False
+        b.place(done)
 
     def _decode(self, s, gid: Value, extents: list[int], spread: int = 1) -> list[Value]:
         """Per-axis coordinates of flat cell id ``gid`` (row-major), with emmy's
@@ -996,6 +1116,8 @@ class Lowerer:
         with the loop variable, and the loop reads no buffer it stores."""
         if self.plain or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < 2:
             return 0
+        if self.store_guard is not None:
+            return 0  # a lane that stores nothing must not take iterations of its own
         if any(kind(x) in mapping.CROSS_THREAD or kind(x) == "Init" for x in walk(s.body)):
             return 0
         if assigned(s.body) - mapping.local_names(s.body):
@@ -1495,20 +1617,22 @@ class Lowerer:
         base = self.flat(buf, s.index)
         shared = isinstance(buf, SharedArray)
         space = "shared" if shared else "global"
+        guard = self.store_guard
         if s.atomic:
             if buf.type not in ATOMIC_ADD:
                 raise LoweringError(f"atomic add on {buf.type} is not supported")
             addr = self.address(buf, flat=base, swizzle=s.swizzle)
-            b.emit(f"red.{space}.add.{ATOMIC_ADD[buf.type]}", addr, values[0])
+            b.emit(f"red.{space}.add.{ATOMIC_ADD[buf.type]}", addr, values[0], guard=guard)
             return
         k = 0
         while k < len(values):
             n = _vector_width(len(values) - k, buf.type)
             addr = self.address(buf, flat=base.plus(Affine(const=k)), swizzle=s.swizzle)
             if n == 1:
-                b.emit(f"st.{space}.{_ldst(buf.type)}", addr, values[k])
+                b.emit(f"st.{space}.{_ldst(buf.type)}", addr, values[k], guard=guard)
             else:
-                b.emit(f"st.{space}.v{n}.{_ldst(buf.type)}", addr, Vec(tuple(v.op for v in values[k : k + n])))
+                b.emit(f"st.{space}.v{n}.{_ldst(buf.type)}", addr, Vec(tuple(v.op for v in values[k : k + n])),
+                       guard=guard)
             k += n
 
     def stmt_Sync(self, s) -> None:
@@ -1762,10 +1886,10 @@ def _param_name(buffer: str) -> str:
 
 def _thread_free(body) -> bool:
     """Does what the statements compute not depend on which thread runs them?
-    No cross-thread statement, shared memory, atomic store or thread index."""
+    No cross-thread statement, shared memory or thread index."""
     for s in walk(body):
         k = kind(s)
-        if k in mapping.CROSS_THREAD or k in ("Smem", "ZeroPrologue") or (k == "Write" and s.atomic):
+        if k in mapping.CROSS_THREAD or k in ("Smem", "ZeroPrologue"):
             return False
         if any(_names_thread(e) for e in getattr(s, "exprs", lambda: ())()):
             return False
@@ -1851,6 +1975,32 @@ def _int_value(e):
 def _lowbit(n: int) -> int:
     """The largest power of two dividing ``n``."""
     return n & -n
+
+
+def _round_up(n: int, m: int) -> int:
+    return -(-n // m) * m
+
+
+def _pow2_ceil(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def _decompositions(n: int):
+    """Aligned lane groups for n cells (powers of two up to a warp), most
+    sharing first: past the whole warps, the rest in one padded group; the
+    largest power of two below it and one padded group; exactly n lanes."""
+    whole, rest = (WARP,) * (n // WARP), n % WARP
+    if not rest:
+        yield whole
+        return
+    yield whole + (_pow2_ceil(rest),)
+    big = 1 << (rest.bit_length() - 1)
+    if big < rest:
+        two = (big, _pow2_ceil(rest - big))
+        yield whole + two
+        exact = tuple(1 << i for i in reversed(range(rest.bit_length())) if rest >> i & 1)
+        if exact != two:
+            yield whole + exact
 
 
 def _lines(group: int, stride) -> float:

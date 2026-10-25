@@ -20,14 +20,14 @@ launch from `meta.json`:
 | | |
 |---|---|
 | Open problem set | **15 / 15** pass (all five categories); the four pointwise problems are bit-exact |
-| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **162 / 162** pass |
+| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **180 / 180** pass |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
-| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **364 / 364** pass (every problem above) |
+| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **382 / 382** pass (every problem above) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
-| Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.28x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.3 ms against 78.1 ms |
+| Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 119 (38 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
+| Tests | 132 (44 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -62,6 +62,12 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
     schedules that fold a whole row in one thread), each cell gets a group of
     lanes, up to a whole block, and its reductions and loops are split among
     them;
+  * *cell placement*: when emmy's layout gives a row's cells no aligned
+    group of lanes, or only small ones (11 or 14 cells of three columns to a
+    row, cells rasterized lane by lane), the compiler moves the cells. Each
+    row's cells go onto aligned lane groups of power-of-two sizes (11 = 8 + 4,
+    with one lane that computes but stores nothing), so blocking shares the
+    row's scores again (up to 4.9x faster on such kernels);
   * *block reductions with one barrier*: every thread folds the warps'
     partials itself, in the order emmy's halving tree would, instead of a
     barrier per tree step.
@@ -100,7 +106,7 @@ emmy_ptx/
   elementwise.py       Assign/Accum operations and emmy's dtype rules
   mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid (exp, log, sigmoid also in float64)
   ptx.py               registers, operands, instructions, module text
-tests/                 unit tests (builder, rewrites, a lane-level IR interpreter) and GPU tests
+tests/                 unit tests (builder, rewrites, cell placement, a lane-level IR interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
 docs/DESIGN.md
 ```

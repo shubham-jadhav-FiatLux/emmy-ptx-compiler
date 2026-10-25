@@ -94,7 +94,7 @@ register.
 
 | Statement | Lowering |
 |---|---|
-| `Tile` | `gid = ctaid·block + tid` (or the aux-band form), guard `gid < N` unless the range proves it, row-major decode of the axes, optional grouped CTA rasterization; with idle threads, cells spread over lanes (4.4) |
+| `Tile` | `gid = ctaid·block + tid` (or the aux-band form), guard `gid < N` unless the range proves it, row-major decode of the axes, optional grouped CTA rasterization; with idle threads, cells spread over lanes (4.4); cells placed anew where no aligned lanes share a row (4.5) |
 | `Loop`, `StridedLoop` | seed the immediate body's accumulators when `seed`, then one of the shapes below |
 | `Cond` | predicated branch, or no branch at all when the predicate is decided by ranges |
 | `Load` / `Write` | affine address, `ld/st[.v2/.v4]`, `ld.global.nc` for read-only buffers, `red.global.add` for atomic writes |
@@ -102,7 +102,7 @@ register.
 | `Smem` | static `.shared` arrays up to 48 KiB in total, else one `.extern .shared` pool packed exactly like emmy's `pack_smem` |
 | `Sync` | `bar.sync 0`, `bar.sync id, count`, `bar.warp.sync -1` |
 | `WarpShuffle` | `activemask` + `shfl.sync.bfly` butterfly, the combine program run per step |
-| `TreeHalve` | every thread folds the partials itself, pairing them exactly as the halving tree would, after the barrier that precedes it: one barrier instead of one per step (4.6) |
+| `TreeHalve` | every thread folds the partials itself, pairing them exactly as the halving tree would, after the barrier that precedes it: one barrier instead of one per step (4.7) |
 | `CpAsyncCopy/Commit/Wait` | `cp.async.{cg,ca}.shared.global`, `commit_group`, `wait_group N` |
 | `ZeroPrologue` | CTA 0 zeroes the delegated accumulator |
 
@@ -136,7 +136,7 @@ rewrites run: no early loads, fusion, regrouping, congruent accumulators,
 lane splits or blocks, dealt loops, spread cells, partial unrolling or
 vector-load merging. The builder's local work (folding, ranges, value
 numbering, LICM) stays. `compile.py --plain` forces this lowering, so it is
-tested like the main one: all 364 problems of the open set, the corpus, the
+tested like the main one: all 382 problems of the open set, the corpus, the
 held-out set and the schedule sweep pass with it, and so does every GPU test.
 It is slower, because lanes no longer share work (the open set's 64×64
 attention takes 81 µs instead of 9), but it computes the same results.
@@ -263,12 +263,67 @@ share their scores, got slower with it.
 When each block holds exactly one cell, the cell takes the whole block: its
 reductions are dealt over all the block's threads and merged in two stages, a
 butterfly within each warp and then the warps' totals through shared memory
-(4.6).
+(4.7).
 
 `x_sum` (one cell, 256 threads) 328 → 6.8 µs; `x_rms` 121 → 13 µs;
 `x_softmax` 144 → 21 µs.
 
-### 4.5 Cooperative reductions in contiguous chunks (`regroup.py`)
+### 4.5 Cells placed anew
+
+Lanes share work only when the cells that need it sit in an aligned group of
+lanes. Emmy lays a Tile's cells out row-major, and some of its tilings defeat
+that:
+* A row of 11 cells (three output columns each, for 32 columns) fills no
+  power-of-two group of lanes at all.
+* A row of 14 cells fills only aligned pairs (`lowbit(14) = 2`).
+* Grouped rasterization applied to the thread axes puts consecutive cells on
+  consecutive rows, so a row's lanes sit 8 apart.
+
+So each row's scores are computed by every lane, or by every pair of lanes.
+
+When a cell does not depend on which thread runs it (as in 4.4, except that
+atomic stores are allowed, since each cell still runs once), the compiler
+chooses where each cell runs (`Lowerer._placement`):
+
+* **Groups.** Cells are grouped by every coordinate except the fastest axis's
+  (a query row).
+* **Lane groups.** Each group gets aligned groups of lanes whose sizes are
+  powers of two: 20 cells as 16 + 4 lanes; 11 cells as 16 when the launch has
+  threads enough, else 8 + 4 with one lane idle, else exactly 8 + 2 + 1.
+* **Regions.** Each size forms a region of whole warps, so no warp diverges.
+  Lane u of a region takes group u / P and cell u % P of that region's share
+  (`_placed_tile`). The lowering then sees each row uniform over P lanes, and
+  lane blocking (4.3) or a lane split (4.2) shares its work.
+* **Idle lanes.** A lane past a group's last cell, or past the last group,
+  computes a copy of the last cell so that whole groups take part, but its
+  stores are predicated off.
+
+Placement is tried only when two things hold. Some loop's work must be the
+same for all cells of a group (`mapping.dependents`). And every lane group it
+would form must be larger than the group of lanes that holds a row as emmy
+lays the cells out. It is kept only if a loop is then shared and the module,
+with one copy of the body per region, still fits the runner's limit.
+
+The region with the smallest groups sets the time, because the lanes holding
+a row's remainder must still score all of its keys. Twelve of the 394 kernels
+are placed, all faster; nothing else changes:
+
+| problem | as emmy lays it out | placed |
+|---|---|---|
+| `a_d40` (d = 40, rasterized lane by lane) | 41.7 µs | 19.1 µs |
+| `a_batched` (11 cells of three columns a row) | 19.1 µs | 10.9 µs |
+| `a_d56` (14 cells a row, in pairs) | 31.3 µs | 8.8 µs |
+| `a_dv40` | 35.3 µs | 10.7 µs |
+| `a_dv24` (12 cells a row, rasterized) | 33.4 µs | 6.8 µs |
+| `a_d88` (44 cells a row, in fours) | 31.3 µs | 14.9 µs |
+| `k_mlp`, `relu(x @ w1) @ w2` fused (22 cells a row) | 125.6 µs | 76.4 µs |
+| `ha_48x80x24` (held-out set) | 10.8 µs | 6.8 µs |
+
+The other four (`a_relu_attn`, `a_relu_32x48`, `a_b8_32x32` and
+`a_d40_q128`) gain 1.2 to 1.8x. The corpus holds 18 attention problems
+written to probe these tilings (`tools/corpus_specs.py`, round 4).
+
+### 4.6 Cooperative reductions in contiguous chunks (`regroup.py`)
 
 Emmy's cooperative reductions stride the B threads of a group over the data
 and then combine the partials across all of them. Each thread's partial is
@@ -281,7 +336,7 @@ combine); the chunks' elements are then dealt to the copies in turn, which
 keeps R independent chains (a 65,536-element sum on one warp: 25 → 8.9 µs, nvcc
 17 µs).
 
-### 4.6 Block reductions with one barrier
+### 4.7 Block reductions with one barrier
 
 Emmy combines a block's partials with a halving tree in shared memory: for
 h = W/2 ... 1, the threads below h combine slot i with slot i + h, then a
@@ -389,7 +444,8 @@ attention kernels 25-40% faster.
   set with the organisers' own generator: odd sizes, broadcasting, every
   traceable elementwise op, max/min reductions, layernorm, chained kernels,
   odd and batched matmuls, attention at other lengths and through
-  `scaled_dot_product_attention` (causal and multi-head);
+  `scaled_dot_product_attention` (causal and multi-head), and attention in
+  tilings that give no aligned group of lanes one row (4.5);
   `tools/corpus_knobs.py` forces the same expressions through many emmy
   schedules.
 * `tools/corpus_holdout.py` is a held-out set written after the compiler, in the style of

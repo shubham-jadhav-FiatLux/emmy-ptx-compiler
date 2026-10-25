@@ -40,6 +40,9 @@ kernel computes.
   through shared memory (LaneStash) rather than shuffles.
 * :func:`cse` removes repeated arithmetic from a loop body, so the analyses
   above see that two merged cells share one online-softmax update.
+* :func:`dependents` finds the names that depend on a Tile coordinate: the
+  work the cells along that axis have in common is everything else (where
+  the lowering may move cells so that lanes share it).
 """
 
 from __future__ import annotations
@@ -308,6 +311,30 @@ def local_names(body) -> set[str]:
         elif k in LOOPS and s.seed:
             out.update(x.name for x in s.body if kind(x) == "Accum")
     return out
+
+
+def dependents(stmts, roots: set[str]) -> set[str]:
+    """``roots`` and every name the statements bind whose value may depend on
+    one of them: through what a statement reads, a loop's bounds (its
+    variable) or a branch's condition (everything the branch binds). Repeated
+    to a fixpoint, since an accumulator carries a dependence around its loop."""
+    dep = set(roots)
+    while True:
+        size = len(dep)
+        for s in walk(stmts):
+            if not own_reads(s) & dep:
+                continue
+            k = kind(s)
+            dep |= produced(s) - {"*"}
+            if k in LOOPS:
+                dep.add(s.axis.name)
+                if k == "StridedLoop" and s.end is not None:
+                    dep.add(f"{s.axis.name}_end")
+            elif k == "Cond":
+                for child in s.nested():
+                    dep |= binds(child) | assigned(child)
+        if len(dep) == size:
+            return dep
 
 
 def cse(body) -> tuple:

@@ -12,6 +12,7 @@ import sys
 import numpy as np
 import pytest
 import requests
+from kernels import rasterized_row_scale, shared_sum_added_atomically, three_column_attention
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F32, F64
@@ -388,3 +389,34 @@ def test_float64_warp_sum_and_atomic_add():
     ))]
     got = run(body, {"x": x}, {"out": (1,)}, 1, 256, out_dtype="f64")["out"][0]
     assert abs(got - x.sum()) <= 1e-13 * np.abs(x).sum()
+
+
+def test_cells_of_three_columns_are_placed_to_share_their_rows():
+    """Attention with 11 cells of three columns to a row: placed 8 + 4 lanes a
+    row (one lane of each 4 computes but does not store), each part blocks
+    the row's keys."""
+    rows, d, keys = 16, 16, 64
+    q = rng.standard_normal((rows, d)).astype(np.float32)
+    kt = rng.standard_normal((d, keys)).astype(np.float32)
+    v = rng.standard_normal((keys, 32)).astype(np.float32)
+    got = run(three_column_attention(rows, d, keys), {"q": q, "kt": kt, "v": v}, {"out": (rows, 32)}, 1, 192)["out"]
+    s = q.astype(np.float64) @ kt
+    p = np.exp(s - s.max(1, keepdims=True))
+    assert np.allclose(got, (p / p.sum(1, keepdims=True)) @ v, rtol=1e-4, atol=1e-5)
+
+
+def test_placed_lanes_that_only_help_add_nothing():
+    """5 rows of 11 cells on 128 threads: 16 lanes a row, and the 5 lanes past
+    each row's cells and the 16 past the last row must not add their copies."""
+    x = rng.standard_normal((5, 64)).astype(np.float32)
+    w = rng.standard_normal(11).astype(np.float32)
+    got = run(shared_sum_added_atomically(5, 64, 11), {"x": x, "w": w}, {"out": (5,)}, 1, 128)["out"]
+    assert np.allclose(got, x.astype(np.float64).sum(1) * w.astype(np.float64).sum(), rtol=1e-4, atol=1e-4)
+
+
+def test_rasterized_cells_are_placed_to_share_their_rows():
+    """Cells rasterized four rows at a time, so a row's lanes are four apart:
+    placed 16 + 8 lanes a row (24 cells, exactly the 384 threads)."""
+    x = rng.standard_normal((16, 24)).astype(np.float32)
+    got = run(rasterized_row_scale(16, 24, 24, 4), {"x": x}, {"out": (16, 24)}, 3, 128)["out"]
+    assert np.allclose(got, x * (x.astype(np.float64) ** 2).sum(1, keepdims=True), rtol=1e-5, atol=1e-5)
