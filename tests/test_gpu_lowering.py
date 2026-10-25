@@ -2,7 +2,8 @@
 run on the GPU and checked against a numpy model of their C semantics.
 
 These need the runner: set EMMY_RUNNER (e.g. http://runner.riftstack.ai:48701)
-to enable them. Each kernel runs twice: lowered as usual, and with the
+to enable them. Each kernel runs three times: lowered as usual, strictly
+(``Lowerer(strict=True)``: no rewrite that changes rounding) and with the
 fallback lowering (``Lowerer(plain=True)``).
 """
 
@@ -30,13 +31,13 @@ from emmy_ptx.lower import Lowerer
 
 RUNNER = os.environ.get("EMMY_RUNNER")
 pytestmark = pytest.mark.skipif(not RUNNER, reason="set EMMY_RUNNER to run GPU tests")
-PLAIN = False  # lower with the fallback lowering (set per test by `lowering`)
+LOWERING = {}  # Lowerer options, set per test by `lowering`
 
 
-@pytest.fixture(autouse=True, params=[False, True], ids=["optimized", "plain"])
+@pytest.fixture(autouse=True, params=[{}, {"strict": True}, {"plain": True}], ids=["optimized", "strict", "plain"])
 def lowering(request, monkeypatch):
     """Run each test once per lowering."""
-    monkeypatch.setattr(sys.modules[__name__], "PLAIN", request.param)
+    monkeypatch.setattr(sys.modules[__name__], "LOWERING", request.param)
 
 
 def I(v):  # noqa: E743 - an int literal
@@ -57,7 +58,7 @@ def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str
     buffers.update({n: Buffer(n, s, out_dtype) for n, s in outputs.items()})
     params = tuple(inputs) + tuple(outputs)
     src = KernelSource("k_test", tuple(body), params, buffers, Launch(grid, block, 0), frozenset(outputs))
-    ptx = Lowerer(src, plain=PLAIN).run().render(PTX_VERSION, TARGET)
+    ptx = Lowerer(src, **LOWERING).run().render(PTX_VERSION, TARGET)
     c = requests.post(f"{RUNNER}/compile", json={"ptx": ptx}, timeout=120).json()
     assert c.get("ok"), c.get("stderr")
     args = [dict(name=n, dtype=buffers[n].dtype, shape=list(a.shape), data=a.ravel().tolist()) for n, a in inputs.items()]

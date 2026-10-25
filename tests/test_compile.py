@@ -4,8 +4,8 @@ Problem folders are looked up in $EMMY_PROBLEMS (one or more paths separated
 by os.pathsep), defaulting to the hackathon repository checked out next to
 this one. When ptxas is on PATH (or $PTXAS points at it) every module is also
 assembled for sm_120, which catches any PTX the runner would reject. Every
-kernel is compiled twice: as usual, and with the fallback lowering
-(``--plain``) that compile_file falls back to.
+kernel is compiled three ways: as usual, with ``--strict`` (no rewrite that
+changes rounding), and with the fallback lowering (``--plain``).
 """
 
 import json
@@ -30,17 +30,17 @@ PTXAS = os.environ.get("PTXAS") or shutil.which("ptxas")
 pytestmark = pytest.mark.skipif(not KERNELS, reason="no problem folders found (set EMMY_PROBLEMS)")
 
 
-def compile_ir(ir: Path, plain: bool = False) -> str:
-    cmd = [sys.executable, str(ROOT / "compile.py"), *(["--plain"] if plain else []), str(ir)]
+def compile_ir(ir: Path, flags: tuple = ()) -> str:
+    cmd = [sys.executable, str(ROOT / "compile.py"), *flags, str(ir)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return r.stdout
 
 
-@pytest.mark.parametrize("plain", [False, True], ids=["optimized", "plain"])
+@pytest.mark.parametrize("flags", [(), ("--strict",), ("--plain",)], ids=["optimized", "strict", "plain"])
 @pytest.mark.parametrize("ir", KERNELS, ids=lambda p: f"{p.parent.name}/{p.stem}")
-def test_kernel_compiles_to_well_formed_ptx(ir, plain, tmp_path):
-    ptx = compile_ir(ir, plain)
+def test_kernel_compiles_to_well_formed_ptx(ir, flags, tmp_path):
+    ptx = compile_ir(ir, flags)
     meta = json.loads((ir.parent / "meta.json").read_text())
     entry = ir.name.removesuffix(".ir.json")
     kernel = next(k for k in meta["kernels"] if k["entry"] == entry)

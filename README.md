@@ -3,7 +3,9 @@
 A compiler from Emmy's Kernel IR (`*.ir.json`) straight to NVIDIA PTX.
 
 ```
-python compile.py path/to/<kernel>.ir.json > out.ptx
+python compile.py path/to/<kernel>.ir.json > out.ptx            # PTX on stdout, diagnostics on stderr
+python compile.py --strict path/to/<kernel>.ir.json > out.ptx   # no rewrite that changes rounding
+python compile.py --plain path/to/<kernel>.ir.json > out.ptx    # the fallback lowering alone
 ```
 
 The IR is loaded with emmy's `Graph.from_dict`. Everything after that (the
@@ -25,10 +27,11 @@ launch from `meta.json`:
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
 | Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (every problem above) |
+| Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **402 / 402** pass; on the 371 problems without float atomics, outputs bit-identical to the plain lowering's (so every rewrite it keeps is exact) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 136 (48 run hand-built IR on the GPU); compile and GPU tests cover both lowerings |
+| Tests | 176 (72 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -94,7 +97,8 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   built from minimax polynomials and exact argument reductions (`exp`, `log`
   and `sigmoid` also in double precision). Splitting a
   reduction regroups its sum (well within the tolerances); folds that are not
-  split keep the IR's order.
+  split keep the IR's order. `--strict` turns off every rewrite that changes
+  rounding (lane splits, softmax updates per block, FMA contraction).
 
 [docs/DESIGN.md](docs/DESIGN.md) explains each part, with the measurements behind
 the choices.

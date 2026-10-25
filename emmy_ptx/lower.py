@@ -209,10 +209,14 @@ class Placement:
 
 
 class Lowerer(TensorCoreLowering):
-    def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False):
+    def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False,
+                 strict: bool = False):
         self.src = src
         self.spread = spread  # do idle threads join the cells (_spread)?
         self.place = place  # do cells run where their lanes share work (_placement)?
+        # every floating-point operation of the IR in its order, each rounded on its own: no rewrite
+        # that regroups a sum (lane splits, chunks, a softmax updated once per block) and no FMA contraction
+        self.strict = strict
         # the fallback lowering (see compile_file): one rule per statement, in the IR's order, with
         # none of the optional rewrites (fusion, regrouping, lane splits, unrolling the IR does not ask for)
         self.plain = plain
@@ -251,9 +255,9 @@ class Lowerer(TensorCoreLowering):
             # cells that, as emmy lays them out, share no work with the lanes beside them may
             # share it with more lanes each (_spread) or laid out anew (_placement)
             if self.wants_spread:
-                return Lowerer(self.src, spread=True).run()
+                return Lowerer(self.src, spread=True, strict=self.strict).run()
             if self.wants_place:
-                placed = Lowerer(self.src, place=True)
+                placed = Lowerer(self.src, place=True, strict=self.strict)
                 kernel = placed.run()
                 # each region lowers the Tile's body again: keep it while the module fits the runner
                 if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
@@ -308,7 +312,7 @@ class Lowerer(TensorCoreLowering):
         combine across the cooperating threads (see regroup.py), else ``s``."""
         accs = {st.name for st in s.body if type(st).__name__ == "Accum"}
         step = _int_value(s.step)
-        if not accs or step is None:
+        if not accs or step is None or self.strict:  # (chunks regroup the sums)
             return s
         start = self.expr(s.start)  # the thread's rank among the cooperating threads
         if start.lo != 0 or start.hi is None or not fully_combined(stmts, i, accs, start.hi + 1):
@@ -946,7 +950,9 @@ class Lowerer(TensorCoreLowering):
         splitting the loops in it (the coalescing-driven choice of the loop to
         parallelize, as in PPCG and Yang et al., PLDI'10).
         """
-        if self.plain or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < SPLIT_MIN_TRIPS:
+        if self.plain or self.strict or not self.converged or trips is None or trips[0] != trips[1]:
+            return None  # (strict: a split regroups the reduction)
+        if trips[0] < SPLIT_MIN_TRIPS:
             return None
         fold = self._fold(s, start, step, end)
         n = trips[0]
@@ -1075,6 +1081,8 @@ class Lowerer(TensorCoreLowering):
             return None
         if assigned(s.body) - mapping.local_names(s.body) != {st.name for st in accs}:
             return None  # a nested fold updates some outer name
+        if self.strict and mapping.online_groups(s.body) != []:
+            return None  # an online softmax updated once per block of keys rounds differently
         n = trips[0]
         of_name = self._uniformity(s, min(start.ug, step.ug, end.ug))
         group = min(WARP, 1 << (n.bit_length() - 1))
@@ -1083,7 +1091,7 @@ class Lowerer(TensorCoreLowering):
             uniform = (lambda g: lambda x: of_name(x) >= g)(group)
             plan = mapping.blocked(s, n, first, step_, group, 1, uniform)
             if plan is not None:
-                share = self._key_lanes(plan, s.axis.name, step_, group)
+                share = 1 if self.strict else self._key_lanes(plan, s.axis.name, step_, group)  # (lanes split a dot)
                 return mapping.blocked(s, n, first, step_, group, share, uniform) if share > 1 else plan
             group //= 2
         return None
@@ -1544,7 +1552,7 @@ class Lowerer(TensorCoreLowering):
         canon = REDUCE_CANON.get(s.op.name, "add")  # emmy folds unknown combines additively
         value = self.value(s.value)
         new = None
-        if canon == "add" and acc.type == "f32":  # contract a product into the fold: one FMA
+        if canon == "add" and acc.type == "f32" and not self.strict:  # contract a product into the fold: one FMA
             for product, addend in ((value, base), (base, value)):
                 factors = self.products.get(product.key()) if product.key() is not None else None
                 # a factor read from a variable must still hold (alpha * l fuses into l's own update)

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Compile one Emmy Kernel-IR file to PTX.
 
-    python compile.py path/to/<kernel>.ir.json > out.ptx
-    python compile.py --plain path/to/<kernel>.ir.json > out.ptx
+    python compile.py [--strict] [--plain] path/to/<kernel>.ir.json > out.ptx
 
 PTX goes to stdout; diagnostics go to stderr. ``meta.json`` must sit next to
-the IR file (it names the kernel parameters in launch order). ``--plain``
-gives the fallback lowering, without the optional rewrites (for testing it).
+the IR file (it names the kernel parameters in launch order).
+
+``--strict`` turns off the rewrites that change floating-point results within
+rounding (sums regrouped across lanes, an online softmax updated once per
+block, FMA contraction of ``acc += a * b``): every result is then bit for bit
+what the IR's own order of operations gives. ``--plain`` gives the fallback
+lowering, without any optional rewrite (for testing it).
 """
 
 import sys
@@ -18,13 +22,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emmy_ptx import compile_file  # noqa: E402
 
 
+FLAGS = ("--strict", "--plain")
+
+
 def main(argv: list[str]) -> int:
-    paths = [a for a in argv[1:] if a != "--plain"]
-    if len(paths) != 1:
-        print("usage: python compile.py [--plain] <kernel>.ir.json > out.ptx", file=sys.stderr)
+    flags = {a for a in argv[1:] if a.startswith("--")}
+    paths = [a for a in argv[1:] if not a.startswith("--")]
+    if len(paths) != 1 or flags - set(FLAGS):
+        print("usage: python compile.py [--strict] [--plain] <kernel>.ir.json > out.ptx", file=sys.stderr)
         return 2
     try:
-        ptx = compile_file(paths[0], plain="--plain" in argv[1:])
+        ptx = compile_file(paths[0], plain="--plain" in flags, strict="--strict" in flags)
     except Exception:  # report everything; stdout must stay clean
         traceback.print_exc(file=sys.stderr)
         return 1

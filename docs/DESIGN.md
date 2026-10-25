@@ -439,6 +439,32 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   summed. Against numpy's answers (float64 for reductions, matmul and
   attention) our largest error over 283 problems is 14% of the tolerance and
   the median 0.13%; numpy's own float32 computation has a median of 0.12%.
+* **`--strict`: results bit for bit as the IR orders its operations.**
+  `compile.py --strict` (`Lowerer(strict=True)`) turns off the rewrites that
+  change a result within rounding:
+  * the lane split of a reduction (4.2), whose merge regroups the sum;
+  * regrouping into contiguous chunks (4.6);
+  * lane blocking of an online softmax, which updates its state once per block
+    of keys (4.3);
+  * lane blocking that gives a key several lanes, which split its dot product;
+  * FMA contraction of `acc += a*b`.
+
+  Everything else stays, because it does not change a single bit:
+  * fusion, congruent accumulators and CSE;
+  * unrolling and early loads;
+  * vector loads and stores;
+  * the one-barrier tree (4.7);
+  * dealt loops, spread cells and cell placement (4.4, 4.5);
+  * lane blocking of plain folds;
+  * the tensor cores, whose order of operations is the IR's own.
+
+  That claim is checked on the GPU. Of the 402 problems, the 371 whose
+  kernels add no floats atomically give bit-identical outputs under
+  `--strict` and under the plain lowering (`--plain --strict`, which runs the
+  IR as written). The other 31 finish with float atomics, whose order varies
+  from run to run. Strictness costs speed where lanes shared a reduction: the
+  open set's 64×64 attention takes 85 µs instead of 9. All 402 problems pass
+  with it.
 * **Transcendentals** are built from an exact or near-exact argument
   reduction plus either a polynomial or a hardware approximation used only on
   a small interval:
