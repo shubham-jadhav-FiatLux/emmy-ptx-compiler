@@ -22,6 +22,12 @@ _WRITES = ("st.", "red.", "atom.", "bar.", "barrier.", "cp.async", "membar", "fe
 _SCALAR32 = (".f32", ".b32", ".s32", ".u32")
 
 
+# State spaces whose loads are merged. Shared memory is left alone: measured on
+# the evaluation GPU, wide shared loads cost more (bank conflicts, issue order)
+# than they save in emmy's matmul tiles (m02: 3.5 -> 4.8 us with them).
+SPACES = ("global",)
+
+
 def vectorize_loads(kernel, align: dict[str, int], sym_align: int = 16) -> int:
     """Rewrite ``kernel.body`` in place; returns how many loads were merged away."""
     body = kernel.body
@@ -66,7 +72,7 @@ def vectorize_loads(kernel, align: dict[str, int], sym_align: int = 16) -> int:
             continue
         op = item.op
         if (op.startswith("ld.") and ".v" not in op and item.guard is None and op.endswith(_SCALAR32)
-                and isinstance(item.args[0], Reg) and isinstance(item.args[1], Mem)):
+                and op.split(".")[1] in SPACES and isinstance(item.args[0], Reg) and isinstance(item.args[1], Mem)):
             mem = item.args[1]
             groups.setdefault((op, mem.base.name), []).append((idx, item.args[0], mem))
             continue
