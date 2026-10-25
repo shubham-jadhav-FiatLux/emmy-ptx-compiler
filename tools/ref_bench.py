@@ -41,7 +41,7 @@ def nvcc_ptx(nvcc: str, cu: Path) -> str:
         return re.sub(r"^\.version \d+\.\d+", ".version 8.8", out.read_text(), count=1, flags=re.M)
 
 
-def launch(server: str, ptx: str, k: dict, produced: dict) -> tuple[dict, dict]:
+def launch(server: str, ptx: str, k: dict, produced: dict, reps: int = 1) -> tuple[dict, dict]:
     c = post(server, "/compile", {"ptx": ptx})
     if not c.get("ok"):
         raise RuntimeError("ptxas: " + c.get("stderr", "")[:300])
@@ -52,15 +52,19 @@ def launch(server: str, ptx: str, k: dict, produced: dict) -> tuple[dict, dict]:
             a["data"] = produced[a["name"]]
         args.append(a)
     need = max((int(np.prod(a["shape"])) for a in k["args"] if a.get("output")), default=1)
-    r = post(server, "/run", {"cubin_id": c["cubin_id"], "entry": k["entry"], "grid": k["grid"], "block": k["block"],
-                              "smem_bytes": k["smem_bytes"], "zero_outputs": k["zero_outputs"], "args": args,
-                              "warmup": 3, "iters": 20, "max_return": max(4096, need)})
-    if not r.get("ok"):
-        raise RuntimeError(f"run: {r.get('stderr', '')[:300]}")
-    return c, r
+    best = None
+    for _ in range(reps):  # the runner's clocks are not locked: keep the best of a few runs
+        r = post(server, "/run", {"cubin_id": c["cubin_id"], "entry": k["entry"], "grid": k["grid"],
+                                  "block": k["block"], "smem_bytes": k["smem_bytes"], "zero_outputs": k["zero_outputs"],
+                                  "args": args, "warmup": 3, "iters": 20, "max_return": max(4096, need)})
+        if not r.get("ok"):
+            raise RuntimeError(f"run: {r.get('stderr', '')[:300]}")
+        if best is None or r["median_us"] < best["median_us"]:
+            best = r
+    return c, best
 
 
-def bench(pdir: Path, nvcc: str, server: str) -> dict:
+def bench(pdir: Path, nvcc: str, server: str, reps: int = 3) -> dict:
     meta = json.loads((pdir / "meta.json").read_text())
     expected = dict(np.load(pdir / "expected.npz"))
     row = {"id": pdir.name, "ours_us": 0.0, "ref_us": 0.0, "ours_regs": [], "ref_regs": [], "ours_ok": True, "ref_ok": True}
@@ -73,7 +77,7 @@ def bench(pdir: Path, nvcc: str, server: str) -> dict:
                 ptx = r.stdout
             else:
                 ptx = nvcc_ptx(nvcc, pdir / f"{k['entry']}.ref.cu")
-            c, res = launch(server, ptx, k, produced)
+            c, res = launch(server, ptx, k, produced, reps)
             row[f"{side}_regs"].append(c.get("registers", {}).get(k["entry"]))
             row[f"{side}_us"] += float(res.get("median_us") or 0)
             for name, out in res["outputs"].items():
@@ -90,13 +94,14 @@ def main() -> int:
     ap.add_argument("--nvcc", default=shutil.which("nvcc") or "nvcc")
     ap.add_argument("--server", default=RUNNER)
     ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--reps", type=int, default=3, help="timed runs per kernel; the best is kept")
     ap.add_argument("--json")
     args = ap.parse_args()
     dirs = [d for d in problem_dirs(args.paths) if list(d.glob("*.ref.cu"))]
 
     def safe(d):
         try:
-            return bench(d, args.nvcc, args.server)
+            return bench(d, args.nvcc, args.server, args.reps)
         except Exception as e:  # noqa: BLE001
             return {"id": d.name, "error": str(e)[:200]}
 
