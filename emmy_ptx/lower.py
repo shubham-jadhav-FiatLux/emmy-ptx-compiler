@@ -62,7 +62,7 @@ AUTO_UNROLL_TRIPS = 64
 # Iterations per trip of a rolled loop, by body size (statements).
 UNROLL_TINY_BODY, UNROLL_TINY = 6, 8
 UNROLL_SMALL_BODY, UNROLL_SMALL = 24, 4
-UNROLL_BIG_BODY, UNROLL_BIG_ONE_WAVE = 400, 1
+UNROLL_BIG_BODY, UNROLL_BIG_CHOICES = 400, (8, 4, 2)  # tuned with tools/tune.py
 # Streaming multiprocessors of the evaluation GPU (RTX 5090). Only a scheduling
 # hint depends on it; the generated code is correct on any GPU.
 TARGET_SMS = 170
@@ -612,7 +612,7 @@ class Lowerer:
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
                 self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
         else:
-            factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS) if step.const is not None else 1
+            factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS, trips) if step.const is not None else 1
             self._rolled(s, start, step, end, trips, factor)
 
     def _split_plan(self, s, start: Value, step: Value, end: Value, trips) -> int:
@@ -1184,15 +1184,24 @@ def _assigned_in(stmts) -> set[str]:
     return out
 
 
-def _unroll_factor(body_size: int, one_wave: bool) -> int:
+def _unroll_factor(body_size: int, one_wave: bool, trips) -> int:
     """Iterations per trip for a rolled loop: enough independent loads in
-    flight to cover memory latency, without blowing up big bodies. A one-wave
-    grid has too few warps to hide latency, so even big bodies get some."""
+    flight to cover memory latency, without blowing up big bodies.
+
+    A one-wave grid has too few warps to hide latency, so even big bodies
+    are unrolled: by the largest of UNROLL_BIG_CHOICES that divides an exact
+    trip count (no leftover iterations to expand), else the last choice."""
     if body_size <= UNROLL_TINY_BODY:
         return UNROLL_TINY
     if body_size <= UNROLL_SMALL_BODY:
         return UNROLL_SMALL
-    return UNROLL_BIG_ONE_WAVE if one_wave and body_size <= UNROLL_BIG_BODY else 1
+    if not one_wave or body_size > UNROLL_BIG_BODY:
+        return 1
+    if trips is not None and trips[0] == trips[1]:
+        for f in UNROLL_BIG_CHOICES:
+            if trips[0] % f == 0:
+                return f
+    return UNROLL_BIG_CHOICES[-1]
 
 
 def _trip_range(start: Value, step: Value, end: Value):

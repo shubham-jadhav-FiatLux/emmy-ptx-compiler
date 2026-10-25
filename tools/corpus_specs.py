@@ -321,3 +321,48 @@ OPEN += [
                               "torch.softmax(q @ kt, dim=-1) @ v",
          ref=_c(lambda q, kt, v: _softmax(q @ kt) @ v), rtol=1e-3, atol=1e-4),
 ]
+
+
+def _causal(q, k, v, scale):
+    s = q @ np.swapaxes(k, -1, -2) / scale
+    n = s.shape[-1]
+    s = np.where(np.tril(np.ones((n, n), bool)), s, -np.inf)
+    return _softmax(s) @ v
+
+
+def sdpa(id, shape, causal=False):
+    b, h, n, d = shape
+    t = f"torch.randn({b}, {h}, {n}, {d})"
+    code = (f"q = {t}; k = {t}; v = {t}; "
+            f"torch.nn.functional.scaled_dot_product_attention(q, k, v{', is_causal=True' if causal else ''})")
+    if causal:
+        ref = _c(lambda q, k, v: _causal(q, k, v, np.sqrt(d)))
+    else:
+        ref = _c(lambda q, k, v: _softmax(q @ np.swapaxes(k, -1, -2) / np.sqrt(d)) @ v)
+    return dict(id=f"a_{id}", code=code, ref=ref, rtol=1e-3, atol=1e-4)
+
+
+# ---- round 3: attention in odd shapes (the new optimizations all fire here) ------------------
+OPEN += [
+    attn("d24", 96, 96, 24, 4.898979),
+    attn("d40", 64, 160, 40, 6.324555),
+    attn("d80", 128, 128, 80, 8.944272),
+    attn("d96", 48, 200, 96, 9.797959),
+    attn("n384", 384, 384, 32, 5.656854),
+    attn("q1", 1, 256, 64, 8.0),
+    attn("k16", 128, 16, 64, 8.0),
+    sdpa("sdpa_b2h2", (2, 2, 100, 32)),
+    sdpa("sdpa_h8", (1, 8, 64, 16)),
+    sdpa("sdpa_causal_odd", (1, 2, 96, 48), causal=True),
+    sdpa("sdpa_causal_long", (1, 1, 256, 64), causal=True),
+    # inputs are numbered by first use in the expression: q, kt, mask, v
+    dict(id="a_masked", code="q = torch.randn(64, 32); kt = torch.randn(32, 64); m = torch.randn(64, 64); "
+                              "v = torch.randn(64, 32); torch.softmax(q @ kt / 5.656854 + m, dim=-1) @ v",
+         ref=_c(lambda q, kt, m, v: _softmax((q @ kt) / 5.656854 + m) @ v), rtol=1e-3, atol=1e-4),
+    dict(id="a_relu_attn", code="q = torch.randn(64, 32); kt = torch.randn(32, 128); v = torch.randn(128, 32); "
+                                 "torch.relu(q @ kt) @ v",
+         ref=_c(lambda q, kt, v: np.maximum(q @ kt, 0) @ v), rtol=1e-3, atol=1e-3),
+    dict(id="a_sigmoid_attn", code="q = torch.randn(64, 32); kt = torch.randn(32, 64); v = torch.randn(64, 32); "
+                                    "torch.sigmoid(q @ kt / 5.656854) @ v",
+         ref=_c(lambda q, kt, v: (1.0 / (1.0 + np.exp(-(q @ kt) / 5.656854))) @ v), rtol=1e-3, atol=1e-4),
+]
