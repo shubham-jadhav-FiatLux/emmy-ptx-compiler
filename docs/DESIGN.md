@@ -693,8 +693,10 @@ instead was 1.25x slower on the 72 kernels that use more than 128.
 
 These raise a clear error (and so cannot reach the GPU half-lowered):
 * Hopper's `wgmma`, which the RTX 5090 lacks.
-* TMA descriptors and mbarriers; a TMA descriptor is built on the host, which
-  the runner's API cannot pass.
+* emmy's TMA pipeline statements (`TmaLoad` and the `Mbarrier*` statements
+  around it): a TMA descriptor is built on the host, which the runner's API
+  cannot pass. The copy engine of section 3 issues its own `cp.async.bulk`
+  and mbarriers, which need no descriptor.
 * `SetMaxNReg`, `Carry` and `Pre`.
 * The Volta m8n8k4 fragment layout, and the fp8 (m16n8k32) and fp4
   block-scaled tensor-core fragments (fp8 elementwise casts are supported).
