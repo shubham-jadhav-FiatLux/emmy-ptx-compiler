@@ -140,7 +140,7 @@ rewrites run: no early loads, fusion, regrouping, congruent accumulators,
 lane splits or blocks, dealt loops, spread cells, partial unrolling or
 vector-load merging. The builder's local work (folding, ranges, value
 numbering, LICM) stays. `compile.py --plain` forces this lowering, so it is
-tested like the main one: all 382 problems of the open set, the corpus, the
+tested like the main one: all 402 problems of the open set, the corpus, the
 held-out set and the schedule sweep pass with it, and so does every GPU test.
 It is slower, because lanes no longer share work (the open set's 64×64
 attention takes 81 µs instead of 9), but it computes the same results.
@@ -309,7 +309,7 @@ lays the cells out. It is kept only if a loop is then shared and the module,
 with one copy of the body per region, still fits the runner's limit.
 
 The region with the smallest groups sets the time, because the lanes holding
-a row's remainder must still score all of its keys. Twelve of the 394 kernels
+a row's remainder must still score all of its keys. Twelve of the 419 kernels
 are placed, all faster; nothing else changes:
 
 | problem | as emmy lays it out | placed |
