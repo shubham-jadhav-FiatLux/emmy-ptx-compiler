@@ -123,7 +123,8 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
                                      loop-body rewrites
 ```
 
-* **One lowering rule per IR statement** (`emmy_ptx/lower.py`), with names in
+* **One lowering rule per IR statement** (`emmy_ptx/lower.py`, with the cell
+  mapping in `cells.py` and lane sharing in `lanes.py`), with names in
   C block scoping, exactly as in the CUDA C++ emmy would print.
 * **A builder that knows what every integer can be** (`emmy_ptx/builder.py`):
   proven ranges turn divisions into shifts and remove guards the launch
@@ -187,11 +188,14 @@ the choices.
 compile.py             command-line entry point (PTX to stdout, errors to stderr)
 emmy_ptx/
   frontend.py          IR + meta.json -> KernelSource
-  lower.py             Kernel IR statements -> instructions; how each loop is lowered
+  lower.py             the Lowerer: driver, names, expressions, addresses, loops, statements
+  cells.py             where a Tile's cells run: decode, rasterization, spread cells, placement
+  lanes.py             lanes sharing a loop's work: split reductions, lane blocking, dealt loops
   mapping.py           loop-body analyses and rewrites (fusion, online softmax, lane blocking)
   congruence.py        accumulators that always hold the same value
   regroup.py           cooperative reductions in contiguous chunks
   tensorcore.py        tensor-core fragments: ldmatrix, mma.sync, fragment softmax, fragment stores
+  common.py            what those share: dtype tables, buffers, affine forms, scopes
   builder.py           typed values, folding, ranges, value numbering, LICM, DCE
   vectorize.py         adjacent scalar loads -> ld.v2 / ld.v4
   elementwise.py       Assign/Accum operations and emmy's dtype rules

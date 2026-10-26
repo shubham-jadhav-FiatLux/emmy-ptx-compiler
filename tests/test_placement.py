@@ -9,7 +9,8 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.kernel.ir import Tile
 from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Write
 from emmy_ptx.frontend import Buffer, KernelSource, Launch
-from emmy_ptx.lower import Lowerer, Placement, _decompositions
+from emmy_ptx.cells import Placement, _decompositions
+from emmy_ptx.lower import Lowerer
 
 
 def source(body, shapes: dict, outputs: tuple, grid: int, block: int) -> KernelSource:

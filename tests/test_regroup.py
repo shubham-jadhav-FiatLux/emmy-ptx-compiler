@@ -52,7 +52,7 @@ def test_rewrite_folds_contiguous_chunks_of_every_element_once():
     for t in range(B):
         for k in range(N // (VECTOR * B)):
             for s in loads:
-                covered.append(s.index[0].eval({"t": t, f"a$chunk": k}))
+                covered.append(s.index[0].eval({"t": t, "a$chunk": k}))
     assert sorted(covered) == list(range(N))
 
 

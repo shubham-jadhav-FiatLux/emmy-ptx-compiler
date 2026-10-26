@@ -37,6 +37,7 @@ from dataclasses import dataclass
 
 from . import elementwise
 from .builder import Value, Variable
+from .common import LoweringError, SharedArray
 from .mapping import kind, walk
 from .ptx import Imm, Vec
 
@@ -50,7 +51,7 @@ FRAG_ROW, FRAG_COL, ELEM_ROW, ELEM_COL = "__frow", "__fcol", "__M__", "__N__"
 _REF = re.compile(r"^(\w+)(?:\[(\w+)\])?$")
 
 
-class TensorCoreError(Exception):
+class TensorCoreError(LoweringError):
     pass
 
 
@@ -170,7 +171,7 @@ class TensorCoreLowering:
         if not s.staged:
             self._fragment_from_global(s, buf, frag)
             return
-        if not hasattr(buf, "symbol"):  # a SharedArray
+        if not isinstance(buf, SharedArray):
             raise TensorCoreError(f"ldmatrix reads shared memory, not {s.src_buffer!r}")
         b = self.b
         lane = self.value("lane")
@@ -401,7 +402,7 @@ class TensorCoreLowering:
                 preds[i] = p if preds[i] is None else b.pand(preds[i], p)
         values = [b.in_reg(b.convert(v, buf.type)) for v in values]
         offsets = [b.add(b.mul(rows[i], b.int_const(ldm)), b.mul(cols[i], b.int_const(ldn))) for i in range(4)]
-        space = "shared" if hasattr(buf, "symbol") else "global"
+        space = "shared" if isinstance(buf, SharedArray) else "global"
         even = ldm % 2 == 0 and base.const % 2 == 0 and all(c % 2 == 0 for _, c in base.terms.values())
         paired = (ldn == 1 and s.n_guard is None and even and buf.type in ("f32", "f16")
                   and not (s.atomic and buf.type == "f32"))

@@ -39,8 +39,7 @@ from dataclasses import replace
 from emmy.compiler.dim import Dim
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.stmt import Assign, Load, StridedLoop
-from emmy.compiler.ir.stmt.leaves import Let
+from emmy.compiler.ir.stmt import StridedLoop
 
 from .mapping import reads
 

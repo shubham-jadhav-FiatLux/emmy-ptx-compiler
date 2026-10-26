@@ -4,7 +4,7 @@
     python tools/tune.py PROBLEM_DIR [...] --variant NAME:module.ATTR=value[;module.ATTR=value] [...]
 
 Every variant overrides some of the compiler's tuning constants (for example
-``lower.UNROLL_BUDGET=8192`` or ``builder.Builder.HOIST_BUDGET=48``), compiles
+``lower.FUSE_BUDGET=1024`` or ``builder.Builder.HOIST_BUDGET=48``), compiles
 each problem in-process, and times it on the runner (best of a few runs of
 20 timed launches). A ``base`` variant with no overrides is always measured.
 The table prints each variant's time relative to the base and flags wrong

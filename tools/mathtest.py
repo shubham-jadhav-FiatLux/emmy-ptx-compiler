@@ -18,7 +18,6 @@ runner's JSON carries an i64 as a double, which would round its low bits).
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 

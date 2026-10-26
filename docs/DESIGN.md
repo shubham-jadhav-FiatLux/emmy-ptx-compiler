@@ -12,6 +12,8 @@ evaluation runner (RTX 5090), each problem with its own launch.
       │  lower.Lowerer          one rule per IR statement, C block scoping;
       │                         per loop: split across lanes, lane-blocked, dealt, unrolled or rolled
       │                         (should that fail: lowered again plainly, without the optional rewrites, §3)
+      │      ├─ cells                            where a Tile's cells run (decode, spread, placement)
+      │      ├─ lanes                            lanes sharing a loop's work (splits, blocking, dealing)
       │      ├─ mapping / congruence / regroup   loop-body analyses and IR-to-IR rewrites
       │      ├─ tensorcore                       the mma.sync fragment statements
       │      ├─ builder.Builder                  folding · ranges · uniformity · value numbering · LICM
@@ -85,7 +87,7 @@ only earlier and never past a store or barrier (unless the data is read-only).
 
 **Dead-code elimination** runs at the end to a fixpoint.
 
-## 3. Lowering (`lower.py`)
+## 3. Lowering (`lower.py`, `cells.py`)
 
 `Lowerer.body` dispatches each statement to `stmt_<Kind>`. Names follow C
 block scoping exactly as the CUDA C++ emmy would print: a `Tile`, loop or
@@ -143,7 +145,7 @@ held-out set and the schedule sweep pass with it, and so does every GPU test.
 It is slower, because lanes no longer share work (the open set's 64×64
 attention takes 81 µs instead of 9), but it computes the same results.
 
-## 4. Lanes that compute the same thing
+## 4. Lanes that compute the same thing (`lanes.py`, `cells.py`)
 
 Emmy's schedules often have many lanes compute the same thing: all the lanes
 that hold one query row compute that row's attention scores, every lane of a
