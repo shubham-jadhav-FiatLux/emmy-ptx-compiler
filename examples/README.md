@@ -1,16 +1,16 @@
 # Examples
 
-Three problems, with the PTX the compiler makes for each (`*.ptx`, next to the
+Four problems, with the PTX the compiler makes for each (`*.ptx`, next to the
 IR). Every folder is a complete problem (IR, `meta.json`, reference CUDA,
 expected outputs), so it can be compiled and checked on the runner:
 
 ```bash
 python compile.py examples/r01_array_sum/k_sum_1_reduce.ir.json > out.ptx
-python tools/run_suite.py examples/r01_array_sum examples/a01_attention examples/m_f16_128 --bench
+python tools/run_suite.py examples/r01_array_sum examples/a01_attention examples/m_f16_128 examples/k_gelu_mlp --bench
 ```
 
 `r01_array_sum` and `a01_attention` are from the open problem set;
-`m_f16_128` is from the corpus (`tools/corpus_specs.py`). The excerpts below
+`m_f16_128` and `k_gelu_mlp` are from the corpus (`tools/corpus_specs.py`). The excerpts below
 are cut from the `.ptx` files, with comments added.
 
 ## 1. A reduction: `r01_array_sum`
@@ -124,3 +124,47 @@ buffered; `ldmatrix` fills each warp's register fragments; `mma.sync` does a
 
 Each lane then stores its four accumulator elements, a row's two neighbouring
 columns as one 8-byte store.
+
+## 4. Thread-block clusters: `k_gelu_mlp`
+
+`gelu(x @ w1) @ w2`, with x 32 x 128, w1 128 x 512 and w2 512 x 128, fused by
+emmy into one kernel of 4096 blocks of 8 threads. The 8 threads of block
+(row, col) split the 512 hidden units, and the block computes all 512 for its
+row: the same work as the other 127 blocks of that row.
+
+```
+Tile[a0, a1, a2_co] (N=32768)
+    for a2 in a2_co..512:8
+        for a3 in 0..128                      // one hidden unit: 128 multiply-adds
+            f32 acc0 <- add(acc0, x[a0, a3] * w1[a3, a2])
+        f32 v5 = gelu(acc0)                   // nothing so far depends on the column a1
+        f32 acc1 <- add(acc1, w2[a2, a1] * v5)    // only this does
+    WarpShuffle(acc1, length=8)
+```
+
+The compiler runs the kernel in clusters of 8 neighbouring blocks (DESIGN
+4.8). The module asks for them. Block r of a cluster computes only an eighth
+of the row's hidden units and stashes them in its shared memory:
+
+```ptx
+.shared .align 16 .b8 cluster_stash[256];
+.reqnctapercluster 8, 1, 1                 // the launch runs in clusters of 8 blocks
+	mov.u32 	%r10, %cluster_ctarank;       // this block's rank r in its cluster
+	...
+	st.shared.f32 	[%r34], %f71;         // gelu of hidden unit a2_co + 8 (8r + k), k = 0..7
+	barrier.cluster.arrive;
+	barrier.cluster.wait;
+```
+
+After the cluster barrier, each thread gathers all 64 of its hidden values,
+each from the block that computed it:
+
+```ptx
+	mapa.shared::cluster.u32 	%r206, %r34, %r205;    // that stash slot in block 0
+	ld.shared::cluster.f32 	%f571, [%r206];            // its gelu value
+	fma.rn.f32 	%f573, %f570, %f571, %f569;            // acc1 += w2[a2, a1] * value
+```
+
+Every value is computed exactly as before and in the same order, so the
+output is bit for bit the same. The kernel runs in 173 µs instead of 389; nvcc's
+build takes 408 µs.

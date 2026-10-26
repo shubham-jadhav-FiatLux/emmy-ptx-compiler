@@ -140,8 +140,10 @@ rewrites run: no early loads, fusion, regrouping, congruent accumulators,
 lane splits or blocks, dealt loops, spread cells, partial unrolling or
 vector-load merging. The builder's local work (folding, ranges, value
 numbering, LICM) stays. `compile.py --plain` forces this lowering, so it is
-tested like the main one: all 402 problems of the open set, the corpus, the
-held-out set and the schedule sweep pass with it, and so does every GPU test.
+tested like the main one: 469 of the 473 problems pass with it, and so does
+every GPU test. The other four are the two generator faults no compiler
+passes (9) and the two divisions by a constant checked at `rtol = 0`, which
+it computes as emmy's multiply by the reciprocal (7).
 It is slower, because lanes no longer share work (the open set's 64×64
 attention takes 81 µs instead of 9), but it computes the same results.
 
@@ -337,8 +339,8 @@ lays the cells out. It is kept only if a loop is then shared and the module,
 with one copy of the body per region, still fits the runner's limit.
 
 The region with the smallest groups sets the time, because the lanes holding
-a row's remainder must still score all of its keys. Twelve of the 419 kernels
-are placed, all faster; nothing else changes:
+a row's remainder must still score all of its keys. Thirteen of the 493
+kernels are placed, all faster; nothing else changes:
 
 | problem | as emmy lays it out | placed |
 |---|---|---|
@@ -350,6 +352,7 @@ are placed, all faster; nothing else changes:
 | `a_d88` (44 cells a row, in fours) | 31.3 µs | 14.9 µs |
 | `k_mlp`, `relu(x @ w1) @ w2` fused (22 cells a row) | 125.6 µs | 76.4 µs |
 | `ha_48x80x24` (held-out set) | 10.8 µs | 6.8 µs |
+| `k_mlp_gelu_8x512x2048x64`, a fused MLP of corpus round 6 (one block) | 20815 µs | 388 µs |
 
 The other four (`a_relu_attn`, `a_relu_32x48`, `a_b8_32x32` and
 `a_d40_q128`) gain 1.2 to 1.8x. The corpus holds 18 attention problems
@@ -506,8 +509,10 @@ rewrites of sections 4 and 5 moves, deals or places them.
 Twenty f16 problems were generated with the organisers' tool, and all of them
 pass. They cover matmuls of odd and batched shapes, `x @ w.T`, fused
 bias/relu/gelu epilogues, flash attention, and causal and multi-head SDPA. On
-19 of them we take 0.76x the time of nvcc's build of emmy's reference CUDA
-(geometric mean, never slower; the causal SDPA 10.9 µs against 133.8). Two GPU
+19 of them we take 0.77x the time of nvcc's build of emmy's reference CUDA
+(geometric mean; the causal SDPA 10.8 µs against 133.6). One is slower, a
+batched 4x64x96 matmul (6.6 µs against 4.6), for the reason given in section
+8. Two GPU
 tests build tensor-core IR by hand, for the forms the problems do not use: an
 f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
 
@@ -588,6 +593,7 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   * vector loads and stores;
   * the one-barrier tree (4.7);
   * dealt loops, spread cells and cell placement (4.4, 4.5);
+  * thread-block clusters and two cells a thread (4.8, 4.9);
   * lane blocking of plain folds;
   * the tensor cores, whose order of operations is the IR's own.
 
@@ -596,8 +602,8 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   under `--strict` and under the plain lowering (`--plain --strict`, which
   runs the IR as written). The other 31 finish with float atomics, whose order varies
   from run to run. Strictness costs speed where lanes shared a reduction: the
-  open set's 64×64 attention takes 85 µs instead of 9. All 402 problems pass
-  with it.
+  open set's 64×64 attention takes 85 µs instead of 9. It passes the same
+  469 of 473 problems as the plain lowering.
 * **Transcendentals** are built from an exact or near-exact argument
   reduction plus either a polynomial or a hardware approximation used only on
   a small interval:
@@ -627,8 +633,18 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
 never uses more registers than a block can launch with. When the whole grid
 fits in one wave (at most one CTA per SM on the 170-SM RTX 5090) the module
 also says `.minnctapersm 1`: extra registers then cannot cost occupancy, and
-ptxas uses them to keep more loads in flight, which makes the latency-bound
-attention kernels 25-40% faster.
+ptxas uses them to keep more loads in flight.
+
+Measured on the 161 of 326 problems whose code the hint changes: without it
+they take 1.20x as long (geometric mean), attention kernels up to 4.5x. One
+problem is faster without it: `m_f16_bmm` (four 64x96 by 96x80 f16 matmuls,
+16 blocks of 8 warps). There ptxas spends 162 registers on issuing all 144
+fragment loads of the unrolled K loop before the first `mma`, and the kernel
+takes 6.6 µs against 4.6 with its default of 66 registers. A rule that
+excluded blocks reading many fragments from global memory did not hold on 8
+new f16 matmuls: the hint was neutral on seven and 1.42x faster on the eighth.
+So the hint stays for every one-wave grid. Capping registers (`.maxnreg 128`)
+instead was 1.25x slower on the 72 kernels that use more than 128.
 
 ## 9. Validation
 

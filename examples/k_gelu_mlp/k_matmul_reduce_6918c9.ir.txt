@@ -1,0 +1,21 @@
+    Tile[a0, a1, a2_co] (N=32768)
+        in0 = load gelu_half[0]
+        in1 = load gelu_inv_sqrt2[0]
+        in2 = load gelu_one[0]
+        for a2 in a2_co..512:8
+            for a3 in 0..128
+                in4 = load x[a0, a3]
+                in3 = load w1[a3, a2]
+                f32 v0 = multiply(in3, in4)
+                f32 acc0 <- add(acc0, v0)
+            f32 v1 = multiply(acc0, in1)
+            f32 v2 = erf(v1)
+            f32 v3 = add(in2, v2)
+            f32 v4 = multiply(acc0, in0)
+            f32 v5 = multiply(v3, v4)
+            in5 = load w2[a2, a1]
+            f32 v6 = multiply(in5, v5)
+            f32 acc1 <- add(acc1, v6)
+        WarpShuffle(acc1, length=8)
+        if ((a2_co == 0)):
+            matmul_1[a0, a1] = acc1

@@ -18,7 +18,8 @@ the organisers' checker: `python submit.py <problem> --compiler compile.py`.
 The IR is loaded with emmy's `Graph.from_dict`. Everything after that is this
 project's own code: the lowering of every statement, the index arithmetic, the
 math library and the PTX text. [`examples/`](examples/README.md) walks through
-the PTX of a reduction, an attention kernel and a tensor-core matmul.
+the PTX of a reduction, an attention kernel, a tensor-core matmul and a fused
+MLP that runs in thread-block clusters.
 
 ## What to look for
 
@@ -70,8 +71,8 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   * swizzled `ldmatrix` slabs.
 * Registers: unrolling bounded by the per-thread register budget, and launch
   hints (`.maxntid`, `.minnctapersm`) for one-wave grids.
-* Result: 0.56x the time of nvcc's build of emmy's own CUDA over 281
-  problems, and attention at 0.12x.
+* Result: 0.51x the time of nvcc's build of emmy's own CUDA over 321
+  problems, attention at 0.16x and fused MLPs down to 0.005x.
 
 **Design**
 * One rule per statement. Each loop-body rewrite is either exact, bit for
@@ -120,15 +121,15 @@ launch from `meta.json`:
 |---|---|
 | Open problem set | **15 / 15** pass (all five categories); the four pointwise problems are bit-exact |
 | Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **205 / 205** pass |
-| Tensor cores (float16: emmy's `mma.sync` matmul, flash-attention and SDPA schedules) | **20 / 20** of the corpus's f16 problems pass; 0.76x the time of nvcc's build (geometric mean of 19, never slower) |
+| Tensor cores (float16: emmy's `mma.sync` matmul, flash-attention and SDPA schedules) | **20 / 20** of the corpus's f16 problems pass; 0.77x the time of nvcc's build (geometric mean of 19); one is slower, a batched 4x64x96 matmul at 6.6 µs against 4.6 (DESIGN 8) |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
 | Second held-out set (`tools/corpus_holdout2.py`: 66 problems written on 26 Oct, after every optimization) | **64 / 66** pass. The other two fail for any compiler, nvcc's build included: the generator lists a consumer kernel before its producer, and emmy traces `A @ v` into a 500x300 output. The set found one bug: emmy's `x * reciprocal(3.0)` is an ulp off numpy's `x / 3.0` at `rtol = 0`, so it is now computed as the correctly rounded quotient (nvcc's build still fails it; `--strict` and `--plain` keep emmy's multiply, 62 / 66) |
-| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (the open set, corpus, sweep and first held-out set) |
-| Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **402 / 402** pass; on the 371 problems without float atomics, outputs bit-identical to the plain lowering's (so every rewrite it keeps is exact) |
+| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **469 / 473** pass: all but the two generator faults and the two `rtol = 0` divisions, where it keeps emmy's multiply by the reciprocal |
+| Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **469 / 473** pass, the same four aside. Checked bit for bit on 402 problems: the 371 without float atomics give outputs identical to the plain lowering's (so every rewrite it keeps is exact) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
-| Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.01x to 0.08x** the time of nvcc's build (12x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
-| Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
+| Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.005x to 0.08x** the time of nvcc's build (13x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
+| Speed against nvcc's build of emmy's reference CUDA (321 problems, same launches) | **0.51x the time** (geometric mean): chained 0.13x, attention 0.16x, fused 0.53x, reductions 0.65x, matmul 0.88x, pointwise 1.00x (launch-bound); total 4.0 ms against 158.2 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
 | Tests | 209 (87 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
@@ -238,7 +239,7 @@ emmy_ptx/
 tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
                        interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
-examples/              three problems with their PTX, walked through in examples/README.md
+examples/              four problems with their PTX, walked through in examples/README.md
 docs/DESIGN.md
 requirements.txt
 ```

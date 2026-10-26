@@ -1,0 +1,158 @@
+{
+  "inputs": [
+    "w1",
+    "w2",
+    "x"
+  ],
+  "outputs": [
+    "matmul_1"
+  ],
+  "nodes": {
+    "gelu_half": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "gelu_half",
+        "value": 0.5,
+        "context_value": null,
+        "load_ops": [],
+        "source_path": null,
+        "source_parts": [],
+        "source_shape": null,
+        "source_dtype": null,
+        "source_graph": null
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "gelu_half",
+          "shape": [
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "gelu_inv_sqrt2": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "gelu_inv_sqrt2",
+        "value": 0.7071067811865475,
+        "context_value": null,
+        "load_ops": [],
+        "source_path": null,
+        "source_parts": [],
+        "source_shape": null,
+        "source_dtype": null,
+        "source_graph": null
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "gelu_inv_sqrt2",
+          "shape": [
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "gelu_one": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "gelu_one",
+        "value": 1.0,
+        "context_value": null,
+        "load_ops": [],
+        "source_path": null,
+        "source_parts": [],
+        "source_shape": null,
+        "source_dtype": null,
+        "source_graph": null
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "gelu_one",
+          "shape": [
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "w1": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "w1",
+          "shape": [
+            128,
+            512
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "w2": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "w2",
+          "shape": [
+            512,
+            128
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "x": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": [
+            32,
+            128
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "matmul_1": {
+      "op": "KernelOp",
+      "op_fields": {
+        "body": [
+          "Tile(axes=(Axis(name='a0', extent=Dim(32), window=None), Axis(name='a1', extent=Dim(128), window=None), Axis(name='a2_co', extent=Dim(8), window=None)), body=(Load(names=('in0',), input='gelu_half', index=(Literal(value=0, dtype='int'),), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Load(names=('in1',), input='gelu_inv_sqrt2', index=(Literal(value=0, dtype='int'),), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Load(names=('in2',), input='gelu_one', index=(Literal(value=0, dtype='int'),), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), StridedLoop(axis=Axis(name='a2', extent=Dim(512), window=None), start=Var(name='a2_co'), step=Literal(value=8, dtype='int'), body=(Loop(axis=Axis(name='a3', extent=Dim(128), window=None), body=(Load(names=('in4',), input='x', index=(Var(name='a0'), Var(name='a3')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Load(names=('in3',), input='w1', index=(Var(name='a3'), Var(name='a2')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v0', op=ElementwiseImpl('multiply'), args=('in3', 'in4'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0', value='v0', op=ElementwiseImpl('add'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a3',), base=None)), unroll=False, seed=True), Assign(name='v1', op=ElementwiseImpl('multiply'), args=('acc0', 'in1'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v2', op=ElementwiseImpl('erf'), args=('v1',), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v3', op=ElementwiseImpl('add'), args=('in2', 'v2'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v4', op=ElementwiseImpl('multiply'), args=('acc0', 'in0'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v5', op=ElementwiseImpl('multiply'), args=('v3', 'v4'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Load(names=('in5',), input='w2', index=(Var(name='a2'), Var(name='a1')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v6', op=ElementwiseImpl('multiply'), args=('in5', 'v5'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc1', value='v6', op=ElementwiseImpl('add'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a2',), base=None)), unroll=False, end=None, seed=True), WarpShuffle(state=('acc1',), state_b=('acc1__o',), combine_states=(Assign(name='acc1', op=ElementwiseImpl('add'), args=('acc1', 'acc1__o'), dtype=None),), length=8, dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Cond(cond=BinaryExpr(op='==', left=Var(name='a2_co'), right=Literal(value=0, dtype='int')), body=(Write(output='matmul_1', index=(Var(name='a0'), Var(name='a1')), values=('acc1',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE'),), else_body=())), block_threads=8, aux_threads=0, raster_axes=None, raster_group=None, raster_orient='m')"
+        ],
+        "name": "k_matmul_reduce_6918c9",
+        "zero_delegated": [],
+        "serial": []
+      },
+      "inputs": [
+        "gelu_inv_sqrt2",
+        "gelu_half",
+        "gelu_one",
+        "x",
+        "w1",
+        "w2"
+      ],
+      "outputs": [
+        {
+          "name": "matmul_1",
+          "shape": [
+            32,
+            128
+          ],
+          "dtype": "f32"
+        }
+      ]
+    }
+  }
+}
