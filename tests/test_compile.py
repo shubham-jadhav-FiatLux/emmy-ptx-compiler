@@ -77,3 +77,17 @@ def test_a_module_too_long_for_the_runner_falls_back(monkeypatch, capsys):
     ir = str(KERNELS[0])
     assert compile_file(ir) == compile_file(ir, plain=True)
     assert "more than the runner accepts" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [{}, {"strict": True}, {"plain": True}], ids=["optimized", "strict", "plain"])
+def test_report_lists_the_decisions_and_changes_no_ptx(flags, capsys):
+    """``--report`` writes the lowering's decisions and a PTX profile to stderr,
+    and the PTX is the same with or without it."""
+    ir = str(next((k for k in KERNELS if k.parent.name == "r01_array_sum"), KERNELS[0]))
+    ptx = compile_file(ir, **flags)
+    capsys.readouterr()
+    assert compile_file(ir, report=True, **flags) == ptx
+    err = capsys.readouterr().err
+    name = Path(ir).name.removesuffix(".ir.json")
+    assert err.startswith(f"{name}: ") and "\n  PTX: " in err and "instructions:" in err
+    assert ("launch hints: .maxntid" in err) and ("lowered plainly" in err) == bool(flags.get("plain"))

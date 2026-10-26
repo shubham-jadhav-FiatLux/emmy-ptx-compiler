@@ -1,5 +1,6 @@
 """Unit tests for the instruction builder: folding, ranges, value numbering."""
 
+import numpy as np
 import pytest
 
 from emmy_ptx.builder import Builder, Value, eliminate_dead_code
@@ -126,3 +127,22 @@ def test_dead_code_elimination_keeps_effects():
     b.emit("st.global.u32", Imm(0, "u32"), x)
     eliminate_dead_code(k)
     assert ops(k) == ["mov.u32", "st.global.u32"]
+
+
+@pytest.mark.parametrize("c", [3.0, 7.0, -0.1, 6.0, 777.0, 1e-38, 3e38, 1.1754942e-38])
+def test_double_product_with_the_reciprocal_rounds_like_float_division(c):
+    """Lowerer._quotient: in double, x * RN(1/c) rounded to float32 is the
+    correctly rounded float32 x / c, for every x (checked here on 4M random
+    bit patterns, both extremes of every exponent, and the special values)."""
+    rng = np.random.default_rng(int(abs(c) * 1e6) % 2**32)
+    bits = rng.integers(0, 2**32, 1 << 22, dtype=np.uint64).astype(np.uint32)
+    edges = np.array([0, 0x80000000, 1, 0x007FFFFF, 0x00800000, 0x7F7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000],
+                     dtype=np.uint32)
+    exps = (np.arange(256, dtype=np.uint32) << 23)
+    x = np.concatenate([bits, edges, exps, exps | 0x7FFFFF]).view(np.float32)
+    c32 = np.float32(c)
+    with np.errstate(all="ignore"):
+        want = x / c32
+        got = (x.astype(np.float64) * (1.0 / float(c32))).astype(np.float32)
+    same = (got.view(np.uint32) == want.view(np.uint32)) | (np.isnan(got) & np.isnan(want))
+    assert same.all(), x[~same][:5]

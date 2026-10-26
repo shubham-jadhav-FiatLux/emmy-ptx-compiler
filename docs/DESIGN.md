@@ -434,8 +434,35 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   layernorm, matmul), every pointwise result is bit-exact or within 2 ulp.
   (The evaluator reads outputs back as float32, so for it any f64 tolerance
   below float32 precision is out of reach in any case.)
+* **fp8.** An `f8e4m3` or `f8e5m2` value is its byte code in an integer
+  register (loaded and stored like `u8`); no arithmetic runs on it, only
+  emmy's casts. `from_f8*` widens a code with `cvt.rn.f16x2.e4m3x2` (or
+  `e5m2x2`): every fp8 value is exactly an f16, e4m3's 0x7f and 0xff come out
+  NaN, e5m2 keeps its infinities. `to_f8*` is one `cvt.rn.satfinite`: round to
+  nearest even, saturate to the largest finite value, NaN to 0x7f, which is
+  emmy's encode (cuda_fp8.h's `__NV_SATFINITE`). A GPU test checks all 256
+  codes of each format and a thousand values of every kind against emmy's own
+  `decode_f8` / `encode_f8`, bit for bit. These conversions need PTX ISA 8.1
+  on sm_89, so only modules that use them say `.version 8.1`.
 * **Reductions contract on purpose**: `acc += a*b` becomes `fma`, as nvcc
   does: faster and more accurate, and those problems carry a tolerance.
+* **Division by a constant, correctly rounded.** Emmy spells `x / 3.0` as
+  `x * reciprocal(3.0)`, and `x * RN(1/3)` can be an ulp from the correctly
+  rounded `x / 3` that numpy computes, which fails a pointwise problem checked
+  with `rtol = atol = 0` (emmy's own CUDA fails it too; found by the second
+  held-out set, §9). Outside loops, where it is cheap, the optimizing lowering
+  computes the true quotient instead (`Lowerer._quotient`), without a division
+  instruction: `div.rn.f32` is a subroutine with a slow path, and its call
+  kept ptxas from moving loads across it (a row normalization ran 3.2 →
+  4.5 µs). In double precision, `x * RN(1/c)` is within 2⁻⁵² of `x / c`; and
+  `x / c` is never closer than 2⁻⁴⁹ (relative) to a float32 rounding boundary,
+  because a boundary has an odd 25-bit significand that `x` and `c` cannot
+  produce exactly. So rounding the double product to float32 gives
+  `RN(x / c)` for every `x`, specials included; a test checks it on 4 million
+  bit patterns per constant. It costs one double multiply per element: free
+  at the usual sizes, 2 µs on a million-element division (6.8 µs, against
+  4.6 µs for the multiply that fails). A power-of-two `c` stays a multiply,
+  which is exact; `--strict` and `--plain` keep the IR's multiply.
 * **Regrouped sums.** Splitting a reduction across lanes, or updating an
   online softmax once per block, changes the order of a sum, never what is
   summed. Against numpy's answers (float64 for reductions, matmul and
@@ -449,7 +476,9 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   * lane blocking of an online softmax, which updates its state once per block
     of keys (4.3);
   * lane blocking that gives a key several lanes, which split its dot product;
-  * FMA contraction of `acc += a*b`.
+  * FMA contraction of `acc += a*b`;
+  * the correctly rounded division by a constant (it is more accurate than the
+    IR's multiply by the reciprocal, but not the IR's own operations).
 
   Everything else stays, because it does not change a single bit:
   * fusion, congruent accumulators and CSE;
@@ -518,6 +547,18 @@ attention kernels 25-40% faster.
   run, the largest error 10.5% of its tolerance. Launching the kernels that use shared
   memory or barriers eight times each gives bit-identical outputs (apart from atomic
   split-K sums), so no result depends on a race.
+* `tools/corpus_holdout2.py` is a second held-out set, written on 26 Oct after every
+  optimization above: prime and odd sizes, single rows and queries, middle-axis and column
+  reductions, matrix-vector and batched products, fused epilogues around a matmul, causal and
+  multi-head attention, float16. 64 of 66 pass; the other two no compiler can pass (the
+  generator lists a consumer kernel first; emmy traces `A @ v` into a 500x300 output). It
+  found the division by a constant (section 7), which nvcc's build of emmy's CUDA fails too.
+* `compile.py --report` (`report.py`) prints what the lowering decided for a kernel, as it
+  decided it (`Lowerer.remark`): each loop's shape (split across lanes with its group and
+  dealing, lane-blocked with its block, dealt, unrolled, rolled), fused loops, merged
+  accumulators, re-mapped cells, one-barrier trees, FMA contractions, merged vector loads,
+  launch hints, then a static count of the PTX's instructions by kind. The PTX is the same
+  with or without it.
 * `tools/ref_bench.py` races our PTX against nvcc's build of emmy's reference
   CUDA on identical launches. Timings move by about 2 µs from run to run, so
   every scheduling decision above was kept only after an A/B comparison
@@ -537,7 +578,8 @@ These raise a clear error (and so cannot reach the GPU half-lowered):
 * TMA descriptors and mbarriers; a TMA descriptor is built on the host, which
   the runner's API cannot pass.
 * `SetMaxNReg`, `Carry` and `Pre`.
-* The Volta m8n8k4 fragment layout, and fp8/fp4 block-scaled fragments.
+* The Volta m8n8k4 fragment layout, and the fp8 (m16n8k32) and fp4
+  block-scaled tensor-core fragments (fp8 elementwise casts are supported).
 
 Emmy produces these only for other GPUs and for warp-specialized pipelines. Double-precision `tanh`, `erf`, `sin`,
 `cos` and `pow` are computed in single precision (section 7).

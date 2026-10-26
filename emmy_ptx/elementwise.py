@@ -23,6 +23,9 @@ from . import mathlib
 from .builder import NUMPY_FLOAT, Builder, Value, float_type
 
 INTEGER_DTYPES = frozenset({"i16", "i32", "i64", "u8", "u16", "u32", "u64"})
+# fp8 formats: a value is its byte code in an s32 register; no arithmetic runs on it, only the
+# decode cast (from_f8*) out of it and the encode cast (to_f8*) into it
+F8_DTYPES = frozenset({"f8e4m3", "f8e5m2"})
 INTEGER_OPS = frozenset({
     "add", "subtract", "multiply", "floor_divide", "remainder", "mod",
     "left_shift", "right_shift", "bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_count",
@@ -38,7 +41,7 @@ def value_type(dtype: str) -> str:
         return dtype
     if dtype in ("i64", "u64"):
         return "s64"
-    if dtype in INTEGER_DTYPES or dtype == "bool":
+    if dtype in INTEGER_DTYPES or dtype in F8_DTYPES or dtype == "bool":
         return "s32"
     raise ValueError(f"unsupported dtype {dtype!r}")
 
@@ -56,6 +59,8 @@ def promote(op: str, dtypes: list[str]) -> str:
 
 def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     """``op(*args)`` with result dtype ``dtype``."""
+    if op in _F8_CASTS:
+        return _F8_CASTS[op](b, args[0])
     out_type = value_type(dtype)
     if out_type in ("s32", "s64") and op in _INT:
         args = [b.convert(a, out_type) for a in args]
@@ -70,6 +75,38 @@ def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     else:
         args = [b.convert(a, ftype) for a in args]
     return b.convert(fn(b, *args), out_type)
+
+
+def _decode_f8(fmt: str):
+    """``from_f8*``: an fp8 byte code to f32. ``cvt.rn.f16x2.<fmt>x2`` widens a
+    pair of codes to two halves exactly (every e4m3 and e5m2 value is an f16;
+    e4m3's 0x7f/0xff come out NaN, e5m2's infinities and NaNs stay), and the
+    low half is the code's value."""
+    def fn(b: Builder, code: Value) -> Value:
+        b.k.require("8.1")  # fp8 conversions on sm_89
+        pair = b.pure("cvt.u16.u32", "u16", (b.in_reg(b.convert(code, "s32")),))
+        halves = b.pure(f"cvt.rn.f16x2.{fmt}x2", "b32", (pair,))
+        return b.pure("cvt.f32.f16", "f32", (b.pure("cvt.u16.u32", "u16", (halves,)),))
+    return fn
+
+
+def _encode_f8(fmt: str):
+    """``to_f8*``: f32 to an fp8 byte code, rounding to nearest even and
+    saturating to the largest finite value, NaN to 0x7f: emmy's encode (the
+    ``__NV_SATFINITE`` conversion of cuda_fp8.h), one ``cvt.rn.satfinite``.
+    The instruction packs two values; both are x, and the low byte is kept."""
+    def fn(b: Builder, x: Value) -> Value:
+        b.k.require("8.1")  # fp8 conversions on sm_89
+        x = b.in_reg(b.convert(x, "f32"))
+        pair = b.pure(f"cvt.rn.satfinite.{fmt}x2.f32", "u16", (x, x))
+        return b.bitop("&", b.pure("cvt.u32.u16", "s32", (pair,), 0, 0xFFFF), b.int_const(0xFF))
+    return fn
+
+
+_F8_CASTS = {
+    "from_f8e4m3": _decode_f8("e4m3"), "from_f8e5m2": _decode_f8("e5m2"),
+    "to_f8e4m3": _encode_f8("e4m3"), "to_f8e5m2": _encode_f8("e5m2"),
+}
 
 
 def _as_float(b: Builder, p: Value) -> Value:

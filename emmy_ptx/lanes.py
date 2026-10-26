@@ -257,7 +257,12 @@ class LaneSharing:
             plan = mapping.blocked(s, n, first, step_, group, 1, uniform)
             if plan is not None:
                 share = 1 if self.strict else self._key_lanes(plan, s.axis.name, step_, group)  # (lanes split a dot)
-                return mapping.blocked(s, n, first, step_, group, share, uniform) if share > 1 else plan
+                plan = mapping.blocked(s, n, first, step_, group, share, uniform) if share > 1 else plan
+                if plan is not None:
+                    online = "; the online softmax updated once per block" if mapping.online_groups(s.body) else ""
+                    self.remark(f"loop {s.axis.name} ({n} trips): lane-blocked, groups of {group} lanes taking "
+                                f"{group // share} iterations a block, {share} lane{'s' if share > 1 else ''} each{online}")
+                return plan
             group //= 2
         return None
 

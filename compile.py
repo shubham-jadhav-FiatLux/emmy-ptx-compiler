@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile one Emmy Kernel-IR file to PTX.
 
-    python compile.py [--strict] [--plain] path/to/<kernel>.ir.json > out.ptx
+    python compile.py [--strict] [--plain] [--report] path/to/<kernel>.ir.json > out.ptx
 
 PTX goes to stdout; diagnostics go to stderr. ``meta.json`` must sit next to
 the IR file (it names the kernel parameters in launch order).
@@ -10,7 +10,8 @@ the IR file (it names the kernel parameters in launch order).
 rounding (sums regrouped across lanes, an online softmax updated once per
 block, FMA contraction of ``acc += a * b``): every result is then bit for bit
 what the IR's own order of operations gives. ``--plain`` gives the fallback
-lowering, without any optional rewrite (for testing it).
+lowering, without any optional rewrite (for testing it). ``--report`` writes
+to stderr what the lowering decided for the kernel and a profile of its PTX.
 """
 
 import sys
@@ -22,17 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from emmy_ptx import compile_file  # noqa: E402
 
 
-FLAGS = ("--strict", "--plain")
+FLAGS = ("--strict", "--plain", "--report")
 
 
 def main(argv: list[str]) -> int:
     flags = {a for a in argv[1:] if a.startswith("--")}
     paths = [a for a in argv[1:] if not a.startswith("--")]
     if len(paths) != 1 or flags - set(FLAGS):
-        print("usage: python compile.py [--strict] [--plain] <kernel>.ir.json > out.ptx", file=sys.stderr)
+        print("usage: python compile.py [--strict] [--plain] [--report] <kernel>.ir.json > out.ptx", file=sys.stderr)
         return 2
     try:
-        ptx = compile_file(paths[0], plain="--plain" in flags, strict="--strict" in flags)
+        ptx = compile_file(paths[0], plain="--plain" in flags, strict="--strict" in flags, report="--report" in flags)
     except Exception:  # report everything; stdout must stay clean
         traceback.print_exc(file=sys.stderr)
         return 1

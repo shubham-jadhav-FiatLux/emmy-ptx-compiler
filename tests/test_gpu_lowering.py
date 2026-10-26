@@ -486,3 +486,72 @@ def test_tensor_core_tile_added_atomically_as_f16_pairs():
     tail = (RegStore("out", (I(0), I(0)), "acc", shape, atomic=True), RegStore("out", (I(0), I(0)), "acc", shape, atomic=True))
     got = run(_one_warp_mma(F32, tail), {"a": a, "bt": bt}, {"out": (16, 8)}, 1, 32, out_dtype="f16")["out"]
     assert np.allclose(got.astype(np.float64), 2 * prod, rtol=5e-3, atol=5e-3)
+
+
+def test_division_by_a_constant_is_correctly_rounded():
+    """emmy spells x / c as x * reciprocal(c). Outside loops the optimized
+    lowering computes the correctly rounded quotient that numpy's x / c gives
+    (pointwise problems compare with rtol = 0); the strict and plain lowerings
+    keep the IR's multiply by RN(1/c)."""
+    n = 4096
+    # (no quotient overflows: the runner returns infinities as null)
+    x = np.concatenate([rng.standard_normal(n - 6), [0.0, -0.0, 1e-40, -3e37, 3e37, 1e30]]).astype(np.float32)
+    consts = [3.0, 7.0, -0.1, 0.5]
+    stmts = [Load(name="x", input="xs", index=(Var("i"),))]
+    for k, c in enumerate(consts):
+        stmts += [Let(name=f"c{k}", value=Literal(c), dtype=F32), Assign(f"r{k}", "reciprocal", (f"c{k}",)),
+                  Assign(f"q{k}", "multiply", ("x", f"r{k}")), Write("out", (I(k), Var("i")), f"q{k}")]
+    body = [Tile(axes=(Axis("i", Dim(n)),), body=tuple(stmts))]
+    got = run(body, {"xs": x}, {"out": (len(consts), n)}, n // 256, 256)["out"]
+    for k, c in enumerate(consts):
+        c32 = np.float32(c)
+        want = x / c32 if not LOWERING else x * np.float32(1 / c32)
+        assert np.array_equal(got[k], want), (c, LOWERING)
+
+
+def test_fp8_decode_and_encode_match_emmys_definitions():
+    """from_f8* / to_f8* against emmy's own reference tables (dtype.decode_f8,
+    encode_f8): all 256 codes of each format decoded, and float32 values of
+    every kind encoded (rounding ties, the largest finite values, saturation,
+    subnormals, infinities and NaN). The runner has no byte buffers, so the
+    codes travel four to an int32."""
+    from emmy.compiler.dtype import F8E4M3, F8E5M2, decode_f8, encode_f8
+
+    n = 1024
+    xs = np.concatenate([rng.standard_normal(n // 2) * 100, rng.standard_normal(n // 4) * 0.01,
+                         np.ldexp(rng.integers(8, 32, n // 4 - 16), -rng.integers(0, 24, n // 4 - 16)),
+                         [0.0, -0.0, 448.0, 464.0, 480.0, -500.0, 57344.0, 61440.0, 1e30, -1e30,
+                          np.inf, -np.inf, np.nan, 2.0 ** -9, 2.0 ** -10, 2.0 ** -17]]).astype(np.float32)
+    codes = np.arange(256, dtype=np.uint8)
+    for fmt, dt in (("f8e4m3", F8E4M3), ("f8e5m2", F8E5M2)):
+        body = [Tile(axes=(Axis("i", Dim(n)),), body=(
+            Load(name="x", input="xs", index=(Var("i"),)),
+            Assign("c", f"to_{fmt}", ("x",), dtype=dt),
+            Write("enc", (Var("i"),), "c"),
+            Cond(cond=B("<", Var("i"), I(256)), body=(
+                Load(name="k", input="codes", index=(Var("i"),)),
+                Assign("v", f"from_{fmt}", ("k",), dtype=F32),
+                Write("dec", (Var("i"),), "v"),
+            )),
+        ))]
+        buffers = {"xs": Buffer("xs", (n,), "f32"), "codes": Buffer("codes", (256,), fmt),
+                   "enc": Buffer("enc", (n,), fmt), "dec": Buffer("dec", (256,), "f32")}
+        src = KernelSource("k_test", tuple(body), ("xs", "codes", "enc", "dec"), buffers, Launch(n // 256, 256, 0),
+                           frozenset({"enc", "dec"}))
+        ptx = Lowerer(src, **LOWERING).run().render(PTX_VERSION, TARGET)
+        c = requests.post(f"{RUNNER}/compile", json={"ptx": ptx}, timeout=120).json()
+        assert c.get("ok"), c.get("stderr")
+        args = [dict(name="xs", dtype="f32", shape=[n], data=[float(v) if np.isfinite(v) else str(v) for v in xs]),
+                dict(name="codes", dtype="i32", shape=[64], data=codes.view(np.int32).tolist()),
+                dict(name="enc", dtype="i32", shape=[n // 4], output=True),
+                dict(name="dec", dtype="f32", shape=[256], output=True)]
+        r = requests.post(f"{RUNNER}/run", json={
+            "cubin_id": c["cubin_id"], "entry": "k_test", "grid": [n // 256, 1, 1], "block": [256, 1, 1], "smem_bytes": 0,
+            "zero_outputs": [], "args": args, "warmup": 0, "iters": 1, "max_return": 1 << 16}, timeout=120).json()
+        assert r.get("ok"), r.get("stderr")
+        enc = np.array(r["outputs"]["enc"]["values"], np.int64).astype(np.int32).view(np.uint8)
+        assert np.array_equal(enc, encode_f8(xs, fmt)), fmt
+        dec = np.array([np.nan if v is None else v for v in r["outputs"]["dec"]["values"]], np.float32)
+        want = decode_f8(codes, fmt)
+        finite = np.isfinite(want)
+        assert np.array_equal(dec[finite], want[finite]), fmt  # (the runner returns inf and NaN as null)

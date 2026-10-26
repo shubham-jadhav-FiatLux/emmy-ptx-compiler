@@ -10,6 +10,7 @@ pip install -r requirements.txt          # Python 3.12+, emmy-ml 0.3.11, numpy
 python compile.py path/to/<kernel>.ir.json > out.ptx            # PTX on stdout, diagnostics on stderr
 python compile.py --strict path/to/<kernel>.ir.json > out.ptx   # no rewrite that changes rounding
 python compile.py --plain path/to/<kernel>.ir.json > out.ptx    # the fallback lowering alone
+python compile.py --report path/to/<kernel>.ir.json > out.ptx   # what the compiler decided, on stderr
 ```
 
 `meta.json`, next to the IR, supplies the parameter order and the launch. With
@@ -37,9 +38,11 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   * f16, on the tensor cores and elsewhere (each operation computed in f32
     and rounded once to f16);
   * f64 in true double precision, with double exp, log and sigmoid;
-  * 8- to 64-bit integers with C semantics, and bool.
+  * 8- to 64-bit integers with C semantics, and bool;
+  * fp8 (e4m3 and e5m2): loads, stores and emmy's encode and decode casts,
+    with sm_89's `cvt.rn.satfinite`, bit for bit as emmy defines them.
 * Every elementwise op emmy's CUDA renderer can emit, including the integer
-  bit operations (fp8/fp4 conversions aside).
+  bit operations (fp4 conversions aside).
 * Multi-kernel problems: split-K partials, and chains passing intermediates.
 
 **Performance, from the GPU's structure**
@@ -71,6 +74,9 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   the IR's own order of operations gives it; checked on 371 problems.
 * `--plain`: if an optimization ever fails, the kernel is lowered again
   without the optional rewrites. That fallback is tested on every problem.
+* `--report` shows what the compiler did to any kernel: the shape it gave
+  each loop (split across lanes, lane-blocked, unrolled...), the cells it
+  moved, the trees it folded, and a profile of the PTX.
 
 **Novelty**
 * The merge of two online-softmax states derived from the IR's own update,
@@ -81,13 +87,16 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
 * One `exp` for both factors of an online-softmax step.
 * Accurate math routines: minimax polynomials with exact argument
   reductions, measured at ≤ 1 to 3 ulp over about a million inputs per range.
+* Division by a constant correctly rounded with one double multiply: emmy's
+  `x * reciprocal(3.0)` can be an ulp off numpy's `x / 3.0`, which nvcc's
+  build fails at `rtol = 0` (DESIGN 7).
 
 **Testing**
-* 176 tests: unit, compile and GPU tests, each kernel lowered three ways,
+* 193 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking.
-* About 400 problems, generated with the organisers' tool: the open set, a
-  wider corpus of 200 (20 of them f16), a schedule sweep of 106, and a
-  held-out set of 81 written after the compiler.
+* 468 problems, generated with the organisers' tool: the open set, a wider
+  corpus of 200 (20 of them f16), a schedule sweep of 106, and two held-out
+  sets (81, then 66) written after the compiler.
 * Tools for an nvcc race (`tools/ref_bench.py`), math accuracy
   (`tools/mathtest.py`), and bit-for-bit equality of two builds
   (`tools/bitwise.py`).
@@ -104,12 +113,13 @@ launch from `meta.json`:
 | Tensor cores (float16: emmy's `mma.sync` matmul, flash-attention and SDPA schedules) | **20 / 20** of the corpus's f16 problems pass; 0.76x the time of nvcc's build (geometric mean of 19, never slower) |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
-| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (every problem above) |
+| Second held-out set (`tools/corpus_holdout2.py`: 66 problems written on 26 Oct, after every optimization) | **64 / 66** pass. The other two fail for any compiler, nvcc's build included: the generator lists a consumer kernel before its producer, and emmy traces `A @ v` into a 500x300 output. The set found one bug: emmy's `x * reciprocal(3.0)` is an ulp off numpy's `x / 3.0` at `rtol = 0`, so it is now computed as the correctly rounded quotient (nvcc's build still fails it; `--strict` and `--plain` keep emmy's multiply, 62 / 66) |
+| Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (the open set, corpus, sweep and first held-out set) |
 | Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **402 / 402** pass; on the 371 problems without float atomics, outputs bit-identical to the plain lowering's (so every rewrite it keeps is exact) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 176 (72 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Tests | 193 (78 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -171,13 +181,17 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   rewrites. That lowering is slower but passes every problem above too.
 * **Numerics.** Elementwise arithmetic is IEEE with explicit round-to-nearest,
   in the precision of each result (an f64 result in double, which emmy's own
-  CUDA does not do), so pointwise kernels reproduce numpy bit for bit.
+  CUDA does not do), so pointwise kernels reproduce numpy bit for bit; a
+  division by a constant, which emmy spells as a multiply by its reciprocal,
+  is computed as the correctly rounded quotient. fp8 values are byte codes
+  that only emmy's encode and decode casts touch.
   `exp`, `log`, `tanh`, `erf`, `sin`, `cos` and `pow` are accurate routines
   built from minimax polynomials and exact argument reductions (`exp`, `log`
   and `sigmoid` also in double precision). Splitting a
   reduction regroups its sum (well within the tolerances); folds that are not
   split keep the IR's order. `--strict` turns off every rewrite that changes
-  rounding (lane splits, softmax updates per block, FMA contraction).
+  rounding (lane splits, softmax updates per block, FMA contraction, the
+  quotient in place of emmy's multiply by a reciprocal).
 
 [docs/DESIGN.md](docs/DESIGN.md) explains each part, with the measurements behind
 the choices.
@@ -201,6 +215,7 @@ emmy_ptx/
   elementwise.py       Assign/Accum operations and emmy's dtype rules
   mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid (exp, log, sigmoid also in float64)
   ptx.py               registers, operands, instructions, module text
+  report.py            compile.py --report: the lowering's decisions and a PTX profile
 tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
                        interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
@@ -222,6 +237,7 @@ python tools/run_suite.py <problems-dir> [--bench] [--strict] [--plain]
 # build the wider corpus with the organisers' generator (needs torch)
 python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --out corpus
 python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --specs tools/corpus_knobs.py --out corpus_knobs
+python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --specs tools/corpus_holdout2.py --out holdout2
 
 # race against nvcc's build of the reference CUDA (development only)
 python tools/ref_bench.py <problems-dir> --nvcc <nvcc>

@@ -45,8 +45,12 @@ class CellLayout:
         n = math.prod(extents) if extents else 1
         cells = s.block_threads or DEFAULT_BLOCK
         spread = self._spread(s, n)
+        if spread > 1:
+            self.remark(f"cells: idle threads join them, {spread} lanes per cell")
         plan = self._placement(s, extents) if self.place and spread == 1 else None
         if plan is not None:
+            self.remark(f"cells: each row's cells moved onto aligned groups of "
+                        f"{' + '.join(map(str, plan.parts))} lanes, so they share its work")
             self.shared_loop = False
             self._placed_tile(s, plan, extents)
             self.placed_shared |= self.shared_loop

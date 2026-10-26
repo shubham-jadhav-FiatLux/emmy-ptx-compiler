@@ -15,12 +15,15 @@ MEM_TYPE = {
     "f32": "f32", "f16": "f16", "f64": "f64", "bf16": "bf16",
     "i32": "s32", "i64": "s64", "i16": "s16", "i8": "s8",
     "u8": "u8", "u16": "u16", "u32": "u32", "u64": "u64", "bool": "u8",
+    # fp8 values travel as their byte codes (see elementwise.py: only the casts look inside)
+    "f8e4m3": "u8", "f8e5m2": "u8",
 }
 # C type names used by Smem declarations -> emmy dtype names
 C_TYPE = {
     "float": "f32", "__half": "f16", "half": "f16", "__nv_bfloat16": "bf16", "double": "f64",
     "int": "i32", "unsigned": "u32", "unsigned int": "u32", "long long": "i64",
     "unsigned long long": "u64", "unsigned char": "u8", "char": "i8", "short": "i16",
+    "__nv_fp8_e4m3": "f8e4m3", "__nv_fp8_e5m2": "f8e5m2",
 }
 # memory type -> the value type it is computed in after loading
 VALUE_TYPE = {

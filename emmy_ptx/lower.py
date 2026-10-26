@@ -97,6 +97,9 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self._lane_bytes = 0  # size of the lane buffer
         self._stashed: dict = {}  # broadcast value -> where stmt_LaneStash put it
         self._static_smem = 0  # bytes of static shared arrays (None: a dynamic pool)
+        self._fmas = 0  # Accum updates contracted into an FMA (for the report)
+        self._loops = 0  # loops around the statement being lowered
+        self._reciprocal_of: dict[str, Value] = {}  # SSA name -> the constant it is the reciprocal of
         self.shared = self._layout_shared()
         self.globals = self._prologue()
         self._readonly = frozenset(n for n, g in self.globals.items() if g.readonly)
@@ -122,8 +125,18 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self.kernel.flatten()
         eliminate_dead_code(self.kernel)
         if not self.plain:
-            vectorize_loads(self.kernel, self.b.align)
+            merged = vectorize_loads(self.kernel, self.b.align)
+            if merged:
+                self.remark(f"{merged} adjacent loads merged into vector loads")
+        if self._fmas:
+            self.remark(f"{self._fmas} multiply-adds contracted into FMA")
+        one_wave = "; .minnctapersm 1 (the grid fits in one wave)" if self.kernel.minnctapersm else ""
+        self.remark(f"launch hints: .maxntid {self.src.launch.block}{one_wave}")
         return self.kernel
+
+    def remark(self, text: str) -> None:
+        """Note a decision for ``compile.py --report``."""
+        self.kernel.remarks.append(text)
 
     def body(self, stmts) -> None:
         stmts = list(stmts if self.plain else _issue_loads_early(stmts, self._readonly))
@@ -132,7 +145,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             s = stmts[i]
             if not self.plain:
                 # later loops over the same iterations join this one (exact; see mapping.py)
-                s = mapping.absorb_siblings(stmts, i, self._fusable)
+                fused = mapping.absorb_siblings(stmts, i, self._fusable)
+                if fused is not s:
+                    self.remark(f"loop {s.axis.name}: later loops over the same iterations fused into it")
+                s = fused
                 if kind(s) == "StridedLoop" and self.converged:
                     s = self._regrouped(stmts, i, s)
             handler = getattr(self, "stmt_" + kind(s), None)
@@ -171,7 +187,11 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         start = self.expr(s.start)  # the thread's rank among the cooperating threads
         if start.lo != 0 or start.hi is None or not fully_combined(stmts, i, accs, start.hi + 1):
             return s
-        return regroup(s, start.hi, step, int(s.axis.extent.as_static())) or s
+        chunked = regroup(s, start.hi, step, int(s.axis.extent.as_static()))
+        if chunked is None:
+            return s
+        self.remark(f"loop {s.axis.name}: the {step} cooperating threads take contiguous chunks instead of a stride")
+        return chunked
 
     def _fusable(self, s, t) -> bool:
         """May sibling loops ``s`` and ``t`` be fused? Only loops that stay loops:
@@ -522,7 +542,11 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         with self.block(dominated=True):
             if end_name:  # the hoisted bound is visible to the body
                 self.scope.names[end_name] = end
-            self._loop_body(s, start, step, end, trips, size)
+            self._loops += 1
+            try:
+                self._loop_body(s, start, step, end, trips, size)
+            finally:
+                self._loops -= 1
         for member, rep_ in aliases.items():  # equal at every iteration, so equal after the loop
             self.scope.rebind(member, self.lookup(rep_))
 
@@ -540,6 +564,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         body = merge_congruent(s.body, members) if members else None
         if body is None:
             return s, {}
+        self.remark(f"loop {s.axis.name}: {len(members)} accumulators proven equal to others and merged")
         # what fed only the dropped updates (a member's own inner loops, say) is now dead, and the
         # members' copies of the representative's arithmetic are repeats
         return replace(s, body=drop_needless_snapshots(mapping.cse(mapping.prune_dead(body)))), members
@@ -549,20 +574,27 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         plan = self._split_plan(s, start, step, end, trips)
         blocked = self._blocked(s, start, step, end, trips) if plan is None else None
         dealt = self._dealt(s, start, step, end, trips) if plan is None and blocked is None else 0
+        name = s.axis.name
         if plan is not None:
+            jam = f", {plan.jam} of a lane's iterations lowered as one body" if plan.jam > 1 else ""
+            self.remark(f"loop {name} ({trips[0]} trips): reduction split over {plan.group} lanes, "
+                        f"{plan.vector} iterations at a time{jam}")
             self._split_reduction(s, start, step, end, trips[0], plan)
         elif blocked is not None:
             self._lower_blocked(blocked)
         elif dealt:
+            self.remark(f"loop {name} ({trips[0]} trips): independent iterations dealt over {dealt} lanes")
             self._deal(s, start, step, end, trips[0], dealt)
         elif trips is not None and (_indexes_fragments(s) or trips[1] * size <= UNROLL_BUDGET
                                     and (s.unroll or trips[1] <= self._auto_unroll(s))):
+            self.remark(f"loop {name}: unrolled ({trips[1]} trips)")
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
                 self._guarded_iteration(s.axis.name, v, s.body, end, guard=k >= trips[0])
         else:
             partly = step.const is not None and not self.plain
             factor = _unroll_factor(size, self.src.launch.grid <= TARGET_SMS, trips) if partly else 1
+            self.remark(f"loop {name}: rolled" + (f", {factor} iterations a trip" if factor > 1 else ""))
             self._rolled(s, start, step, end, trips, factor)
 
     def _auto_unroll(self, s) -> int:
@@ -705,12 +737,54 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         args = [self.value(a) for a in s.args]
         op = s.op.name
         dtype = s.dtype.name if s.dtype is not None else elementwise.promote(op, [_dtype_of(a) for a in args])
-        v = elementwise.apply(self.b, op, args, dtype)
+        quotient = self._constant_quotient(s, op, args, dtype)
+        if quotient is not None:
+            v = self._quotient(*quotient, elementwise.value_type(dtype))
+        else:
+            v = elementwise.apply(self.b, op, args, dtype)
+        self._reciprocal_of.pop(s.name, None)
+        if op == "reciprocal" and len(args) == 1 and args[0].const is not None:
+            self._reciprocal_of[s.name] = args[0]
         if (op == "multiply" and v.type == "f32" and v.const is None and all(a.type == "f32" for a in args)
                 and all(a.key() is not None for a in args)  # a variable read only with its version
                 and v.key() not in [a.key() for a in args]):  # a real product (x * 1 folds away)
             self.products[v.key()] = (args[0], args[1])  # an Accum may fuse it into an FMA
         self.define(s.name, v)
+
+    def _constant_quotient(self, s, op: str, args, dtype: str) -> tuple[Value, Value] | None:
+        """``(x, c)`` when Assign ``s`` multiplies x by the reciprocal of a
+        constant c outside every loop, with a float32 or float16 result: emmy
+        spells ``x / 3.0`` that way, and x * RN(1/3) can be an ulp from the
+        correctly rounded quotient that numpy's ``x / 3.0`` gives (pointwise
+        problems compare with rtol = 0). A power-of-two c, whose reciprocal is
+        exact, stays a multiply. ``--strict`` and ``--plain`` keep the IR's
+        own operations."""
+        if op != "multiply" or len(args) != 2 or self.strict or self.plain or self._loops:
+            return None
+        if elementwise.value_type(dtype) not in ("f32", "f16"):
+            return None
+        for i in (0, 1):
+            name = s.args[i] if isinstance(s.args[i], str) else getattr(s.args[i], "name", None)
+            c = self._reciprocal_of.get(name)
+            if c is None or c.const in (0.0, None) or not math.isfinite(c.const):
+                continue
+            if math.frexp(c.const)[0] in (0.5, -0.5):
+                return None  # 1/c is exact: the multiply is already the quotient
+            self.remark("x * reciprocal(c) for a constant c computed as the correctly rounded x / c")
+            return args[1 - i], c
+        return None
+
+    def _quotient(self, x: Value, c: Value, out_type: str) -> Value:
+        """``x / c`` for a float32 constant c, correctly rounded, without
+        ``div.rn.f32`` (a subroutine with a slow path, whose call keeps ptxas
+        from moving loads across it: a row normalization ran 3.2 -> 4.5 us).
+        In double, x * RN(1/c) is within 2^-52 of x / c, while x / c is never
+        closer than 2^-49 to a float32 rounding boundary (x, c and a boundary's
+        odd 25-bit significand cannot line up exactly), so rounding it to
+        float32 gives RN(x / c) for every x, special values included."""
+        b = self.b
+        wide = b.fbin("*", b.convert(b.convert(x, "f32"), "f64"), b.float_const(1.0 / c.const, "f64"))
+        return b.convert(b.convert(wide, "f32"), out_type)
 
     def stmt_Accum(self, s) -> None:
         b = self.b
@@ -727,6 +801,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 # a factor read from a variable must still hold (alpha * l fuses into l's own update)
                 if factors is not None and addend.type == "f32" and all(b.current(f) for f in factors):
                     new = b.fma(factors[0], factors[1], addend)
+                    self._fmas += 1
                     break
         if new is None:
             new = elementwise.apply(b, canon, [base, b.convert(value, acc.type)], _dtype_name(acc.type))
@@ -946,6 +1021,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             b.emit("bar.sync", Imm(0, "u32"))
         else:
             b.emit("bar.sync", Imm(s.barrier_id, "u32"), Imm(int(s.barrier_count), "u32"))
+        self.remark(f"halving tree over {length} partials: each thread folds them in the tree's order, "
+                    f"1 barrier instead of {length.bit_length() - 1}")
         for st, v in zip(s.state, level[0]):
             self.reassign(st, v)
 
