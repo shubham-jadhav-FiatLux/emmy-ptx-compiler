@@ -381,6 +381,80 @@ after it. The same scheme merges a cell that spans a block's warps (4.4): each
 warp's butterfly total goes to shared memory, and after one barrier every
 thread folds the W totals.
 
+### 4.8 Work repeated across blocks: thread-block clusters (`cluster.py`)
+
+Lane sharing stops at the edge of a block. Some emmy schedules give every
+block one output and have it recompute what its neighbouring blocks compute
+too. `gelu(x @ w1) @ w2`, fused into one kernel of 4096 blocks of 8 threads,
+recomputes the 512 hidden units of a row once for each of that row's 128
+output columns. Hopper and Blackwell let neighbouring blocks share work
+through distributed shared memory:
+
+* The module declares `.reqnctapercluster 8, 1, 1`, so the unchanged launch
+  runs in clusters of 8 neighbouring blocks: neighbouring columns of one row.
+* `mapping.dependents` splits the loop into a shared part, which does not
+  depend on the column (the dot products and the gelu), and an own part, which
+  does (the column's weights and its fold).
+* Block r of a cluster runs the shared part of its threads' iterations
+  `[r K/8, (r+1) K/8)` and stores the results in its shared memory. After one
+  cluster barrier, every block runs the own part of all K iterations, reading
+  each result from the block that computed it (`mapa` +
+  `ld.shared::cluster`). A second barrier keeps each block's shared memory
+  alive until the others have read it.
+
+Every value is computed as before and folded in the same order, so the result
+is bit for bit the same, under `--strict` too. The fused MLP runs in 173 µs
+instead of 389 (nvcc's build: 408).
+
+* **Cluster size.** 8 blocks is the portable maximum, and it measured best:
+  4 blocks took 349 µs and 2 blocks 656 µs, because scheduling clusters of
+  8-thread blocks costs more than small clusters save.
+* **When it applies.** A loop is split only when its shared part takes at
+  least 2048 inner iterations per thread. One of the 493 kernels has this
+  shape.
+* **Fused MLPs emmy tiles instead** (corpus round 6, with gelu, relu, tanh and
+  silu) share their hidden layer within blocks by lane blocking (4.3). They
+  run at 0.01 to 0.08 of nvcc's time.
+* **Attention is left alone.** Its column blocks (two to eight per row) also
+  repeat their scores, but sharing them would take a cluster barrier for each
+  block of keys, about 0.4 µs apiece, which costs about what it saves.
+
+### 4.9 Two cells a thread for SIMT matmuls (`coarsen.py`)
+
+Emmy's f32 matmul schedules stage tiles of A and B in shared memory with
+`cp.async`, and give each thread a small cell of outputs: 2 x 2 for a 512³
+matmul on blocks of 512 threads. Each multiply-add then costs its own
+shared-memory load. Per step of k, a warp loads 64 values of B and two
+broadcast values of A for 128 multiply-adds, so shared memory sets the pace,
+not the FMA units. Measured on m01, a hand-written split of the kernel: the
+copies alone take 8.5 µs, emmy's arithmetic alone 12.9 µs, and the measured
+peak rate allows 4.1 µs for its million multiply-adds per SM.
+
+Two cells that hold the same columns share their B values. So:
+
+* In a Tile whose cells are rows x columns of a block of at least 512
+  threads, with the cell columns a multiple of a warp, the threads of the
+  first half of the block each compute two neighbouring cells, rows 2p and
+  2p+1.
+* Both cells' work goes into one inner loop, so each step of k loads B once
+  for both. The second, identical loads disappear inside ptxas, which removes
+  repeated shared loads within a basic block.
+* The other half of the block only fills the tiles.
+
+Each cell's sum keeps its order, so the results are bit for bit the same.
+Four kernels have this shape:
+
+| problem | before | two cells a thread |
+|---|---|---|
+| m01_matmul_512 (open set) | 15.9 µs | 12.9 µs |
+| x_mm__raster-gn8 | 6.6 µs | 4.9 µs |
+| x_mm_rect__reduce-g4a | 7.1 µs | 4.9 µs |
+| hm_512x128x256 | 6.9 µs | 6.9 µs |
+
+Blocks of 256 threads gained nothing, and one ran slower (8.8 → 10.8 µs): only
+four warps would be left to compute, too few to hide the shared-memory
+latency.
+
 ## 5. Loop-body rewrites (`mapping.py`, `congruence.py`)
 
 * **Congruent accumulators.** In attention each output column a thread

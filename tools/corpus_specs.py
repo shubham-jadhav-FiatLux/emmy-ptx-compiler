@@ -480,3 +480,26 @@ OPEN += [
     sdpa16("sdpa_heads", (2, 4, 64, 32)),
     # not included: a causal (1, 2, 96, 48) sdpa, whose two kernels the generator lists consumer first
 ]
+
+
+def mlp(act: str, m: int, k: int, h: int, n: int):
+    """``act(x @ w1) @ w2`` fused into one kernel: emmy recomputes the hidden layer for every
+    output column, which the compiler shares across a cluster of blocks (cluster.py)."""
+    torch_act = {"gelu": "torch.nn.functional.gelu", "relu": "torch.relu", "tanh": "torch.tanh",
+                 "silu": "torch.nn.functional.silu"}[act]
+    np_act = {"gelu": lambda z: 0.5 * z * (1.0 + _erf(z / np.sqrt(2.0))), "relu": lambda z: np.maximum(z, 0),
+              "tanh": np.tanh, "silu": lambda z: z / (1.0 + np.exp(-z))}[act]
+    code = (f"x = torch.randn({m}, {k}); w1 = torch.randn({k}, {h}); w2 = torch.randn({h}, {n}); "
+            f"{torch_act}(x @ w1) @ w2")
+    return dict(id=f"k_mlp_{act}_{m}x{k}x{h}x{n}", code=code, ref=_c(lambda x, w1, w2: np_act(x @ w1) @ w2),
+                rtol=1e-3, atol=1e-3)
+
+
+# ---- round 6: fused MLPs, whose hidden layer emmy recomputes for every output column ----------
+OPEN += [
+    mlp("gelu", 64, 256, 1024, 128),
+    mlp("relu", 32, 128, 512, 64),
+    mlp("tanh", 16, 64, 256, 256),
+    mlp("silu", 32, 256, 512, 128),
+    mlp("gelu", 8, 512, 2048, 64),
+]

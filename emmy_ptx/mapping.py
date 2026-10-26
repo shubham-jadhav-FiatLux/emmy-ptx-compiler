@@ -64,7 +64,8 @@ PURE = ("Load", "Assign", "Let", "Accum", "Select", *LOOPS)
 # (a tensor-core fragment's elements are spread over its warp's lanes: its statements too)
 CROSS_THREAD = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve", "LaneBroadcast",
                 "LaneButterfly", "LaneStash", "RegFragment", "LdmatrixLoad", "MmaSyncPtx", "FragmentApply",
-                "FragmentRowReduce", "FragmentRepack", "FragmentPromote", "RegStore")
+                "FragmentRowReduce", "FragmentRepack", "FragmentPromote", "RegStore",
+                "ClusterSync", "ClusterStash", "ClusterLoad")
 _BUTTERFLIES = ("WarpShuffle", "TreeHalve", "LaneButterfly")  # statements that reassign their ``state``
 _EFFECTS = ("Write", "ZeroPrologue", "Init", "Smem", *CROSS_THREAD)
 _MAX = ("maximum", "amax", "fmax")
@@ -106,7 +107,7 @@ def own_reads(s) -> set[str]:
         out.update(x for a in s.combine_states for x in a.args)
     elif k == "LaneBroadcast":
         out.add(s.value)
-    elif k == "LaneStash":
+    elif k in ("LaneStash", "ClusterStash"):
         out.update(s.values)
     for e in getattr(s, "exprs", lambda: ())():
         out.update(e.free_vars())
@@ -133,7 +134,7 @@ def produced(s) -> set[str]:
     """Names statement ``s`` declares or reassigns that later statements see. A
     cross-thread statement counts as producing everything (``"*"``)."""
     k = kind(s)
-    if k == "Load":
+    if k in ("Load", "ClusterLoad"):
         return set(s.names)
     if k in ("Assign", "Let", "Init", "Select", "Accum", "Smem", "LaneBroadcast", "LaneSlot"):
         return {s.name}

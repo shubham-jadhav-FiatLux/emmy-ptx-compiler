@@ -226,6 +226,7 @@ class Kernel:
     remarks: list[str] = field(default_factory=list)  # what the lowering decided (compile.py --report)
     min_version: str = "0.0"  # the PTX ISA an instruction needs beyond the module default (fp8 casts: 8.1)
     min_target: str = "sm_0"  # the target an instruction needs beyond the default (the copy engine: sm_90)
+    cluster: int | None = None  # blocks a thread-block cluster (.reqnctapercluster), if any
     _counts: dict[str, int] = field(default_factory=dict)
     _labels: int = 0
 
@@ -279,6 +280,8 @@ class Kernel:
             out.append(f".maxntid {self.maxntid}, 1, 1")
         if self.minnctapersm:
             out.append(f".minnctapersm {self.minnctapersm}")
+        if self.cluster:
+            out.append(f".reqnctapercluster {self.cluster}, 1, 1")
         out.append("{")
         for cls, (ptx_type, prefix) in _REG_CLASSES.items():
             if cls in self._counts:

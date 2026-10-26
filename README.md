@@ -58,7 +58,11 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
     from the IR;
   * idle threads joining cells;
   * cells moved where lanes can share them;
-  * block reductions with one barrier.
+  * block reductions with one barrier;
+  * work that neighbouring blocks repeat, shared through thread-block
+    clusters and distributed shared memory (DESIGN 4.8);
+  * SIMT matmuls with two cells a thread, so a step of k loads B once for
+    both (m01 15.9 → 12.9 µs, bit for bit the same; DESIGN 4.9).
 * Memory:
   * warp loads counted in 128-byte lines;
   * shared-memory broadcasts instead of shuffles (17x cheaper, measured);
@@ -87,6 +91,8 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   not hard-coded.
 * Lane blocking and cell placement, which re-map emmy's schedules onto
   warps.
+* Thread-block clusters (Hopper and Blackwell) for work emmy repeats across
+  blocks: a fused MLP 2.2x faster, bit for bit the same.
 * Congruent-accumulator merging.
 * One `exp` for both factors of an online-softmax step.
 * Accurate math routines: minimax polynomials with exact argument
@@ -96,10 +102,10 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   build fails at `rtol = 0` (DESIGN 7).
 
 **Testing**
-* 199 tests: unit, compile and GPU tests, each kernel lowered three ways,
+* 209 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking.
-* 468 problems, generated with the organisers' tool: the open set, a wider
-  corpus of 200 (20 of them f16), a schedule sweep of 106, and two held-out
+* 473 problems, generated with the organisers' tool: the open set, a wider
+  corpus of 205 (20 of them f16), a schedule sweep of 106, and two held-out
   sets (81, then 66) written after the compiler.
 * Tools for an nvcc race (`tools/ref_bench.py`), math accuracy
   (`tools/mathtest.py`), and bit-for-bit equality of two builds
@@ -113,7 +119,7 @@ launch from `meta.json`:
 | | |
 |---|---|
 | Open problem set | **15 / 15** pass (all five categories); the four pointwise problems are bit-exact |
-| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **200 / 200** pass |
+| Wider corpus (`tools/corpus_specs.py`, generated with the organisers' tool) | **205 / 205** pass |
 | Tensor cores (float16: emmy's `mma.sync` matmul, flash-attention and SDPA schedules) | **20 / 20** of the corpus's f16 problems pass; 0.76x the time of nvcc's build (geometric mean of 19, never slower) |
 | Schedule sweep (`tools/corpus_knobs.py`: 106 EMMY_KNOBS variants, incl. split-K over two kernels) | **106 / 106** pass |
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
@@ -121,9 +127,10 @@ launch from `meta.json`:
 | Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **402 / 402** pass (the open set, corpus, sweep and first held-out set) |
 | Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **402 / 402** pass; on the 371 problems without float atomics, outputs bit-identical to the plain lowering's (so every rewrite it keeps is exact) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
+| Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.01x to 0.08x** the time of nvcc's build (12x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 199 (81 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Tests | 209 (87 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -167,7 +174,12 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
     row's scores again (up to 4.9x faster on such kernels);
   * *block reductions with one barrier*: every thread folds the warps'
     partials itself, in the order emmy's halving tree would, instead of a
-    barrier per tree step.
+    barrier per tree step;
+  * *blocks that compute the same thing* (`emmy_ptx/cluster.py`): where every
+    block recomputes work that does not depend on its own output column (a
+    fused MLP's hidden layer), the kernel runs in clusters of 8 blocks. Each
+    block computes an eighth of that work and reads the rest from its
+    neighbours' shared memory (`mapa`, `ld.shared::cluster`).
 * **Loop-body rewrites** (`emmy_ptx/mapping.py`, `congruence.py`): provably
   equal accumulators are merged, repeated arithmetic removed, independent
   sibling loops fused, and the online softmax's merge of two partial states is
@@ -221,6 +233,8 @@ emmy_ptx/
   ptx.py               registers, operands, instructions, module text
   report.py            compile.py --report: the lowering's decisions and a PTX profile
   bulk.py              compile.py --bulk-copy: which cp.async fills the copy engine can take
+  cluster.py           work neighbouring blocks repeat, shared across a thread-block cluster
+  coarsen.py           two matmul cells a thread, sharing their shared-memory loads
 tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
                        interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy

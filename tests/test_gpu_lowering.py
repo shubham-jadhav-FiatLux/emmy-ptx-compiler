@@ -13,7 +13,8 @@ import sys
 import numpy as np
 import pytest
 import requests
-from kernels import rasterized_row_scale, shared_sum_added_atomically, three_column_attention
+from kernels import (column_recomputing_mlp, rasterized_row_scale, shared_sum_added_atomically, staged_matmul,
+                     three_column_attention)
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F16, F32, F64
@@ -601,3 +602,27 @@ def test_shared_fills_through_the_copy_engine():
     t = np.arange(512)
     want = np.stack([x[k * rows + (t * 7) % rows, t % cols] for k in range(stages)])
     assert np.array_equal(got["out2"], want)
+
+
+def test_work_repeated_across_blocks_is_shared_in_a_cluster():
+    """cluster.py: the 8 neighbouring blocks of a cluster each compute an
+    eighth of the hidden layer their row needs, and read the rest from each
+    other's shared memory."""
+    rows, k, hidden, cols = 2, 128, 128, 16
+    x = rng.standard_normal((rows, k)).astype(np.float32)
+    w1 = rng.standard_normal((k, hidden)).astype(np.float32)
+    w2 = rng.standard_normal((hidden, cols)).astype(np.float32)
+    got = run(column_recomputing_mlp(rows, k, hidden, cols), {"x": x, "w1": w1, "w2": w2}, {"out": (rows, cols)},
+              rows * cols, 8, ptx_has=".reqnctapercluster 8, 1, 1")["out"]
+    want = np.maximum(x.astype(np.float64) @ w1, 0) @ w2
+    assert np.allclose(got, want, rtol=1e-4, atol=1e-3)
+
+
+def test_matmul_cells_merged_in_pairs():
+    """coarsen.py: the first half of the block computes two cells a thread,
+    the other half only fills the shared tiles."""
+    rows, cols, k = 32, 64, 64
+    a = rng.standard_normal((rows, k)).astype(np.float32)
+    b = rng.standard_normal((k, cols)).astype(np.float32)
+    got = run(staged_matmul(rows, cols, k), {"a": a, "b": b}, {"out": (rows, cols)}, 1, 512)["out"]
+    assert np.allclose(got, a.astype(np.float64) @ b, rtol=1e-4, atol=1e-4)

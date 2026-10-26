@@ -78,7 +78,10 @@ class CellLayout:
             for name, v in zip((a.name for a in s.axes), coords):
                 self.scope.names[name] = v
             copy_engine = spread == 1 and not needs_guard and self._bulk_begin(s)
-            self.body(s.body)
+            shared = self._cluster_body(s) if spread == 1 and not needs_guard else None
+            if shared is None and spread == 1 and not needs_guard:
+                shared = self._coarsened_body(s)
+            self.body(shared if shared is not None else s.body)
             if copy_engine:
                 self._bulk_end()
         # cells that already share their work across lanes (one query row for all, say) gain

@@ -28,7 +28,7 @@ import contextlib
 import math
 from dataclasses import replace
 
-from . import bulk, elementwise, mapping
+from . import bulk, cluster, coarsen, elementwise, mapping
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .cells import CellLayout
 from .common import (ATOMIC_ADD, AUTO_UNROLL_TRIPS, C_TYPE, IDENTITY, MEM_TYPE, REDUCE_CANON, SMEM_UNROLL_TRIPS,
@@ -100,6 +100,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self._stashed: dict = {}  # broadcast value -> where stmt_LaneStash put it
         self._static_smem = 0  # bytes of static shared arrays (None: a dynamic pool)
         self._fmas = 0  # Accum updates contracted into an FMA (for the report)
+        self._stash_slots = 0  # iterations a block stashes for each thread (cluster.py)
         self._loops = 0  # loops around the statement being lowered
         self._reciprocal_of: dict[str, Value] = {}  # SSA name -> the constant it is the reciprocal of
         self.shared = self._layout_shared()
@@ -948,6 +949,67 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             target = self.kernel.reg("s32")
             self.b.emit("sub.s32", target, self._commits, Imm(int(s.group), "s32"), ndefs=1)
             self._bulk_wait(target)
+
+    # ---------------------------------------------------- bigger register tiles (coarsen.py)
+
+    def _coarsened_body(self, tile):
+        """The Tile's body with pairs of matmul cells computed by one thread (coarsen.py), or None."""
+        if self.plain:
+            return None
+        body = coarsen.plan(tile, self.src.launch.grid, self.src.launch.block)
+        if body is not None:
+            self.remark("cells: the first half of the block computes two cells a thread, rows 2p and 2p+1, "
+                        "sharing their B loads; the other half only fills the tiles")
+        return body
+
+    # ---------------------------------------------------- thread-block clusters (cluster.py)
+
+    def _cluster_body(self, tile):
+        """The Tile's body with a loop's column-free work shared across a
+        cluster of neighbouring blocks (cluster.py), or None."""
+        if self.plain or self.kernel.cluster:
+            return None
+        plan = cluster.plan(tile, self.src.launch.grid, self.src.launch.block)
+        if plan is None:
+            return None
+        size = plan.values * plan.slots * self.src.launch.block * 4
+        if self._static_smem is None or self._static_smem + self._lane_bytes + size > STATIC_SMEM_LIMIT:
+            return None
+        self._static_smem += size
+        self.kernel.decls.append(f".shared .align 16 .b8 {cluster.STASH}[{size}];")
+        self.kernel.cluster = cluster.CLUSTER
+        self.kernel.require_target("sm_90")
+        self._stash_slots = plan.slots
+        self.scope.names[cluster.RANK] = self.b.special("%cluster_ctarank", 0, cluster.CLUSTER - 1)
+        self.remark(f"clusters of {cluster.CLUSTER} blocks: each computes 1/{cluster.CLUSTER} of the work its "
+                    f"neighbours repeat ({plan.values} value(s) an iteration), read through distributed shared memory")
+        return plan.body
+
+    def _stash_address(self, k: int, slot) -> Value:
+        """This thread's place in the stash for value ``k`` of iteration ``slot`` (a shared address)."""
+        b = self.b
+        index = b.add(b.mul(b.add(b.int_const(k * self._stash_slots), self.expr(slot)),
+                            b.int_const(self.src.launch.block)), self.tid)
+        base = b.pure("mov.u32", "s32", (Sym(cluster.STASH),), 0, 1 << 24)
+        return b.in_reg(b.add(base, b.mul(index, b.int_const(4))))
+
+    def stmt_ClusterSync(self, s) -> None:
+        self.b.emit("barrier.cluster.arrive")
+        self.b.emit("barrier.cluster.wait")
+
+    def stmt_ClusterStash(self, s) -> None:
+        b = self.b
+        for k, name in enumerate(s.values):
+            b.emit("st.shared.f32", Mem(self._stash_address(k, s.slot).op), b.in_reg(b.convert(self.value(name), "f32")))
+
+    def stmt_ClusterLoad(self, s) -> None:
+        b = self.b
+        rank = b.in_reg(b.convert(self.expr(s.rank), "s32"))
+        for k, name in enumerate(s.names):
+            remote, out = self.kernel.reg("s32"), self.kernel.reg("f32")
+            b.emit("mapa.shared::cluster.u32", remote, self._stash_address(k, s.slot), rank, ndefs=1, effect=False)
+            b.emit("ld.shared::cluster.f32", out, Mem(remote), ndefs=1, effect=False)
+            self.define(name, Value("f32", out))
 
     # ---------------------------------------------------- the copy engine (bulk.py)
 
