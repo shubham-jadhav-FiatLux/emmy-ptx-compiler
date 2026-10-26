@@ -77,7 +77,10 @@ class CellLayout:
         with self.block(guarded=needs_guard):
             for name, v in zip((a.name for a in s.axes), coords):
                 self.scope.names[name] = v
+            copy_engine = spread == 1 and not needs_guard and self._bulk_begin(s)
             self.body(s.body)
+            if copy_engine:
+                self._bulk_end()
         # cells that already share their work across lanes (one query row for all, say) gain
         # nothing from more lanes each; cells that fold alone, one per lane, do (see run)
         self.wants_spread |= not self.shared_loop and self._spread(s, n, candidate=True) > 1

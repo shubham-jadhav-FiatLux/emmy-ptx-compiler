@@ -145,6 +145,34 @@ held-out set and the schedule sweep pass with it, and so does every GPU test.
 It is slower, because lanes no longer share work (the open set's 64×64
 attention takes 81 µs instead of 9), but it computes the same results.
 
+**The copy engine (`--bulk-copy`, `bulk.py`).** Emmy fills shared tiles with
+per-thread `cp.async` copies of 4 to 16 bytes, committed in groups and awaited
+with `cp.async.wait_group N`. With `--bulk-copy`, a fill in which each aligned
+group of lanes copies one contiguous run (consecutive, 16-byte aligned source
+and destination addresses) is handed to the copy engine instead. The run's
+first lane issues one `cp.async.bulk`, the TMA unit's one-dimensional form,
+which needs no tensor map, and it completes on an mbarrier.
+
+* `bulk.plan` proves each run by evaluating the copy's addresses with numpy
+  for every thread of the launch and every iteration of the loops around it.
+  Anything else keeps its `cp.async` (swizzled tensor-core tiles, copies in
+  branches, groups committed in another loop), and both kinds can share a
+  group.
+* A commit becomes thread 0's `mbarrier.arrive.expect_tx` for the group's
+  bytes, on one of 8 mbarriers used round robin. A wait waits in order for the
+  groups it covers: group g is mbarrier g % 8 in phase g / 8 % 2.
+* The Tile ends by waiting for every group still in flight, since a block
+  must not exit while the engine writes its shared memory.
+* The commit and wait counters live in registers that only emitted
+  instructions touch. The builder's value numbering would otherwise take them
+  for constants inside rolled loops. Such modules say `.target sm_90`.
+
+All 68 problems that fill shared memory pass with it, but it is off by
+default: on this GPU it never beat `cp.async` for emmy's fills (geometric mean
+1.18x the time over 58; runs of 2-4 KB ran 1.2-1.5x slower; m01 15.9 → 27.1
+µs). The engine pays off for large boxes, and their two-dimensional form needs
+a tensor map built on the host, which the runner's API cannot pass.
+
 ## 4. Lanes that compute the same thing (`lanes.py`, `cells.py`)
 
 Emmy's schedules often have many lanes compute the same thing: all the lanes

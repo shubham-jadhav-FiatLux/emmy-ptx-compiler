@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile problem folders with compile.py, run them on the runner, check them.
 
-    python tools/run_suite.py PROBLEMS_DIR [PROBLEMS_DIR ...] [--jobs 4] [--bench] [--strict] [--plain]
+    python tools/run_suite.py PROBLEMS_DIR [PROBLEMS_DIR ...] [--jobs 4] [--bench] [--strict] [--plain] [--bulk-copy]
 
 Each argument is a problem folder (with meta.json) or a directory of them.
 Every kernel is compiled exactly the way the evaluator does it (a fresh
@@ -10,7 +10,7 @@ outputs are compared with expected.npz under the problem's rtol/atol. The
 table also shows how close each result came to its tolerance ("margin": the
 largest |got-ref| / (atol + rtol*|ref|), so <= 1 passes) and the worst error
 in ulps, which says far more than PASS/FAIL about numerical health.
-``--strict`` and ``--plain`` are passed on to compile.py.
+``--strict``, ``--plain`` and ``--bulk-copy`` are passed on to compile.py.
 """
 
 from __future__ import annotations
@@ -132,11 +132,13 @@ def main() -> int:
     ap.add_argument("--json", help="also write the rows to this file")
     ap.add_argument("--strict", action="store_true", help="compile.py --strict: no rewrite that changes rounding")
     ap.add_argument("--plain", action="store_true", help="compile.py --plain: the fallback lowering")
+    ap.add_argument("--bulk-copy", action="store_true", help="compile.py --bulk-copy: fills through the copy engine")
     args = ap.parse_args()
 
     dirs = problem_dirs(args.paths)
     with ThreadPoolExecutor(args.jobs) as pool:
-        flags = tuple(f for f, on in (("--strict", args.strict), ("--plain", args.plain)) if on)
+        flags = tuple(f for f, on in (("--strict", args.strict), ("--plain", args.plain),
+                                      ("--bulk-copy", args.bulk_copy)) if on)
         rows = list(pool.map(lambda d: _safe(d, args.server, args.bench, flags), dirs))
     print(f"{'problem':<34} {'result':<6} {'us':>9} {'regs':>8} {'margin':>8} {'ulp':>8} {'compile':>8}")
     for r in rows:

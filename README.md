@@ -31,6 +31,10 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
     dynamic pool), `Sync` (named barriers);
   * the `cp.async` copy engine (4/8/16 bytes, swizzled, lane-indexed,
     double-buffered), `ZeroPrologue`;
+  * the bulk copy engine (`--bulk-copy`): fills that copy contiguous runs go
+    to the TMA unit as `cp.async.bulk`, completing on mbarriers. It is correct
+    on all 68 problems that fill shared memory, and off by default because
+    it was never faster here (DESIGN 3);
   * cross-lane: `WarpShuffle`, `TreeHalve`;
   * tensor cores: the eight statements of emmy's `mma.sync` path (DESIGN 6).
 * Data types:
@@ -92,7 +96,7 @@ the PTX of a reduction, an attention kernel and a tensor-core matmul.
   build fails at `rtol = 0` (DESIGN 7).
 
 **Testing**
-* 193 tests: unit, compile and GPU tests, each kernel lowered three ways,
+* 199 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking.
 * 468 problems, generated with the organisers' tool: the open set, a wider
   corpus of 200 (20 of them f16), a schedule sweep of 106, and two held-out
@@ -119,7 +123,7 @@ launch from `meta.json`:
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **14% of the tolerance** (median 0.13%); numpy's own float32 has median 0.12%, nvcc's build 0.18% and fails 2 bit-exact problems |
 | Speed against nvcc's build of emmy's reference CUDA (281 problems, same launches) | **0.56x the time** (geometric mean): attention 0.12x, chained 0.26x, fused 0.52x, reductions 0.65x, matmul 0.87x, pointwise 1.00x (launch-bound); total 3.2 ms against 78.1 ms |
 | Math library accuracy (against correctly rounded results) | exp, tanh ≤ 2 ulp · log, erf, sin, cos ≤ 1 ulp (sin/cos through 1e9) · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 193 (78 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Tests | 199 (81 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time | under 2 s per kernel (mostly importing emmy) |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -216,6 +220,7 @@ emmy_ptx/
   mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid (exp, log, sigmoid also in float64)
   ptx.py               registers, operands, instructions, module text
   report.py            compile.py --report: the lowering's decisions and a PTX profile
+  bulk.py              compile.py --bulk-copy: which cp.async fills the copy engine can take
 tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
                        interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
@@ -231,8 +236,8 @@ requirements.txt
 python -m pytest tests
 
 # compile, run and check problem folders on the runner (margin = share of the tolerance used);
-# --strict and --plain are passed on to compile.py
-python tools/run_suite.py <problems-dir> [--bench] [--strict] [--plain]
+# --strict, --plain and --bulk-copy are passed on to compile.py
+python tools/run_suite.py <problems-dir> [--bench] [--strict] [--plain] [--bulk-copy]
 
 # build the wider corpus with the organisers' generator (needs torch)
 python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --out corpus

@@ -28,7 +28,7 @@ import contextlib
 import math
 from dataclasses import replace
 
-from . import elementwise, mapping
+from . import bulk, elementwise, mapping
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .cells import CellLayout
 from .common import (ATOMIC_ADD, AUTO_UNROLL_TRIPS, C_TYPE, IDENTITY, MEM_TYPE, REDUCE_CANON, SMEM_UNROLL_TRIPS,
@@ -38,7 +38,7 @@ from .congruence import congruent_accumulators, drop_needless_snapshots, merge_c
 from .frontend import KernelSource
 from .lanes import LANE_BUFFER, LaneSharing
 from .mapping import LOOPS, assigned, kind, produced, reads, walk
-from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, Mem, Sym, Vec
+from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, LabelRef, Mem, Reg, Sym, Vec
 from .regroup import fully_combined, regroup
 from .tensorcore import TensorCoreLowering, fragment_index, fragment_refs
 from .vectorize import vectorize_loads
@@ -64,8 +64,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     it lowers a kernel again with cells re-mapped."""
 
     def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False,
-                 strict: bool = False):
+                 strict: bool = False, bulk_copy: bool = False):
         self.src = src
+        self.bulk_copy = bulk_copy  # hand contiguous cp.async fills to the copy engine (bulk.py)
+        self._bulk: dict = {}  # CpAsyncCopy -> lanes of each bulk run, for the Tile being lowered
         self.spread = spread  # do idle threads join the cells (_spread)?
         self.place = place  # do cells run where their lanes share work (_placement)?
         # every floating-point operation of the IR in its order, each rounded on its own: no rewrite
@@ -112,9 +114,9 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             # cells that, as emmy lays them out, share no work with the lanes beside them may
             # share it with more lanes each (_spread) or laid out anew (_placement)
             if self.wants_spread:
-                return Lowerer(self.src, spread=True, strict=self.strict).run()
+                return Lowerer(self.src, spread=True, strict=self.strict, bulk_copy=self.bulk_copy).run()
             if self.wants_place:
-                placed = Lowerer(self.src, place=True, strict=self.strict)
+                placed = Lowerer(self.src, place=True, strict=self.strict, bulk_copy=self.bulk_copy)
                 kernel = placed.run()
                 # each region lowers the Tile's body again: keep it while the module fits the runner
                 if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
@@ -913,14 +915,114 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         src_addr = self.address(src, s.src_index)
         if s.nbytes not in (4, 8, 16):
             raise LoweringError(f"cp.async of {s.nbytes} bytes")
+        lanes = self._bulk.get(s, 0)
+        if lanes:
+            # the first lane of each run hands the run to the copy engine; it completes on the
+            # mbarrier of the group being built (bulk.py)
+            lead = b.icmp("==", b.bitop("&", self.tid, b.int_const(lanes - 1)), b.int_const(0))
+            slot = self._mbarrier(self._commits)
+            if not self._bulk_bytes:  # the group's first: order the reads of the buffers it refills first
+                b.emit("fence.proxy.async.shared::cta")
+            b.emit("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes", dst_addr, src_addr,
+                   Imm(lanes * s.nbytes, "u32"), Mem(slot), guard=lead)
+            self._bulk_bytes += self.src.launch.block * s.nbytes
+            return
         cache = "cg" if s.nbytes == 16 else "ca"
         b.emit(f"cp.async.{cache}.shared.global", dst_addr, src_addr, Imm(s.nbytes, "u32"))
 
     def stmt_CpAsyncCommit(self, s) -> None:
-        self.b.emit("cp.async.commit_group")
+        b = self.b
+        b.emit("cp.async.commit_group")
+        if self._bulk:
+            # thread 0 arrives on the group's mbarrier, expecting all of the group's bulk bytes
+            first = b.icmp("==", self.tid, b.int_const(0))
+            slot = self._mbarrier(self._commits)
+            b.emit("mbarrier.arrive.expect_tx.shared::cta.b64", self.kernel.reg("b64"), Mem(slot),
+                   Imm(self._bulk_bytes, "u32"), ndefs=1, guard=first)
+            b.emit("add.s32", self._commits, self._commits, Imm(1, "s32"))
+            self._bulk_bytes = 0
 
     def stmt_CpAsyncWait(self, s) -> None:
         self.b.emit("cp.async.wait_group", Imm(int(s.group), "u32"))
+        if self._bulk:
+            target = self.kernel.reg("s32")
+            self.b.emit("sub.s32", target, self._commits, Imm(int(s.group), "s32"), ndefs=1)
+            self._bulk_wait(target)
+
+    # ---------------------------------------------------- the copy engine (bulk.py)
+
+    def _bulk_begin(self, tile) -> bool:
+        """Plan the Tile's bulk copies and, if there are any, set up their
+        mbarriers: one per commit group in flight, used round robin. The
+        commit and wait counters live in registers that only emitted
+        instructions touch, so no value numbering or hoisting sees through
+        them (their values change at run time inside rolled loops)."""
+        self._bulk = {}
+        if not self.bulk_copy or self.plain:
+            return False
+        globals_ = {n: (g.shape, SIZEOF.get(g.type, 1)) for n, g in self.globals.items()}
+        shared = {n: (a.shape, SIZEOF.get(a.type, 1), a.offset) for n, a in self.shared.items()}
+        self._bulk = bulk.plan(tile, self.src.launch.grid, self.src.launch.block, globals_, shared)
+        mbarriers = 8 * bulk.SLOTS
+        if self._static_smem is not None and self._static_smem + self._lane_bytes + mbarriers > STATIC_SMEM_LIMIT:
+            self._bulk = {}  # the static arrays already fill the 48 KiB a kernel may declare
+        if not self._bulk:
+            return False
+        if self._static_smem is not None:
+            self._static_smem += mbarriers  # (a lane buffer placed later must fit beside them too)
+        b = self.b
+        self.kernel.require_target("sm_90")
+        self.kernel.decls.append(f".shared .align 8 .b64 {bulk.MBARRIERS}[{bulk.SLOTS}];")
+        first = b.icmp("==", self.tid, b.int_const(0))
+        for k in range(bulk.SLOTS):
+            b.emit("mbarrier.init.shared::cta.b64", Mem(Sym(bulk.MBARRIERS), 8 * k), Imm(1, "u32"), guard=first)
+        b.emit("fence.proxy.async.shared::cta")  # the initialized mbarriers, seen by the copy engine
+        b.emit("bar.sync", Imm(0, "u32"))
+        self._commits, self._waited = self.kernel.reg("s32"), self.kernel.reg("s32")
+        for counter in (self._commits, self._waited):
+            b.emit("mov.s32", counter, Imm(0, "s32"), ndefs=1)
+        self._bulk_bytes = 0
+        runs = sorted(set(self._bulk.values()))
+        self.remark(f"{len(self._bulk)} cp.async fills handed to the copy engine (cp.async.bulk), runs of "
+                    f"{' or '.join(map(str, runs))} lanes, completed on {bulk.SLOTS} mbarriers")
+        return True
+
+    def _bulk_end(self) -> None:
+        """Wait for every group still in flight: a block must not exit while the
+        copy engine is writing its shared memory."""
+        self._bulk_wait(self._commits)
+        self._bulk = {}
+
+    def _mbarrier(self, group) -> Reg:
+        """The address of group ``group``'s mbarrier (a register)."""
+        b = self.b
+        slot = self.kernel.reg("s32")
+        b.emit("and.b32", slot, group, Imm(bulk.SLOTS - 1, "u32"), ndefs=1)
+        b.emit("shl.b32", slot, slot, Imm(3, "u32"), ndefs=1)
+        base = self.kernel.reg("s32")
+        b.emit("mov.u32", base, Sym(bulk.MBARRIERS), ndefs=1)
+        b.emit("add.s32", slot, slot, base, ndefs=1)
+        return slot
+
+    def _bulk_wait(self, target) -> None:
+        """Wait, in order, for the groups up to ``target`` (exclusive): group g's
+        mbarrier is slot g % SLOTS in phase g / SLOTS."""
+        b = self.b
+        top, spin, done = b.label("bulk_wait"), b.label("bulk_try"), b.label("bulk_waited")
+        enough, landed = self.kernel.reg("pred"), self.kernel.reg("pred")
+        parity = self.kernel.reg("s32")
+        b.place(top)
+        b.emit("setp.ge.s32", enough, self._waited, target, ndefs=1)
+        b.emit("bra", LabelRef(done), guard=Value("pred", enough))
+        slot = self._mbarrier(self._waited)
+        b.emit("shr.u32", parity, self._waited, Imm(bulk.SLOTS.bit_length() - 1, "u32"), ndefs=1)
+        b.emit("and.b32", parity, parity, Imm(1, "u32"), ndefs=1)
+        b.place(spin)
+        b.emit("mbarrier.try_wait.parity.shared::cta.b64", landed, Mem(slot), parity, ndefs=1)
+        b.emit("bra", LabelRef(spin), guard=Value("pred", landed), negate=True)
+        b.emit("add.s32", self._waited, self._waited, Imm(1, "s32"))
+        b.emit("bra", LabelRef(top))
+        b.place(done)
 
     def stmt_ZeroPrologue(self, s) -> None:
         """CTA 0 zeroes ``words`` 32-bit words of another kernel's accumulator."""

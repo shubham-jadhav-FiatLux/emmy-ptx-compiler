@@ -20,8 +20,9 @@ from emmy.compiler.dtype import F16, F32, F64
 from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
-from emmy.compiler.ir.kernel.ir import (FragmentApply, FragmentPromote, LdmatrixLoad, MmaSyncPtx, RegFragment, RegStore,
-                                       Smem, Sync, Tile, TreeHalve, WarpShuffle)
+from emmy.compiler.ir.kernel.ir import (CpAsyncCommit, CpAsyncCopy, CpAsyncWait, FragmentApply, FragmentPromote,
+                                       LdmatrixLoad, MmaSyncPtx, RegFragment, RegStore, Smem, Sync, Tile, TreeHalve,
+                                       WarpShuffle)
 from emmy.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from emmy.compiler.ir.stmt.leaves import Init, Let
 
@@ -52,13 +53,16 @@ DTYPE = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64", np.dtype(np.f
          np.dtype(np.int32): "i32"}
 
 
-def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str = "f32") -> dict:
-    """Compile ``body`` as a kernel and run it; inputs/outputs map names to arrays/shapes."""
+def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str = "f32", ptx_has: str = "",
+        **options) -> dict:
+    """Compile ``body`` as a kernel and run it; inputs/outputs map names to arrays/shapes.
+    ``options`` go to the Lowerer; ``ptx_has`` must appear in the PTX unless lowered plainly."""
     buffers = {n: Buffer(n, a.shape, DTYPE[a.dtype]) for n, a in inputs.items()}
     buffers.update({n: Buffer(n, s, out_dtype) for n, s in outputs.items()})
     params = tuple(inputs) + tuple(outputs)
     src = KernelSource("k_test", tuple(body), params, buffers, Launch(grid, block, 0), frozenset(outputs))
-    ptx = Lowerer(src, **LOWERING).run().render(PTX_VERSION, TARGET)
+    ptx = Lowerer(src, **LOWERING, **options).run().render(PTX_VERSION, TARGET)
+    assert LOWERING.get("plain") or ptx_has in ptx
     c = requests.post(f"{RUNNER}/compile", json={"ptx": ptx}, timeout=120).json()
     assert c.get("ok"), c.get("stderr")
     args = [dict(name=n, dtype=buffers[n].dtype, shape=list(a.shape), data=a.ravel().tolist()) for n, a in inputs.items()]
@@ -555,3 +559,45 @@ def test_fp8_decode_and_encode_match_emmys_definitions():
         want = decode_f8(codes, fmt)
         finite = np.isfinite(want)
         assert np.array_equal(dec[finite], want[finite]), fmt  # (the runner returns inf and NaN as null)
+
+
+def pipelined_fills(stages: int = 4, rows: int = 32, cols: int = 64) -> list:
+    """A two-buffer cp.async pipeline as emmy writes one: 512 threads fill a
+    stage of ``rows`` x ``cols`` floats (16 bytes a thread, so the whole stage
+    is one contiguous run), and copy 4 bytes each of a scattered row into a
+    second array (no run: it stays a cp.async in the same group); each stage
+    is read back after its wait."""
+    t, k = Var("t"), Var("k")
+    row, col = B("/", t, I(16)), B("*", B("%", t, I(16)), I(4))
+
+    def fill(stage, buf):
+        return (CpAsyncCopy("s", (B("+", B("*", buf, I(rows)), row), col), "x",
+                            (B("+", B("*", stage, I(rows)), row), col), nbytes=16),
+                CpAsyncCopy("u", (B("+", B("*", buf, I(512)), t),), "x",
+                            (B("+", B("*", stage, I(rows)), B("%", B("*", t, I(7)), I(rows))), B("%", t, I(cols))),
+                            nbytes=4),
+                CpAsyncCommit())
+
+    nxt = TernaryExpr(B("<", B("+", k, I(1)), I(stages)), B("+", k, I(1)), I(stages - 1))
+    step = [*fill(nxt, B("%", B("+", k, I(1)), I(2))), CpAsyncWait(1), Sync()]
+    for j in range(4):
+        step += [Load(name=f"v{j}", input="s", index=(B("+", B("*", B("%", k, I(2)), I(rows)), row), B("+", col, I(j)))),
+                 Write("out", (B("+", B("*", k, I(rows)), row), B("+", col, I(j))), f"v{j}")]
+    step += [Load(name="w", input="u", index=(B("+", B("*", B("%", k, I(2)), I(512)), t),)),
+             Write("out2", (k, t), "w"), Sync()]
+    return [Tile(axes=(Axis("t", Dim(512)),), body=(
+        Smem("s", (2 * rows, cols), "float", 16), Smem("u", (1024,), "float", 16),
+        *fill(I(0), I(0)), Loop(axis=Axis("k", Dim(stages)), body=tuple(step))))]
+
+
+def test_shared_fills_through_the_copy_engine():
+    """Lowerer(bulk_copy=True): the contiguous fill becomes one cp.async.bulk a
+    stage, completed on an mbarrier; the scattered one stays a cp.async."""
+    stages, rows, cols = 4, 32, 64
+    x = rng.standard_normal((stages * rows, cols)).astype(np.float32)
+    got = run(pipelined_fills(stages, rows, cols), {"x": x}, {"out": (stages * rows, cols), "out2": (stages, 512)},
+              1, 512, ptx_has="cp.async.bulk.shared::cluster.global.mbarrier", bulk_copy=True)
+    assert np.array_equal(got["out"], x)
+    t = np.arange(512)
+    want = np.stack([x[k * rows + (t * 7) % rows, t % cols] for k in range(stages)])
+    assert np.array_equal(got["out2"], want)
