@@ -1,18 +1,96 @@
 # emmy-ptx-compiler
 
-A compiler from Emmy's Kernel IR (`*.ir.json`) straight to NVIDIA PTX.
+A compiler from Emmy's Kernel IR (`*.ir.json`) straight to NVIDIA PTX, tuned on
+the hackathon's RTX 5090 runner.
 
-```
+## Quick start
+
+```bash
+pip install -r requirements.txt          # Python 3.12+, emmy-ml 0.3.11, numpy
 python compile.py path/to/<kernel>.ir.json > out.ptx            # PTX on stdout, diagnostics on stderr
 python compile.py --strict path/to/<kernel>.ir.json > out.ptx   # no rewrite that changes rounding
 python compile.py --plain path/to/<kernel>.ir.json > out.ptx    # the fallback lowering alone
 ```
 
-The IR is loaded with emmy's `Graph.from_dict`. Everything after that (the
-lowering of every statement, the index arithmetic, the math library and the
-PTX text) is this project's own code. `meta.json`, next to the IR, supplies
-the parameter order and the launch geometry. Requirements: Python 3.12+,
-`emmy-ml==0.3.11`, numpy.
+`meta.json`, next to the IR, supplies the parameter order and the launch. With
+the organisers' checker: `python submit.py <problem> --compiler compile.py`.
+The IR is loaded with emmy's `Graph.from_dict`. Everything after that is this
+project's own code: the lowering of every statement, the index arithmetic, the
+math library and the PTX text. [`examples/`](examples/README.md) walks through
+the PTX of a reduction, an attention kernel and a tensor-core matmul.
+
+## What to look for
+
+**Versatility**
+* Every Kernel-IR statement emmy emits for this GPU:
+  * structure: `Tile` (aux bands, CTA rasterization), `Loop`/`StridedLoop`
+    (runtime bounds), `Cond`;
+  * values: `Let`, `Assign`, `Accum`, `Init`, `Select`;
+  * memory: `Load`/`Write` (vector, atomic), `Smem` (static arrays or a
+    dynamic pool), `Sync` (named barriers);
+  * the `cp.async` copy engine (4/8/16 bytes, swizzled, lane-indexed,
+    double-buffered), `ZeroPrologue`;
+  * cross-lane: `WarpShuffle`, `TreeHalve`;
+  * tensor cores: the eight statements of emmy's `mma.sync` path (DESIGN 6).
+* Data types:
+  * f32;
+  * f16, on the tensor cores and elsewhere (each operation computed in f32
+    and rounded once to f16);
+  * f64 in true double precision, with double exp, log and sigmoid;
+  * 8- to 64-bit integers with C semantics, and bool.
+* Every elementwise op emmy's CUDA renderer can emit, including the integer
+  bit operations (fp8/fp4 conversions aside).
+* Multi-kernel problems: split-K partials, and chains passing intermediates.
+
+**Performance, from the GPU's structure**
+* A per-lane uniformity analysis finds the work that neighbouring lanes
+  repeat, and shares it among them (DESIGN 4):
+  * reductions split across lanes, choosing the loop by a coalescing cost
+    model;
+  * attention blocked across lanes, the FlashAttention-2 work split derived
+    from the IR;
+  * idle threads joining cells;
+  * cells moved where lanes can share them;
+  * block reductions with one barrier.
+* Memory:
+  * warp loads counted in 128-byte lines;
+  * shared-memory broadcasts instead of shuffles (17x cheaper, measured);
+  * 128-bit vector accesses, and `ld.global.nc` for read-only data;
+  * swizzled `ldmatrix` slabs.
+* Registers: unrolling bounded by the per-thread register budget, and launch
+  hints (`.maxntid`, `.minnctapersm`) for one-wave grids.
+* Result: 0.56x the time of nvcc's build of emmy's own CUDA over 281
+  problems, and attention at 0.12x.
+
+**Design**
+* One rule per statement. Each loop-body rewrite is either exact, bit for
+  bit, or a regrouping of an associative fold.
+* A builder that knows the range of every integer, value-numbers, and hoists
+  invariant work.
+* `--strict` keeps only the rewrites that leave every bit of every result as
+  the IR's own order of operations gives it; checked on 371 problems.
+* `--plain`: if an optimization ever fails, the kernel is lowered again
+  without the optional rewrites. That fallback is tested on every problem.
+
+**Novelty**
+* The merge of two online-softmax states derived from the IR's own update,
+  not hard-coded.
+* Lane blocking and cell placement, which re-map emmy's schedules onto
+  warps.
+* Congruent-accumulator merging.
+* One `exp` for both factors of an online-softmax step.
+* Accurate math routines: minimax polynomials with exact argument
+  reductions, measured at ≤ 1 to 3 ulp over about a million inputs per range.
+
+**Testing**
+* 176 tests: unit, compile and GPU tests, each kernel lowered three ways,
+  plus a lane-level interpreter for lane blocking.
+* About 400 problems, generated with the organisers' tool: the open set, a
+  wider corpus of 200 (20 of them f16), a schedule sweep of 106, and a
+  held-out set of 81 written after the compiler.
+* Tools for an nvcc race (`tools/ref_bench.py`), math accuracy
+  (`tools/mathtest.py`), and bit-for-bit equality of two builds
+  (`tools/bitwise.py`).
 
 ## Results
 
@@ -119,9 +197,12 @@ emmy_ptx/
   elementwise.py       Assign/Accum operations and emmy's dtype rules
   mathlib.py           exp, log, tanh, erf, sin, cos, pow, sigmoid (exp, log, sigmoid also in float64)
   ptx.py               registers, operands, instructions, module text
-tests/                 unit tests (builder, rewrites, cell placement, a lane-level IR interpreter) and GPU tests
+tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
+                       interpreter) and GPU tests
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
+examples/              three problems with their PTX, walked through in examples/README.md
 docs/DESIGN.md
+requirements.txt
 ```
 
 ## Testing
@@ -131,8 +212,8 @@ docs/DESIGN.md
 python -m pytest tests
 
 # compile, run and check problem folders on the runner (margin = share of the tolerance used);
-# --plain checks the fallback lowering instead (compile.py --plain)
-python tools/run_suite.py <problems-dir> [--bench] [--plain]
+# --strict and --plain are passed on to compile.py
+python tools/run_suite.py <problems-dir> [--bench] [--strict] [--plain]
 
 # build the wider corpus with the organisers' generator (needs torch)
 python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --out corpus
@@ -140,6 +221,9 @@ python tools/make_corpus.py --hackathon <emmy-hackathon-2026> --specs tools/corp
 
 # race against nvcc's build of the reference CUDA (development only)
 python tools/ref_bench.py <problems-dir> --nvcc <nvcc>
+
+# do two builds give bit-identical outputs? (default: --strict against --plain --strict)
+python tools/bitwise.py <problems-dir>
 
 # accuracy of the math library on the GPU
 python tools/mathtest.py

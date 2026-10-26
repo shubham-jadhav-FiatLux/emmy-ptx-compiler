@@ -1,0 +1,25 @@
+    Tile[_a2_ks, a0_b, a1_b, a0_u, a1_u, _lane] (N=4096)
+        RegFragment a:f16 _a0[4] (16x8x16)
+        RegFragment b:f16 _b[2][2] (16x8x16)
+        RegFragment c:f32 _c0_[2][4] (16x8x16)
+        Smem __half _a_smem[32, 32] align=512
+        Smem __half _b_smem[64, 32] align=512
+        cp.async[16B] _a_smem[0, 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x0[((a0_b * 16) + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 0)), ((_a2_ks * 64) + (0 + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)))]
+        cp.async[16B] _b_smem[0, 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x1[((_a2_ks * 64) + (0 + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 0))), ((a1_b * 32) + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32))]
+        cp.async[16B] _b_smem[16, 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x1[((_a2_ks * 64) + (0 + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 16))), ((a1_b * 32) + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32))]
+        cp.async.commit_group
+        for _ks in 0..64:32
+            cp.async[16B] _a_smem[(((((_ks / 32) + 1) % 2) * 16) + 0), 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x0[((a0_b * 16) + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 0)), ((_a2_ks * 64) + ((((_ks + 32) < 64) ? (_ks + 32) : 32) + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)))]
+            cp.async[16B] _b_smem[(((((_ks / 32) + 1) % 2) * 32) + 0), 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x1[((_a2_ks * 64) + ((((_ks + 32) < 64) ? (_ks + 32) : 32) + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 0))), ((a1_b * 32) + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32))]
+            cp.async[16B] _b_smem[(((((_ks / 32) + 1) % 2) * 32) + 16), 0] + lane(((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32), ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32)) swz=B64 <- x1[((_a2_ks * 64) + ((((_ks + 32) < 64) ? (_ks + 32) : 32) + (((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) / 32) + 16))), ((a1_b * 32) + ((((((a0_u * 2) + a1_u) * 32) + _lane) * 8) % 32))]
+            cp.async.commit_group
+            cp.async.wait_group(1)
+            Sync
+            for _ki in 0..32:16
+                LdmatrixLoad _a0 <- _a_smem[((((_ks / 32) % 2) * 16) + ((a0_u * 16) + 0)), _ki] (x4, ldm=32)
+                LdmatrixLoad (_b[0], _b[1]) <- _b_smem[((((_ks / 32) % 2) * 32) + _ki), ((a1_u * 16) + 0)] (x4.trans pair, ldm=32)
+                for _r0 in 0..2:1
+                    MmaSyncPtx _c0_[_r0] += _a0 @ _b[_r0] (m16n8k16 f16)
+            Sync
+        RegStore matmul__partial[_a2_ks, (((a0_b * 16) + (a0_u * 16)) + 0), (((a1_b * 32) + (a1_u * 16)) + 0)] <- _c0_[0] (ldm=auto)
+        RegStore matmul__partial[_a2_ks, (((a0_b * 16) + (a0_u * 16)) + 0), (((a1_b * 32) + (a1_u * 16)) + 8)] <- _c0_[1] (ldm=auto)

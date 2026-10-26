@@ -1,0 +1,7 @@
+# compile.py
+emmy-ml==0.3.11
+numpy
+# tests and tools/ (the GPU tests and tools talk to the runner over HTTP;
+# generating problem folders with the organisers' tool also needs torch)
+pytest
+requests

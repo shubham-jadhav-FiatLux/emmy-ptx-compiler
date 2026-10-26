@@ -1,0 +1,5 @@
+    Tile[a0, a1] (N=16384)
+        for _a2_ks in 0..2
+            acc0__p = load matmul__partial[_a2_ks, a0, a1]
+            f32 acc0 <- add(acc0, acc0__p)
+        matmul[a0, a1] = acc0

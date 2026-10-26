@@ -1,0 +1,109 @@
+{
+ "id": "m_f16_128",
+ "code": "torch.randn(128, 128, dtype=torch.float16) @ torch.randn(128, 128, dtype=torch.float16)",
+ "rtol": 0.01,
+ "atol": 0.01,
+ "graph_inputs": [
+  "x0",
+  "x1"
+ ],
+ "graph_outputs": [
+  "matmul"
+ ],
+ "kernels": [
+  {
+   "node": "matmul__partial",
+   "entry": "k_matmul__partial",
+   "arg_order": [
+    "x1",
+    "x0",
+    "matmul__partial"
+   ],
+   "grid": [
+    64,
+    1,
+    1
+   ],
+   "block": [
+    64,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x1",
+     "dtype": "f16",
+     "shape": [
+      128,
+      128
+     ],
+     "seed": 1
+    },
+    {
+     "name": "x0",
+     "dtype": "f16",
+     "shape": [
+      128,
+      128
+     ],
+     "seed": 0
+    },
+    {
+     "name": "matmul__partial",
+     "dtype": "f32",
+     "shape": [
+      2,
+      128,
+      128
+     ],
+     "output": true
+    }
+   ],
+   "final": false
+  },
+  {
+   "node": "matmul",
+   "entry": "k_matmul",
+   "arg_order": [
+    "matmul__partial",
+    "matmul"
+   ],
+   "grid": [
+    64,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "matmul__partial",
+     "dtype": "f32",
+     "shape": [
+      2,
+      128,
+      128
+     ],
+     "intermediate": true
+    },
+    {
+     "name": "matmul",
+     "dtype": "f16",
+     "shape": [
+      128,
+      128
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

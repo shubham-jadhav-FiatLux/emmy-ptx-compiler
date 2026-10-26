@@ -458,10 +458,10 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   * lane blocking of plain folds;
   * the tensor cores, whose order of operations is the IR's own.
 
-  That claim is checked on the GPU. Of the 402 problems, the 371 whose
-  kernels add no floats atomically give bit-identical outputs under
-  `--strict` and under the plain lowering (`--plain --strict`, which runs the
-  IR as written). The other 31 finish with float atomics, whose order varies
+  That claim is checked on the GPU (`tools/bitwise.py`). Of the 402 problems,
+  the 371 whose kernels add no floats atomically give bit-identical outputs
+  under `--strict` and under the plain lowering (`--plain --strict`, which
+  runs the IR as written). The other 31 finish with float atomics, whose order varies
   from run to run. Strictness costs speed where lanes shared a reduction: the
   open set's 64×64 attention takes 85 µs instead of 9. All 402 problems pass
   with it.
