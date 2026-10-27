@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import re
 from dataclasses import replace
 
@@ -65,9 +66,12 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     it lowers a kernel again with cells re-mapped."""
 
     def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False,
-                 strict: bool = False, bulk_copy: bool = False):
+                 strict: bool = False, bulk_copy: bool = False, disable: frozenset | None = None):
         self.src = src
         self.bulk_copy = bulk_copy  # hand contiguous cp.async fills to the copy engine (bulk.py)
+        # rewrites switched off one by one (EMMY_PTX_DISABLE=split,blocking,...), to measure what each
+        # contributes (tools/ablate.py); all of them are on by default
+        self.disable = disabled_rewrites() if disable is None else frozenset(disable)
         self._bulk: dict = {}  # CpAsyncCopy -> lanes of each bulk run, for the Tile being lowered
         self.spread = spread  # do idle threads join the cells (_spread)?
         self.place = place  # do cells run where their lanes share work (_placement)?
@@ -90,7 +94,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         # registers per thread cannot cost occupancy: let ptxas spend them on
         # keeping more loads in flight (it otherwise caps registers to leave room
         # for CTAs that never come). Bigger grids keep ptxas's own balance.
-        one_wave = src.launch.grid <= TARGET_SMS
+        one_wave = src.launch.grid <= TARGET_SMS and not self.off("hint")
         self.kernel = Kernel(src.name, tuple(_param_name(p) for p in src.params), maxntid=src.launch.block,
                              minnctapersm=1 if one_wave else None)
         self.b = Builder(self.kernel)
@@ -120,9 +124,11 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             # cells that, as emmy lays them out, share no work with the lanes beside them may
             # share it with more lanes each (_spread) or laid out anew (_placement)
             if self.wants_spread:
-                return Lowerer(self.src, spread=True, strict=self.strict, bulk_copy=self.bulk_copy).run()
+                return Lowerer(self.src, spread=True, strict=self.strict, bulk_copy=self.bulk_copy,
+                               disable=self.disable).run()
             if self.wants_place:
-                placed = Lowerer(self.src, place=True, strict=self.strict, bulk_copy=self.bulk_copy)
+                placed = Lowerer(self.src, place=True, strict=self.strict, bulk_copy=self.bulk_copy,
+                                 disable=self.disable)
                 kernel = placed.run()
                 # each region lowers the Tile's body again: keep it while the module fits the runner
                 if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
@@ -132,7 +138,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             self.kernel.decls.append(f".shared .align 16 .b8 {LANE_BUFFER}[{self._lane_bytes}];")
         self.kernel.flatten()
         eliminate_dead_code(self.kernel)
-        if not self.plain:
+        if not self.plain and not self.off("vectorize"):
             merged = vectorize_loads(self.kernel, self.b.align)
             if merged:
                 self.remark(f"{merged} adjacent loads merged into vector loads")
@@ -146,14 +152,18 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         """Note a decision for ``compile.py --report``."""
         self.kernel.remarks.append(text)
 
+    def off(self, rewrite: str) -> bool:
+        """Is optional rewrite ``rewrite`` (one of REWRITES) switched off?"""
+        return rewrite in self.disable
+
     def body(self, stmts) -> None:
-        stmts = list(stmts if self.plain else _issue_loads_early(stmts, self._readonly))
+        stmts = list(stmts if self.plain or self.off("early_loads") else _issue_loads_early(stmts, self._readonly))
         i = 0
         while i < len(stmts):
             s = stmts[i]
             if not self.plain:
                 # later loops over the same iterations join this one (exact; see mapping.py)
-                fused = mapping.absorb_siblings(stmts, i, self._fusable)
+                fused = s if self.off("fusion") else mapping.absorb_siblings(stmts, i, self._fusable)
                 if fused is not s:
                     self.remark(f"loop {s.axis.name}: later loops over the same iterations fused into it")
                 s = fused
@@ -190,7 +200,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         combine across the cooperating threads (see regroup.py), else ``s``."""
         accs = {st.name for st in s.body if type(st).__name__ == "Accum"}
         step = _int_value(s.step)
-        if not accs or step is None or self.strict:  # (chunks regroup the sums)
+        if not accs or step is None or self.strict or self.off("regroup"):  # (chunks regroup the sums)
             return s
         start = self.expr(s.start)  # the thread's rank among the cooperating threads
         if start.lo != 0 or start.hi is None:
@@ -568,7 +578,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     def _merge_congruent(self, s):
         """``s`` with provably equal accumulators sharing one representative
         (see congruence.py), and the members to alias after the loop."""
-        if self.plain:
+        if self.plain or self.off("congruence"):
             return s, {}
         start = {}
         for st in s.body:
@@ -618,7 +628,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         inner product), whose loads then all take immediate offsets (measured:
         a 256x256 cp.async matmul 6.8 -> 4.8 us; unrolling every loop of up to
         128 trips instead grew some kernels five times over)."""
-        if self.plain:
+        if self.plain or self.off("unroll"):
             return 0
         tile = any(kind(x) == "Load" and isinstance(self.scope.lookup(x.input) or self.shared.get(x.input), SharedArray)
                    for x in walk(s.body))
@@ -821,7 +831,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         canon = REDUCE_CANON.get(s.op.name, "add")  # emmy folds unknown combines additively
         value = self.value(s.value)
         new = None
-        if canon == "add" and acc.type == "f32" and not self.strict:  # contract a product into the fold: one FMA
+        if canon == "add" and acc.type == "f32" and not self.strict and not self.off("fma"):  # one FMA
             for product, addend in ((value, base), (base, value)):
                 factors = self.products.get(product.key()) if product.key() is not None else None
                 # a factor read from a variable must still hold (alpha * l fuses into l's own update)
@@ -973,7 +983,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
     def _coarsened_body(self, tile):
         """The Tile's body with pairs of matmul cells computed by one thread (coarsen.py), or None."""
-        if self.plain:
+        if self.plain or self.off("coarsen"):
             return None
         body = coarsen.plan(tile, self.src.launch.grid, self.src.launch.block)
         if body is not None:
@@ -986,7 +996,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     def _cluster_body(self, tile):
         """The Tile's body with a loop's column-free work shared across a
         cluster of neighbouring blocks (cluster.py), or None."""
-        if self.plain or self.kernel.cluster:
+        if self.plain or self.off("clusters") or self.kernel.cluster:
             return None
         plan = cluster.plan(tile, self.src.launch.grid, self.src.launch.block)
         if plan is None:
@@ -1190,7 +1200,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             slot = lambda k: self.b.add(self.b.mul(k, self.b.int_const(scale)), iv)  # noqa: E731
         else:
             slot = lambda k: k  # noqa: E731
-        refusal = "the plain lowering keeps it" if self.plain else self._tree_refusal(s)
+        refusal = ("the plain lowering keeps it" if self.plain else "switched off" if self.off("tree")
+                   else self._tree_refusal(s))
         if refusal is not None:
             self._literal_tree(s, vtype, bufs, length, slot)
             self.remark(f"halving tree over {length} partials: emmy's tree, {length.bit_length() - 1} barriers "
@@ -1429,6 +1440,35 @@ def _promote_pair(b: Builder, x: Value, y: Value):
 
 
 
+
+# The optional rewrites EMMY_PTX_DISABLE can switch off, one by one (tools/ablate.py measures each).
+REWRITES = {
+    "early_loads": "loads issued ahead of the statements that need them",
+    "fusion": "sibling loops over the same iterations fused",
+    "regroup": "cooperative reductions in contiguous chunks (4.6)",
+    "congruence": "provably equal accumulators merged (5)",
+    "unroll": "short loops unrolled though the IR does not ask",
+    "split": "reductions split across the lanes that share them (4.2)",
+    "blocking": "lane blocking (4.3)",
+    "dealing": "independent loops dealt to the lanes of a cell (4.4)",
+    "spread": "idle threads joining cells (4.4)",
+    "placement": "cells placed anew (4.5)",
+    "tree": "block reductions with one barrier (4.7)",
+    "clusters": "work repeated across blocks shared in a cluster (4.8)",
+    "coarsen": "two matmul cells a thread (4.9)",
+    "vectorize": "adjacent loads merged into vector loads",
+    "fma": "a product folded into a sum as one FMA",
+    "hint": "the one-wave launch hint (8)",
+}
+
+
+def disabled_rewrites() -> frozenset:
+    """The rewrites named in EMMY_PTX_DISABLE (comma-separated)."""
+    names = frozenset(n.strip() for n in os.environ.get("EMMY_PTX_DISABLE", "").split(",") if n.strip())
+    unknown = names - set(REWRITES)
+    if unknown:
+        raise ValueError(f"EMMY_PTX_DISABLE: unknown rewrite(s) {sorted(unknown)}; known: {', '.join(REWRITES)}")
+    return names
 
 def _divisor_constant(name: str | None) -> bool:
     """Is ``name`` a ConstantOp that emmy made for the divisor of a source

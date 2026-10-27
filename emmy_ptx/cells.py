@@ -109,7 +109,7 @@ class CellLayout:
         them and ``_dealt`` its independent loops. ``run`` lowers a kernel with
         spread cells only when, lowered without, the lanes shared no loop."""
         launch = self.src.launch
-        if self.plain or not (self.spread or candidate) or s.aux_threads or not _thread_free(s.body):
+        if self.plain or self.off("spread") or not (self.spread or candidate) or s.aux_threads or not _thread_free(s.body):
             return 1
         if any(kind(x) == "Write" and x.atomic for x in walk(s.body)):
             return 1  # the lanes of a cell would each add its result
@@ -140,7 +140,7 @@ class CellLayout:
         with one lane idle, else 8 + 2 + 1 (_placed_tile). Worth trying only
         when some loop's work is the same along that axis."""
         launch = self.src.launch
-        if self.plain or s.aux_threads or launch.block % WARP or not _thread_free(s.body):
+        if self.plain or self.off("placement") or s.aux_threads or launch.block % WARP or not _thread_free(s.body):
             return None
         axis = max((i for i, e in enumerate(extents) if e > 1), default=None)
         if axis is None:

@@ -115,7 +115,7 @@ class LaneSharing:
         splitting the loops in it (the coalescing-driven choice of the loop to
         parallelize, as in PPCG and Yang et al., PLDI'10).
         """
-        if self.plain or self.strict or not self.converged or trips is None or trips[0] != trips[1]:
+        if self.plain or self.strict or self.off("split") or not self.converged or trips is None or trips[0] != trips[1]:
             return None  # (strict: a split regroups the reduction)
         if trips[0] < SPLIT_MIN_TRIPS:
             return None
@@ -237,7 +237,7 @@ class LaneSharing:
         rather than kt[d, t]), one lane per key would read a cache line per
         lane, so a slot then has several lanes (``_key_lanes``), which split
         the key's dot product and read its row coalesced."""
-        if self.plain or not self.converged or trips is None or trips[0] != trips[1]:
+        if self.plain or self.off("blocking") or not self.converged or trips is None or trips[0] != trips[1]:
             return None
         if None in (start.const, step.const) or not s.seed or not mapping.is_pure_loop(s):
             return None
@@ -346,7 +346,7 @@ class LaneSharing:
         can take iterations r, r + G, ... instead: the same stores, G times
         fewer each. Each buffer is stored by one statement whose index moves
         with the loop variable, and the loop reads no buffer it stores."""
-        if self.plain or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < 2:
+        if self.plain or self.off("dealing") or not self.converged or trips is None or trips[0] != trips[1] or trips[0] < 2:
             return 0
         if self.store_guard is not None:
             return 0  # a lane that stores nothing must not take iterations of its own
