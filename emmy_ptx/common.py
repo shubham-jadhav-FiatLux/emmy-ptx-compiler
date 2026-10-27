@@ -42,7 +42,7 @@ UNROLL_BUDGET = 4096
 # over a shared-memory tile up to SMEM_UNROLL_TRIPS).
 AUTO_UNROLL_TRIPS, SMEM_UNROLL_TRIPS = 64, 128
 # Streaming multiprocessors of the evaluation GPU (RTX 5090). Only a scheduling
-# hint depends on it; the generated code is correct on any GPU.
+# hint depends on it, no result (the code needs sm_89, or sm_90 for clusters).
 TARGET_SMS = 170
 # identities of the reduction combines (emmy's ElementwiseImpl table)
 IDENTITY = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "minimum": 1e30}

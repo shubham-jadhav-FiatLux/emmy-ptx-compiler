@@ -105,7 +105,7 @@ register.
 | `Smem` | static `.shared` arrays up to 48 KiB in total, else one `.extern .shared` pool packed exactly like emmy's `pack_smem` |
 | `Sync` | `bar.sync 0`, `bar.sync id, count`, `bar.warp.sync -1` |
 | `WarpShuffle` | `activemask` + `shfl.sync.bfly` butterfly, the combine program run per step |
-| `TreeHalve` | every thread folds the partials itself, pairing them exactly as the halving tree would, after the barrier that precedes it: one barrier instead of one per step (4.7) |
+| `TreeHalve` | emmy's tree as written (each level folds in shared memory, then a barrier), or, when nothing can observe the shared slab afterwards, every thread folds the partials itself, pairing them exactly as the tree would: one barrier instead of one per level (4.7) |
 | `CpAsyncCopy/Commit/Wait` | `cp.async.{cg,ca}.shared.global`, `commit_group`, `wait_group N` |
 | `ZeroPrologue` | CTA 0 zeroes the delegated accumulator |
 | `RegFragment`, `LdmatrixLoad`, `MmaSyncPtx`, `Fragment*`, `RegStore` | tensor cores (section 6) |
@@ -371,6 +371,17 @@ combine); the chunks' elements are then dealt to the copies in turn, which
 keeps R independent chains (a 65,536-element sum on one warp: 25 → 8.9 µs, nvcc
 17 µs).
 
+Moving elements between threads is legal only if no partial is observed on
+its own, so `combine_refusal` checks the whole combine program before the
+rewrite: each partial must be combined with its own fold and its partner
+(`acc = fold(acc, acc_b)`; a maximum of per-lane sums is refused, since the
+elements must then stay with their lanes), in the fold's dtype, with nothing
+else in the program reading it; the warp partials may reach shared memory
+only as the input of the tree over the warps, and that tree's slab must be
+private to it (4.7). `--report` prints the reason for each refusal, e.g.
+`loop i: kept strided, not regrouped: the butterfly combines s with maximum,
+but the loop folds it with add`.
+
 ### 4.7 Block reductions with one barrier
 
 Emmy combines a block's partials with a halving tree in shared memory: for
@@ -380,9 +391,17 @@ divergent branch. Since every thread can read all W partials once they are
 written, each thread instead folds them itself, pairing them exactly as the
 tree would, so it computes the very value slot 0 would hold, bit for bit;
 one barrier at the end keeps the ordering the tree's last one gave the code
-after it. The same scheme merges a cell that spans a block's warps (4.4): each
-warp's butterfly total goes to shared memory, and after one barrier every
-thread folds the W totals.
+after it. The same scheme merges a cell that spans a block's warps (4.4): lane
+0 of each warp stores the warp's butterfly total (one writer per slot), and
+after one barrier every thread folds the W totals.
+
+The tree also leaves a state in shared memory: the root in slot 0 and partial
+combinations in the others. The one-barrier form does not, so it is used only
+when nothing can observe that state (`Lowerer._tree_refusal`): no other
+statement of the kernel reads the slab, and the tree runs once (it is in no
+loop, so no later run reads what an earlier one left). Otherwise, and always
+in the plain lowering, the tree runs as emmy writes it, with its stores and a
+barrier per level. All 155 trees of the corpus qualify.
 
 ### 4.8 Work repeated across blocks: thread-block clusters (`cluster.py`)
 
@@ -553,13 +572,45 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   on sm_89, so only modules that use them say `.version 8.1`.
 * **Reductions contract on purpose**: `acc += a*b` becomes `fma`, as nvcc
   does: faster and more accurate, and those problems carry a tolerance.
-* **Division by a constant, correctly rounded.** Emmy spells `x / 3.0` as
-  `x * reciprocal(3.0)`, and `x * RN(1/3)` can be an ulp from the correctly
-  rounded `x / 3` that numpy computes, which fails a pointwise problem checked
-  with `rtol = atol = 0` (emmy's own CUDA fails it too; found by the second
-  held-out set, §9). Outside loops, where it is cheap, the optimizing lowering
-  computes the true quotient instead (`Lowerer._quotient`), without a division
-  instruction: `div.rn.f32` is a subroutine with a slow path, and its call
+* **Constants keep their type and their sign.** Constants are value-numbered
+  by their bit patterns, so `+0` and `-0` stay different values (`1/x` tells
+  them apart), in the builder and in the IR-level CSE alike. An `Init`, a
+  typed `Let` of a literal and a reduction's seed are built in their own type,
+  rounded once: an f64 constant keeps all 53 bits, an integer one all its
+  bits.
+* **Integers** follow numpy's fixed-width arithmetic in the result's type:
+  `add`, `multiply` and the rest wrap at the width; comparisons compare the
+  operands in their own types, exactly at any magnitude (never through
+  float32, where 16,777,216 equals 16,777,217); `where`, `maximum`, `minimum`
+  and `abs` with an integer result stay integers. `floor_divide` and
+  `remainder` round down, like numpy's `//` and `%` (and torch's), which the
+  problems are checked against; emmy's CUDA prints C's `/` and `%`, which
+  truncate, so the two differ for negative operands. Unsigned values (u8 to
+  u64) keep their sign: logical right shifts, unsigned division, remainder
+  and comparison, and zero-extension when widened. u8, u16 and i16 results
+  wrap to their width.
+* **Signed zeros, NaN and the policy for rewrites.** Every rewrite is in one
+  of three classes: exact (bit for bit the IR's result: CSE, fusion,
+  congruent accumulators, unrolling, vector loads, the one-barrier tree, cell
+  moves, clusters, coarsening), reassociating within rounding (lane splits,
+  regrouping, per-block softmax updates, FMA contraction; off under
+  `--strict`), or recovering a source operation (the division below; off under
+  `--strict` and `--plain`).
+* **Division by a constant, correctly rounded, where the IR records one.**
+  Emmy's `split_invariant_divides` (emmy/compiler/ir/stmt/normalize.py) turns
+  `x / 3.0` into `x * reciprocal(3.0)`, and `x * RN(1/3)` can be an ulp from
+  the correctly rounded `x / 3` that numpy computes, which fails a pointwise
+  problem checked with `rtol = atol = 0` (emmy's own CUDA fails it too; found
+  by the second held-out set, §9). The IR's meaning is the product, the
+  source's the quotient, so the rewrite applies only where emmy's graph
+  records that the divisor came from a source division: a ConstantOp named
+  after a division node (`div_c1`: the tracer names a scalar argument
+  `<node>_c<k>`, trace/torch.py) or a mean's element count (`<out>_count`,
+  decomposition/090_mean.py). In all 493 kernels every reciprocal of a constant
+  is one of these; a reciprocal the IR asks for in its own right keeps its
+  literal meaning (a GPU test checks both). Outside loops, where it is cheap,
+  the optimizing lowering then computes the true quotient
+  (`Lowerer._quotient`), without a division instruction: `div.rn.f32` is a subroutine with a slow path, and its call
   kept ptxas from moving loads across it (a row normalization ran 3.2 →
   4.5 µs). In double precision, `x * RN(1/c)` is within 2⁻⁵² of `x / c`; and
   `x / c` is never closer than 2⁻⁴⁹ (relative) to a float32 rounding boundary,
@@ -573,8 +624,24 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
 * **Regrouped sums.** Splitting a reduction across lanes, or updating an
   online softmax once per block, changes the order of a sum, never what is
   summed. Against numpy's answers (float64 for reductions, matmul and
-  attention) our largest error over 283 problems is 14% of the tolerance and
-  the median 0.13%; numpy's own float32 computation has a median of 0.12%.
+  attention) our largest error over the 471 passing problems (commit 8b76863)
+  is 26% of the tolerance, on `k_mlp_gelu_64x256x1024x128`, whose 1024-term
+  sums emmy accumulates in float32; in the IR's own order (`--strict`) the
+  same problem uses 38%. The median is 0.14%. These are observations on the
+  problems' inputs, not error bounds.
+* **sin and cos of any float.** Below |x| = 105615 the argument is reduced by
+  a three-part Cody-Waite step with FMAs. Beyond it, on a branch the usual
+  inputs never take, the reduction is exact (Payne-Hanek): |x| = M · 2^(E-150)
+  for its 24-bit significand M, the product of M with the first 192 bits of
+  2/π is formed in 32-bit words with a 64-bit carry, and its 64 bits around
+  the binary point give the quadrant and the fraction, which rounds to the
+  nearest quadrant and becomes r = f · π/2 in double. The bits of 2/π past
+  the 192nd move the product by less than 2⁻⁶⁴, far below how close any float
+  comes to a multiple of π/2. Checked against mpmath (relative error of r
+  2.2 · 10⁻¹³ over 2¹⁷..2¹²⁷) and on the GPU: sin and cos are within 1 ulp on
+  2 million inputs in each of [0, 7], [7, 105615], [105615, 10⁹] and
+  [10⁹, 3.4 · 10³⁸]. (The former double-precision reduction lost all accuracy
+  past about 2⁴⁰: `sin(1e20)` gave 4.3 · 10³⁰.)
 * **`--strict`: results bit for bit as the IR orders its operations.**
   `compile.py --strict` (`Lowerer(strict=True)`) turns off the rewrites that
   change a result within rounding:
@@ -664,13 +731,32 @@ instead was 1.25x slower on the 72 kernels that use more than 128.
   tolerances and reduction schedule), to estimate the hidden set: 81 of 81 pass on first
   run, the largest error 10.5% of its tolerance. Launching the kernels that use shared
   memory or barriers eight times each gives bit-identical outputs (apart from atomic
-  split-K sums), so no result depends on a race.
+  split-K sums). That is evidence, not a proof of race freedom (Compute Sanitizer
+  cannot run on the evaluation runner); where lanes would store the same value to the
+  same place (a spread cell's outputs, a warp's total), one lane now stores it.
 * `tools/corpus_holdout2.py` is a second held-out set, written on 26 Oct after every
   optimization above: prime and odd sizes, single rows and queries, middle-axis and column
   reductions, matrix-vector and batched products, fused epilogues around a matmul, causal and
   multi-head attention, float16. 64 of 66 pass; the other two no compiler can pass (the
   generator lists a consumer kernel first; emmy traces `A @ v` into a 500x300 output). It
   found the division by a constant (section 7), which nvcc's build of emmy's CUDA fails too.
+* An independent review (27 Oct) built small legal kernels that the corpus never forms:
+  a maximum of per-lane sums after a cooperative loop, `x*(+0)` against `x*(-0)`, integers
+  past 2^24, a u32 shifted right, an f64 `Init` of 1.0000000000000002, `sin(1e20)`, a read
+  of a tree's shared memory, and a reciprocal written in the IR. Seven were wrong (the
+  first only when optimized, the next six in every lowering) and the eighth was the
+  division policy. Each is now a GPU test in all three lowerings
+  (`tests/test_gpu_lowering.py`), next to positive cases (a sum of sums is still
+  regrouped). The fixes changed the PTX of 43 of the 493 kernels; raced against the
+  previous build (alternating order, best of three), they run at 0.999x its time.
+  It also showed that agreement between `--strict` and `--plain` is not an independent
+  oracle: both share the builder, the math library and, until then, the tree's lowering.
+  The GPU tests compare against numpy models instead.
+* `tools/corpus_holdout3.py` is a third held-out set, written on 27 Oct after those
+  fixes were frozen and run once: sines and cosines of large arguments, divisions by
+  constants and means at `rtol = 0`, minima, maxima and clamps, norms over odd lengths,
+  and new shapes in all five categories. 39 of 39 pass on the first run (the generator
+  could not trace a fortieth), the largest error 6.2% of its tolerance.
 * `compile.py --report` (`report.py`) prints what the lowering decided for a kernel, as it
   decided it (`Lowerer.remark`): each loop's shape (split across lanes with its group and
   dealing, lane-blocked with its block, dealt, unrolled, rolled), fused loops, merged
@@ -703,3 +789,43 @@ These raise a clear error (and so cannot reach the GPU half-lowered):
 
 Emmy produces these only for other GPUs and for warp-specialized pipelines. Double-precision `tanh`, `erf`, `sin`,
 `cos` and `pow` are computed in single precision (section 7).
+
+## 11. Support, limits and next steps
+
+**What each data type supports**
+
+| | f32 | f16 | f64 | integers (i16..i64, u8..u64), bool | fp8 (e4m3, e5m2) |
+|---|---|---|---|---|---|
+| `+ - * /`, `sqrt`, comparisons, `min`/`max`, `where` | IEEE, rounded once | computed in f32, rounded once to f16 | IEEE in double | numpy's fixed-width semantics (7) | — |
+| `exp`, `log`, `sigmoid` | ≤ 1–2 ulp | via f32 | ≤ 1–2 ulp in double | via f32 | — |
+| `tanh`, `erf`, `sin`, `cos`, `pow` | ≤ 1–3 ulp (sin, cos for every float) | via f32 | computed in f32 | via f32 | — |
+| reductions, shuffles, trees | yes | yes | yes (64-bit shuffles) | yes | — |
+| tensor cores (`mma.sync`) | — | m16n8k16, f32 or f16 accumulators | — | — | — |
+| loads, stores, casts | yes | yes | yes | yes | emmy's encode and decode casts only |
+
+The default target is sm_89 with PTX ISA 8.0; modules that use clusters or the
+copy engine say sm_90, those with fp8 casts ISA 8.1, and every module runs on
+the sm_120 runner. The 170-SM count of the RTX 5090 only steers a scheduling
+hint (8); no result depends on it.
+
+**What an independent review (27 Oct) raised, and where it stands**
+
+| Point | Status |
+|---|---|
+| Regrouping must check the combine program; a maximum of partial sums is not a sum | fixed, with refusal reasons in `--report` (4.6) |
+| +0 and -0 merged by value numbering | fixed: constants keyed by their bits (7) |
+| A tree's shared memory may be read afterwards | fixed: emmy's tree as written unless provably unobservable (4.7) |
+| Integer comparisons through f32; unsignedness lost; f64 `Init` through f32 | fixed (7) |
+| `sin`/`cos` wrong past about 2^40 | fixed: Payne-Hanek, ≤ 1 ulp for every float (7) |
+| Recovering `x / c` from `x * reciprocal(c)` changes the IR's meaning | now only where emmy's graph records a source division (7) |
+| Same-value stores by several lanes | one writer per spread cell output and per warp total (4.4, 4.7) |
+| The fallback catches failures, not wrong code; strict-versus-plain is not an independent oracle | stated as such (3, 9); the GPU tests compare with numpy models |
+| Claims too broad: bit-exact, race-free, accuracy, the 17x broadcast | qualified, with datasets and revisions (README, 4.3, 9) |
+| Fresh held-out data after the fixes | `holdout3`: 39 of 39 on first run (9) |
+| An independent dtype-faithful IR interpreter, with randomly generated kernels checked against it in every lowering | next step |
+| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | next step: today lane splits, blocking, placement and clusters are separate recognisers over the same uniformity analysis |
+| A coalescing model in 32-byte sectors (alignment, dtype width, reuse) instead of 128-byte lines | next step |
+| Raw paired benchmark data in alternating order, a family-weighted view, and an ablation table per rewrite | partly: the 27 Oct fixes were raced in alternating order (9); the rest is next |
+| Compile cost: the largest module (`h2a_1x512x64`, 1.1 MB of PTX) takes about 1.8 s to generate and 6 s in ptxas | next step: an expansion budget from the estimated PTX size, with a cheaper policy for an autotuner's exploratory trials |
+| Analyses that produce facts, plans that record their preconditions, a checker, then emission | the regroup and tree checks follow that shape; the other rewrites still decide while they emit |
+| GPU tests and the corpus-dependent compile tests skip when the runner or the problem folders are absent | `EMMY_REQUIRE_ALL=1` turns those skips into failures |
