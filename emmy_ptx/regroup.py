@@ -26,10 +26,11 @@ elements to the copies in turn (element j of a chunk to copy j mod R), which
 keeps R independent chains.
 
 It only applies when the statements right after the loop are exactly such a
-full combine of the loop's accumulators across all B threads, the body is a
-pure fold (loads, arithmetic, accumulations nothing else reads), every load
-reads the loop variable plus a multiple of B, and V*B divides N, so no thread
-needs a partial chunk.
+full combine of the loop's accumulators across all B threads, with the loop's
+own fold (``combine_refusal`` checks the whole combine program and says why
+not), the body is a pure fold (loads, arithmetic, accumulations nothing else
+reads), every load reads the loop variable plus a multiple of B, and V*B
+divides N, so no thread needs a partial chunk.
 """
 
 from __future__ import annotations
@@ -51,41 +52,92 @@ def _int(e):
     return e.value if type(e).__name__ == "Literal" and not isinstance(e.value, float) else None
 
 
-def fully_combined(stmts, i: int, accs: set[str], width: int) -> bool:
-    """Do the statements after ``stmts[i]`` combine ``accs`` across all ``width``
-    threads of the group (a warp butterfly, then a tree over the warps)? Some
-    of the accumulators may first be folded into the others (an R-times
-    unrolled loop's partials, with the loop's own combine)."""
-    ops = {s.name: s.op.name for s in stmts[i].body if type(s).__name__ == "Accum"}
+def combine_refusal(stmts, i: int, accs: set[str], width: int, private=lambda tree: None) -> str | None:
+    """Why the statements after ``stmts[i]`` are not a full combine of ``accs``
+    across all ``width`` threads of the group (a warp butterfly, then a tree
+    over the warps) that folds each accumulator with its own fold, or None
+    when they are. Some accumulators may first be folded into the others (an
+    R-times unrolled loop's partials, with the loop's own combine).
+
+    Moving elements between threads is legal only if no partial is observed
+    on its own: each partial must flow straight into combines that apply the
+    loop's own associative fold to it and to its partner (a maximum of partial
+    sums is not a sum), in the same dtype, and the per-warp partials may reach
+    shared memory only as the tree's input, read by nothing but the tree
+    (``private(tree)`` says why not, or None)."""
+    loop = stmts[i]
+    folds = {s.name: s for s in loop.body if type(s).__name__ == "Accum"}
+    ops = {n: _canon(s.op.name) for n, s in folds.items()}
     rest = list(stmts[i + 1 :])
     merged = set()
     while rest and type(rest[0]).__name__ == "Accum" and rest[0].base is None:
         fold = rest[0]
-        if fold.name not in accs or fold.value not in accs - merged - {fold.name} or ops[fold.name] != fold.op.name:
+        if fold.name not in accs or fold.value not in accs - merged - {fold.name} or ops[fold.name] != _canon(fold.op.name):
             break
-        if ops[fold.value] != fold.op.name:
-            return False
+        if ops[fold.value] != _canon(fold.op.name):
+            return f"{fold.value} is folded into {fold.name} with {fold.op.name}, but the loop folds it with {ops[fold.value]}"
         merged.add(fold.value)
         rest = rest[1:]
     if merged & reads(rest):
-        return False  # a partial folded away is still read
+        return "a partial folded away is still read"
+    live = accs - merged
     if not rest or type(rest[0]).__name__ != "WarpShuffle":
-        return False
+        return "the loop's partials do not flow straight into a warp butterfly"
     shuffle = rest[0]
-    if not accs - merged <= set(shuffle.state) or int(shuffle.length) != min(width, 32):
-        return False
-    if width <= 32:
-        return True
+    if int(shuffle.length) != min(width, 32):
+        return f"the butterfly spans {int(shuffle.length)} lanes, not the {min(width, 32)} cooperating threads"
+    reason = _same_combine(shuffle, live, folds, ops, "butterfly")
+    if reason is not None or width <= 32:
+        return reason
+    slabs: set[str] = set()
     for s in rest[1:]:
         kind = type(s).__name__
         if kind == "TreeHalve":
-            whole = int(s.length) * 32 == width and s.tid_var == "warp" and s.inner is None
-            return accs - merged <= set(s.state) and whole
-        if kind not in ("Smem", "Sync", "Cond"):
-            return False
-        if kind == "Cond" and not all(type(x).__name__ == "Write" for x in (*s.body, *s.else_body)):
-            return False
-    return False
+            if not (int(s.length) * 32 == width and s.tid_var == "warp" and s.inner is None):
+                return "the tree over the warps does not span the cooperating threads"
+            reason = _same_combine(s, live, folds, ops, "tree")
+            if reason is None and slabs - set(s.bufs):
+                reason = f"warp partials are written to {sorted(slabs - set(s.bufs))}, which the tree does not reduce"
+            return reason if reason is not None else private(s)
+        if kind == "Cond":
+            for x in (*s.body, *s.else_body):
+                if type(x).__name__ != "Write" or set(x.values) - live:
+                    return "something other than the warp partials is written between the butterfly and the tree"
+                slabs.add(x.output)
+        elif kind not in ("Smem", "Sync"):
+            return f"a {kind} sits between the butterfly and the tree"
+    return "the warp partials are not combined by a tree over the warps"
+
+
+def _canon(op: str) -> str:
+    return {"sum": "add", "prod": "multiply", "amax": "maximum"}.get(op, op)
+
+
+def _same_combine(stmt, live: set[str], folds: dict, ops: dict, what: str) -> str | None:
+    """Why ``stmt`` (a WarpShuffle or TreeHalve) does not combine each of
+    ``live`` with its own fold, ``acc = fold(acc, partner)``, or None."""
+    partner = dict(zip(stmt.state, stmt.state_b))
+    if live - set(partner):
+        return f"the {what} does not combine {sorted(live - set(partner))}"
+    ours = live | {partner[n] for n in live}
+    seen = set()
+    for a in stmt.combine_states:
+        if a.name in live:
+            if a.name in seen or set(a.args) != {a.name, partner[a.name]} or len(a.args) != 2:
+                return f"the {what} computes {a.name} from {', '.join(a.args)}, not from {a.name} and its partner"
+            if _canon(a.op.name) != ops[a.name]:
+                return f"the {what} combines {a.name} with {a.op.name}, but the loop folds it with {ops[a.name]}"
+            seen.add(a.name)
+        elif set(a.args) & ours:
+            return f"the {what} reads {sorted(set(a.args) & ours)} for {a.name}, which the loop's fold does not"
+    if live - seen:
+        return f"the {what} does not update {sorted(live - seen)}"
+    dtype = getattr(stmt.dtype, "name", "f32")
+    for n in live:
+        fold_dtype = getattr(folds[n].dtype, "name", None) or "f32"
+        if fold_dtype != dtype:
+            return f"the {what} combines {n} in {dtype}, the loop folds it in {fold_dtype}"
+    return None
 
 
 def regroup(loop, start_hi: int, step: int, extent: int):

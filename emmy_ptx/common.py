@@ -28,8 +28,8 @@ C_TYPE = {
 # memory type -> the value type it is computed in after loading
 VALUE_TYPE = {
     "f32": "f32", "f16": "f16", "f64": "f64",
-    "s32": "s32", "u32": "s32", "s64": "s64", "u64": "s64",
-    "s16": "s32", "u16": "s32", "s8": "s32", "u8": "s32",
+    "s32": "s32", "u32": "u32", "s64": "s64", "u64": "u64",
+    "s16": "s32", "u16": "u32", "s8": "s32", "u8": "u32",
 }
 # memory type -> the red.add that adds a value to it (an integer add is the same for either sign)
 ATOMIC_ADD = {"f32": "f32", "f64": "f64", "f16": "noftz.f16", "s32": "s32", "u32": "u32", "s64": "u64", "u64": "u64"}

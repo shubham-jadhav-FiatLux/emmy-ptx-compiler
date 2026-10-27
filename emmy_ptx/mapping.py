@@ -356,12 +356,13 @@ def cse(body) -> tuple:
     for s in body:
         s = renamed(s, alias)
         k, key = kind(s), None
+        # (expressions by repr: emmy's Literal(0.0) == Literal(-0.0), and the two are different values)
         if k == "Assign":
             key = (s.op.name, tuple((a, version.get(a, 0)) for a in s.args), _dtype(s))
         elif k == "Let":
-            key = (s.value, _dtype(s), tuple((v, version.get(v, 0)) for v in sorted(s.value.free_vars())))
+            key = (repr(s.value), _dtype(s), tuple((v, version.get(v, 0)) for v in sorted(s.value.free_vars())))
         elif k == "Select":
-            key = (s.branches, tuple((v, version.get(v, 0)) for v in sorted(own_reads(s))))
+            key = (repr(s.branches), tuple((v, version.get(v, 0)) for v in sorted(own_reads(s))))
         if key is not None and key in seen:
             alias[s.name] = seen[key]
             continue

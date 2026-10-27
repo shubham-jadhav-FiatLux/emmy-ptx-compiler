@@ -382,6 +382,7 @@ class LaneSharing:
             return Let(name=t, value=BinaryExpr("+", Var(f"{t}$start"), BinaryExpr("*", i, Var(f"{t}$step"))))
 
         slot = LaneSlot(f"{t}$rank", group, 1)
+        writer, self.cell_writer = self.cell_writer, None  # every lane stores the iterations it takes
         with self.block(dominated=True):
             self.scope.names[f"{t}$start"], self.scope.names[f"{t}$step"] = start, step
             if rounds:
@@ -393,6 +394,7 @@ class LaneSharing:
             if rest:
                 self.body((slot, Cond(cond=BinaryExpr("<", Var(f"{t}$rank"), int_lit(rest)),
                                       body=(at(int_lit(rounds)), *s.body))))
+        self.cell_writer = writer
 
     def _deltas(self, stmts, var: str, step: int) -> list:
         """``(runs per iteration, bytes between the addresses of consecutive
@@ -550,9 +552,10 @@ class LaneSharing:
         self._lane_bytes += warps * len(states) * 4
         base = b.add(b.pure("mov.u32", "s32", (Sym(LANE_BUFFER),), 0, 1 << 24), b.int_const(offset))
         mine = b.in_reg(b.add(base, b.mul(self.value("warp"), b.int_const(len(states) * 4)))).op
+        first = b.icmp("==", b.bitop("&", self.tid, b.int_const(WARP - 1)), b.int_const(0))  # one writer a warp
         b.emit("bar.sync", Imm(0, "u32"))
         for c, name in enumerate(states):
-            b.emit("st.shared.f32", Mem(mine, c * 4), b.in_reg(self.lookup(name).read()))
+            b.emit("st.shared.f32", Mem(mine, c * 4), b.in_reg(self.lookup(name).read()), guard=first)
         b.emit("bar.sync", Imm(0, "u32"))
         totals = b.in_reg(base).op
         for part, program in fold.merges:

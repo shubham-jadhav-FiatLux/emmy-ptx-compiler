@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 
 from .builder import Builder, Value
+from .ptx import Imm, Vec
 
 LOG2E_HI = 1.44269502162933349609375  # float32(log2(e))
 LOG2E_LO = 1.925963033500011e-08  # log2(e) - LOG2E_HI
@@ -46,8 +47,10 @@ COS = (-0.5, 0.0416666679084301, -0.0013888879911974072, 2.4798757294774987e-05,
 # pi/2 = PIO2_A + PIO2_B + PIO2_C to ~1e-23 (Cody-Waite reduction with FMAs)
 PIO2_A, PIO2_B, PIO2_C = 1.5707963705062866, -4.371138828673793e-08, -1.7151245100058819e-15
 TWO_OVER_PI = 0.6366197723675814
-TRIG_FAST_LIMIT = 105615.0  # beyond this the float32 reduction loses bits; use float64
-PIO2_HI_D, PIO2_LO_D = 1.5707963267948966, 6.123233995736766e-17
+TRIG_FAST_LIMIT = 105615.0  # beyond this the float32 reduction loses bits: reduce exactly (Payne-Hanek)
+# the first 192 fraction bits of 2/pi as 32-bit words, least significant first (fdlibm's two_over_pi)
+TWO_OVER_PI_WORDS = (0x3C439041, 0xDB629599, 0xF534DDC0, 0xFC2757D1, 0x4E441529, 0xA2F9836E)
+PIO2_TIMES_2_POW_M64 = math.pi / 2 * 2.0 ** -64  # pi/2 scaled to a 0.64 fixed-point fraction
 
 # float64: ln 2 = LN2_HI_D + LN2_LO_D, LN2_HI_D with 32 significant bits so k * LN2_HI_D is
 # exact for |k| < 2^21 (fdlibm's split)
@@ -225,7 +228,8 @@ def _reduce_half_pi(b: Builder, x: Value):
     """x = k*pi/2 + r with |r| <= ~pi/4 and the quadrant k (an int).
 
     Three-constant Cody-Waite reduction with FMAs for |x| < 105615; beyond
-    that a float64 reduction (accurate to |x| ~ 2^40) on a rarely taken branch.
+    that, on a rarely taken branch, an exact Payne-Hanek reduction valid for
+    every finite float (``_reduce_exactly``).
     """
     k = b.fop("cvt.rni.s32.f32", b.fbin("*", x, _c(b, TWO_OVER_PI)), type_="s32")
     nk = b.fop("neg.f32", b.convert(k, "f32"))
@@ -236,16 +240,58 @@ def _reduce_half_pi(b: Builder, x: Value):
     fast = b.label("trig_fast")
     b.branch(fast, b.fcmp(">", b.fop("abs.f32", b.in_reg(x)), _c(b, TRIG_FAST_LIMIT)), negate=True)
     with b.guarded(), b.cse_scope():
-        xd = b.convert(x, "f64")
-        kd = b.fop("cvt.rni.f64.f64", b.fop("mul.rn.f64", xd, _f64(b, TWO_OVER_PI), type_="f64"), type_="f64")
-        nkd = b.fop("neg.f64", kd, type_="f64")
-        rd = b.fop("fma.rn.f64", nkd, _f64(b, PIO2_HI_D), xd, type_="f64")
-        rd = b.fop("fma.rn.f64", nkd, _f64(b, PIO2_LO_D), rd, type_="f64")
-        b.assign(r_var, b.convert(rd, "f32"))
-        kq = b.fop("cvt.rzi.s64.f64", kd, type_="s64")
-        b.assign(k_var, b.convert(b.bitop("&", kq, b.int_const(3, "s64")), "s32"))
+        r_big, k_big = _reduce_exactly(b, x)
+        b.assign(r_var, r_big)
+        b.assign(k_var, k_big)
     b.place(fast)
     return r_var.read(), k_var.read()
+
+
+def _reduce_exactly(b: Builder, x: Value):
+    """Payne-Hanek: |x| = M * 2^(E-150) for its 24-bit significand M, so
+    |x| * 2/pi = M * G * 2^(E-342) with G the first 192 fraction bits of 2/pi
+    as an integer. The 216-bit product P = M * G is formed word by word with
+    a 64-bit carry; the 64 bits of P around its binary point (bit 192 - (E -
+    150)) hold the quadrant (two integer bits) and 62 bits of the fraction f.
+    Rounding to the nearest quadrant leaves f in [-1/2, 1/2), and r = f * pi/2
+    in double. The bits of 2/pi past the 192nd move |x| * 2/pi by less than
+    2^-64, far below the closest a float comes to a multiple of pi/2, so r has
+    nearly double precision for every finite x (checked against mpmath to a
+    relative 2.2e-13 over 2^17..2^127). An infinity or NaN gives NaN."""
+    ax = b.fop("abs.f32", b.in_reg(x))
+    bits = b.bits(ax)
+    exponent = b.bitop("&", b.shr(bits, b.int_const(23)), b.int_const(0xFF))
+    m = b.bitop("|", b.bitop("&", bits, b.int_const(0x7FFFFF)), b.int_const(0x800000))
+    words, carry = [], None
+    for w in TWO_OVER_PI_WORDS:  # P = M * G, a 32-bit word at a time
+        part = b.pure("mul.wide.u32", "u64", (m, Imm(w, "u32")))
+        carry = part if carry is None else b.pure("add.u64", "u64", (carry, part))
+        words.append(b.pure("cvt.u32.u64", "u32", (carry,)))
+        carry = b.pure("shr.u64", "u64", (carry, Imm(32, "u32")))
+    words.append(b.pure("cvt.u32.u64", "u32", (carry,)))
+    low = b.sub(b.int_const(280), exponent)  # the window's lowest bit: 192 - (E - 150) - 62
+    word, shift = b.shr(low, b.int_const(5)), b.bitop("&", low, b.int_const(31))
+
+    def pick(k: int) -> Value:  # words[word + k], by a chain of selects
+        out = words[-1]
+        for j in range(len(words) - 2, -1, -1):
+            out = b.select(b.icmp("==", word, b.int_const(j - k)), words[j], out)
+        return b.in_reg(out)
+
+    pair = b.pure("mov.b64", "u64", (Vec((pick(0).op, pick(1).op)),))
+    top = b.pure("cvt.u64.u32", "u64", (pick(2),))
+    window = b.pure("or.b64", "u64", (b.pure("shr.u64", "u64", (pair, shift)),
+                                      b.pure("shl.b64", "u64", (top, b.sub(b.int_const(64), shift)))))
+    quadrant = b.pure("cvt.u32.u64", "s32", (b.pure("shr.u64", "u64", (window, Imm(62, "u32"))),), 0, 3)
+    fraction = b.pure("shl.b64", "s64", (window, Imm(2, "u32")))  # f in 0.64 fixed point, read as signed
+    up = b.icmp("<", fraction, b.int_const(0, "s64"))  # f >= 1/2: the next quadrant, f - 1
+    quadrant = b.select(up, b.add(quadrant, b.int_const(1)), quadrant)
+    r = b.convert(b.fbin("*", b.pure("cvt.rn.f64.s64", "f64", (fraction,)), _f64(b, PIO2_TIMES_2_POW_M64)), "f32")
+    negative = b.fcmp("<", x, _c(b, 0.0))  # sin and cos of -|x|: the quadrant and r negate
+    r = b.select(negative, b.fop("neg.f32", r), r)
+    quadrant = b.select(negative, b.sub(b.int_const(0), quadrant), quadrant)
+    finite = b.fcmp("<", ax, _c(b, INF))
+    return b.select(finite, r, _c(b, math.nan)), b.bitop("&", quadrant, b.int_const(3))
 
 
 def _f64(b: Builder, v: float) -> Value:

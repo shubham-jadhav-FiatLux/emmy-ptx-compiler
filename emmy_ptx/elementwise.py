@@ -21,6 +21,7 @@ import numpy as np
 
 from . import mathlib
 from .builder import NUMPY_FLOAT, Builder, Value, float_type
+from .ptx import Imm
 
 INTEGER_DTYPES = frozenset({"i16", "i32", "i64", "u8", "u16", "u32", "u64"})
 # fp8 formats: a value is its byte code in an s32 register; no arithmetic runs on it, only the
@@ -34,13 +35,17 @@ _WIDTH = {"u8": 8, "i16": 16, "u16": 16, "i32": 32, "u32": 32, "i64": 64, "u64":
 
 
 def value_type(dtype: str) -> str:
-    """The register type a value of emmy dtype ``dtype`` is computed in."""
+    """The register type a value of emmy dtype ``dtype`` is computed in. The
+    type carries the signedness: unsigned values divide, shift, compare and
+    widen as unsigned numbers."""
     if dtype in ("f32", "bf16"):
         return "f32"
     if dtype in ("f16", "f64"):
         return dtype
     if dtype in ("i64", "u64"):
-        return "s64"
+        return "s" + dtype[1:] if dtype[0] == "i" else dtype
+    if dtype in ("u8", "u16", "u32"):
+        return "u32"
     if dtype in INTEGER_DTYPES or dtype in F8_DTYPES or dtype == "bool":
         return "s32"
     raise ValueError(f"unsupported dtype {dtype!r}")
@@ -62,9 +67,20 @@ def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     if op in _F8_CASTS:
         return _F8_CASTS[op](b, args[0])
     out_type = value_type(dtype)
-    if out_type in ("s32", "s64") and op in _INT:
-        args = [b.convert(a, out_type) for a in args]
-        return _INT[op](b, *args)
+    if op in _COMPARE:
+        # C compares the operands in their own types (integers exactly, an f64 in
+        # double); the result is the 0 or 1 of the test, in the result's type
+        x, y = args
+        test = b.icmp(_COMPARE[op], x, y) if x.is_int and y.is_int else b.fcmp(_COMPARE[op], x, y)
+        return b.convert(test, out_type)
+    if out_type in INT_VALUE_TYPES and op in _INT:
+        if op == "where":  # the condition keeps its own type
+            args = [args[0], *(b.convert(a, out_type) for a in args[1:])]
+        elif op in ("left_shift", "right_shift"):  # the shift amount is a u32 operand
+            args = [b.convert(args[0], out_type), b.convert(args[1], "u32")]
+        else:
+            args = [b.convert(a, out_type) for a in args]
+        return _narrow(b, _INT[op](b, out_type, *args), dtype)
     double = out_type == "f64" and (op in _DOUBLE or op not in _SINGLE)
     fn = _DOUBLE.get(op, _FLOAT.get(op)) if double else _FLOAT.get(op)
     if fn is None:
@@ -112,10 +128,6 @@ _F8_CASTS = {
 def _as_float(b: Builder, p: Value) -> Value:
     """A C comparison used as a value: 1.0 or 0.0."""
     return b.select(p, b.f32_const(1.0), b.f32_const(0.0))
-
-
-def _cmp(op: str):
-    return lambda b, x, y: _as_float(b, b.fcmp(op, x, y))
 
 
 def _unary(opcode: str, fold):
@@ -172,12 +184,6 @@ _FLOAT = {
     "cos": mathlib.cos,
     "pow": mathlib.pow,
     "where": lambda b, c, x, y: b.select(b.truthy(c), x, y),
-    "equal": _cmp("=="),
-    "not_equal": _cmp("!="),
-    "greater": _cmp(">"),
-    "less": _cmp("<"),
-    "greater_equal": _cmp(">="),
-    "less_equal": _cmp("<="),
     "bitwise_and": lambda b, x, y: _as_float(b, b.pand(b.truthy(x), b.truthy(y))),
     "bitwise_or": lambda b, x, y: _as_float(b, b.por(b.truthy(x), b.truthy(y))),
     "bitwise_not": lambda b, x: _as_float(b, b.fcmp("==", x, b.f32_const(0.0))),
@@ -193,17 +199,121 @@ _DOUBLE = {
     "sigmoid": mathlib.sigmoid64,
 }
 
+# ---- integers: fixed-width two's-complement arithmetic of the result type (like numpy's
+# arrays), signed or unsigned by the type; constants fold with the same wrap-around
+
+INT_VALUE_TYPES = frozenset({"s32", "s64", "u32", "u64"})
+_COMPARE = {"equal": "==", "not_equal": "!=", "greater": ">", "less": "<", "greater_equal": ">=", "less_equal": "<="}
+
+
+def _bits(t: str) -> int:
+    return 64 if t in ("s64", "u64") else 32
+
+
+def _wrapped(t: str, v: int) -> int:
+    """``v`` reduced to type ``t``'s width (two's complement for signed types)."""
+    bits = _bits(t)
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if t[0] == "s" and v >> (bits - 1) else v
+
+
+def _narrow(b: Builder, v: Value, dtype: str) -> Value:
+    """A u8, u16, i8 or i16 result computed in 32 bits, wrapped to its width."""
+    width = {"u8": 8, "u16": 16, "i8": 8, "i16": 16}.get(dtype)
+    if width is None or v.type not in ("s32", "u32"):
+        return v
+    if v.const is not None:
+        w = int(v.const) & ((1 << width) - 1)
+        return b.int_const(w - (1 << width) if dtype[0] == "i" and w >> (width - 1) else w, v.type)
+    if dtype[0] == "u":
+        return b.pure("and.b32", v.type, (v, b.int_const((1 << width) - 1, v.type)), 0, (1 << width) - 1)
+    return b.pure("bfe.s32", v.type, (v, Imm(0, "u32"), Imm(width, "u32")), -(1 << (width - 1)), (1 << (width - 1)) - 1)
+
+
+def _int_op(opcode: str, fold, commutative: bool = False):
+    """One instruction ``opcode`` (``{t}``: the type, ``{w}``: its width), or
+    the folded constant when both operands are constants."""
+    def fn(b: Builder, t: str, x: Value, y: Value) -> Value:
+        if x.const is not None and y.const is not None:
+            r = fold(int(x.const), int(y.const))
+            if r is not None:
+                return b.int_const(_wrapped(t, r), t)
+        return b.pure(opcode.format(t=t, w=_bits(t)), t, (x, y), commutative=commutative)
+    return fn
+
+
+def _division(remainder: bool):
+    """numpy's ``floor_divide`` / ``remainder`` (Python's ``//`` and ``%``: the
+    quotient rounds down, the remainder takes the divisor's sign). The
+    hardware's ``div``/``rem`` truncate; for signed operands of different
+    signs the result moves by one step. (emmy's CUDA prints C's ``/`` and
+    ``%``, which differ from numpy's answer there.)"""
+    def fold(x: int, y: int):
+        if y == 0:
+            return None  # left to the hardware, like any division by zero
+        return x % y if remainder else x // y
+
+    def fn(b: Builder, t: str, x: Value, y: Value) -> Value:
+        if x.const is not None and y.const is not None and fold(int(x.const), int(y.const)) is not None:
+            return b.int_const(_wrapped(t, fold(int(x.const), int(y.const))), t)
+        r = b.pure(f"rem.{t}", t, (x, y))
+        q = r if remainder else b.pure(f"div.{t}", t, (x, y))
+        if t[0] == "u" or (x.nonneg and y.lo is not None and y.lo > 0):
+            return q  # no operand below zero: truncation is the floor
+        zero = b.int_const(0, t)
+        sign_differs = b.icmp("<", b.pure(f"xor.b{_bits(t)}", t, (r, y), commutative=True), zero)
+        step = b.pand(b.icmp("!=", r, zero), sign_differs)
+        moved = b.pure(f"add.{t}", t, (r, y)) if remainder else b.pure(f"sub.{t}", t, (q, b.int_const(1, t)))
+        return b.select(step, moved, q)
+    return fn
+
+
+def _shift(left: bool):
+    def fn(b: Builder, t: str, x: Value, y: Value) -> Value:
+        if x.const is not None and y.const is not None and 0 <= y.const < _bits(t):
+            return b.int_const(_wrapped(t, int(x.const) << int(y.const) if left else int(x.const) >> int(y.const)), t)
+        # shr.s* shifts in copies of the sign bit (numpy's >> on signed values), shr.u* zeros
+        return b.pure(f"shl.b{_bits(t)}" if left else f"shr.{t}", t, (x, y))
+    return fn
+
+
+def _int_unary(fn_signed, fn_unsigned=None):
+    def fn(b: Builder, t: str, x: Value) -> Value:
+        return (fn_unsigned or fn_signed)(b, t, x) if t[0] == "u" else fn_signed(b, t, x)
+    return fn
+
+
+def _iabs(b: Builder, t: str, x: Value) -> Value:
+    if x.const is not None:
+        return b.int_const(_wrapped(t, abs(int(x.const))), t)
+    return b.pure(f"abs.{t}", t, (x,))
+
+
+def _ineg(b: Builder, t: str, x: Value) -> Value:
+    if x.const is not None:
+        return b.int_const(_wrapped(t, -int(x.const)), t)
+    return b.pure(f"sub.{t}", t, (b.int_const(0, t), x))
+
+
 _INT = {
-    "add": lambda b, x, y: b.add(x, y),
-    "subtract": lambda b, x, y: b.sub(x, y),
-    "multiply": lambda b, x, y: b.mul(x, y),
-    "floor_divide": lambda b, x, y: b.div(x, y),  # emmy prints `//` as C `/`
-    "remainder": lambda b, x, y: b.rem(x, y),
-    "mod": lambda b, x, y: b.rem(x, y),
-    "left_shift": lambda b, x, y: b.shl(x, y),
-    "right_shift": lambda b, x, y: b.shr(x, y),
-    "bitwise_and": lambda b, x, y: b.bitop("&", x, y),
-    "bitwise_or": lambda b, x, y: b.bitop("|", x, y),
-    "bitwise_xor": lambda b, x, y: b.bitop("^", x, y),
-    "bitwise_count": lambda b, x: b.pure(f"popc.b{x.type[1:]}", "s32", (x,), 0, int(x.type[1:])),
+    "add": _int_op("add.{t}", lambda x, y: x + y, commutative=True),
+    "subtract": _int_op("sub.{t}", lambda x, y: x - y),
+    "multiply": _int_op("mul.lo.{t}", lambda x, y: x * y, commutative=True),
+    "floor_divide": _division(remainder=False),
+    "remainder": _division(remainder=True),
+    "mod": _division(remainder=True),
+    "left_shift": _shift(left=True),
+    "right_shift": _shift(left=False),
+    "bitwise_and": _int_op("and.b{w}", lambda x, y: x & y, commutative=True),
+    "bitwise_or": _int_op("or.b{w}", lambda x, y: x | y, commutative=True),
+    "bitwise_xor": _int_op("xor.b{w}", lambda x, y: x ^ y, commutative=True),
+    "bitwise_count": lambda b, t, x: b.pure(f"popc.b{_bits(t)}", "s32", (x,), 0, _bits(t)),
+    "maximum": _int_op("max.{t}", max, commutative=True),
+    "minimum": _int_op("min.{t}", min, commutative=True),
+    "abs": _int_unary(_iabs, lambda b, t, x: x),
+    "negative": _ineg,
+    "square": lambda b, t, x: _INT["multiply"](b, t, x, x),
+    "copy": lambda b, t, x: x,
+    "pad": lambda b, t, x: x,
+    "where": lambda b, t, c, x, y: b.select(b.truthy(c), x, y),
 }

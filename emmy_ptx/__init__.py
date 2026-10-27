@@ -25,7 +25,9 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
     Should the optimizing lowering fail (an IR shape one of its rewrites did
     not foresee) or give a module longer than the runner accepts, the kernel
     is lowered again plainly (``Lowerer(plain=True)``): one rule per
-    statement, in the IR's order, without the optional rewrites. ``plain``
+    statement, in the IR's order, without the optional rewrites. This is a
+    fallback for a lowering that fails, not a check of the code: wrong code
+    that lowers without an error is not caught here (the tests do that). ``plain``
     lowers it that way from the start (``compile.py --plain``). ``strict``
     keeps only the rewrites that leave every floating-point result bit for bit
     as the IR's own order and rounding give it (``compile.py --strict``).
@@ -50,6 +52,9 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
         mode = "plainly" + (" and strictly" if strict else "")
     kernel = Lowerer(src, plain=True, strict=strict).run()
     ptx = kernel.render(PTX_VERSION, TARGET)
+    if len(ptx) > PTX_LIMIT:
+        print(f"error: {src.name}: even the plain lowering gives {len(ptx)} characters of PTX, more than the "
+              f"runner's {PTX_LIMIT}", file=sys.stderr)
     if report:
         print(_report(src, kernel, ptx, mode), file=sys.stderr)
     return ptx

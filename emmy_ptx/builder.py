@@ -28,7 +28,7 @@ import numpy as np
 
 from .ptx import Block, Imm, Instr, Kernel, Label, LabelRef, Mem, Reg, Vec
 
-INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1)}
+INT_RANGE = {"s32": (-(2**31), 2**31 - 1), "s64": (-(2**63), 2**63 - 1), "u32": (0, 2**32 - 1), "u64": (0, 2**64 - 1)}
 WARP = 32
 NUMPY_FLOAT = {"f32": np.float32, "f64": np.float64}
 
@@ -83,7 +83,9 @@ class Value:
         if self.mutable:
             return None if self.version is None else ("var", self.op.name, self.version)
         if isinstance(self.op, Imm):
-            return ("imm", self.op.type, self.op.value)
+            value = self.op.value
+            # a float by its bits: +0 and -0 are equal numbers but different values (1/x tells them apart)
+            return ("imm", self.op.type, value.hex() if isinstance(value, float) else value)
         return ("reg", self.op.name)
 
 
@@ -330,6 +332,7 @@ class Builder:
         v = int(v)
         if type_ is None:
             type_ = "s32" if INT_RANGE["s32"][0] <= v <= INT_RANGE["s32"][1] else "s64"
+        v = _wrap_int(v, type_)
         return Value(type_, Imm(v, type_), v, v)
 
     def f32_const(self, x: float) -> Value:
@@ -341,6 +344,21 @@ class Builder:
 
     def pred_const(self, b: bool) -> Value:
         return Value("pred", Imm(bool(b), "pred"))
+
+    def const_of(self, x, type_: str) -> Value:
+        """The number ``x`` (an IR initializer) as a constant of value type
+        ``type_``, rounded once: f64 keeps every bit, f16 rounds straight from
+        the double, and an integer is exact (a float out of its range saturates,
+        as ``cvt.rzi`` does)."""
+        if type_ in INT_RANGE:
+            lo, hi = INT_RANGE[type_]
+            if isinstance(x, float):
+                x = 0 if x != x else min(max(x, lo), hi)  # (cvt.rzi turns NaN into 0)
+            return self.int_const(min(max(int(x), lo), hi), type_)
+        if type_ == "f16":
+            with np.errstate(over="ignore"):  # (past the f16 range: an infinity, as C converts it)
+                return self.convert(self.f32_const(float(np.float16(x))), "f16")  # exact: every f16 is an f32
+        return self.float_const(float(x), type_)
 
     def special(self, name: str, lo: int, hi: int) -> Value:
         """Read a special register such as ``%tid.x`` (range from the launch)."""
@@ -420,14 +438,18 @@ class Builder:
                 return self.select(v, self.int_const(1, type_), self.int_const(0, type_))
             one, zero = self.f32_const(1.0), self.f32_const(0.0)
             return self.convert(self.select(v, one, zero), type_)
-        if v.is_int and type_ in INT_RANGE:
+        if v.is_int and type_ in INT_RANGE:  # C's conversion: the value modulo the width
             if v.const is not None:
                 return self.int_const(v.const, type_)
-            if type_ == "s64":
-                return self.pure("cvt.s64.s32", "s64", (v,), v.lo, v.hi)
-            lo, hi = INT_RANGE["s32"]
+            lo, hi = INT_RANGE[type_]
             keep = v.lo is not None and lo <= v.lo and v.hi <= hi
-            return self.pure("cvt.u32.u64", "s32", (v,), v.lo if keep else None, v.hi if keep else None)
+            rlo, rhi = (v.lo, v.hi) if keep else (None, None)
+            wide, to_wide = v.type in ("s64", "u64"), type_ in ("s64", "u64")
+            if wide == to_wide:  # the same bits, read with the other sign
+                return self.pure(f"mov.b{64 if wide else 32}", type_, (v,), rlo, rhi)
+            if to_wide:  # sign- or zero-extended, as the source's own sign says
+                return self.pure("cvt.s64.s32" if v.type == "s32" else "cvt.u64.u32", type_, (v,), rlo, rhi)
+            return self.pure("cvt.u32.u64", type_, (v,), rlo, rhi)  # the low half
         if v.is_int and type_ in ("f32", "f64"):
             if v.const is not None:
                 return self.float_const(float(v.const), type_)
@@ -460,7 +482,7 @@ class Builder:
 
     def _widen(self, a: Value, b: Value, lo: int, hi: int):
         """Common integer type for ``a op b``; 64-bit if the range needs it."""
-        t = "s64" if "s64" in (a.type, b.type) else "s32"
+        t = "s64" if {a.type, b.type} & {"s64", "u64"} else "s32"
         if t == "s32" and not (INT_RANGE["s32"][0] <= lo and hi <= INT_RANGE["s32"][1]):
             t = "s64"
         return self.convert(a, t), self.convert(b, t), t
@@ -620,6 +642,8 @@ class Builder:
         decided = _decide(op, a.lo, a.hi, b.lo, b.hi)
         if decided is not None:
             return self.pred_const(decided)
+        if a.type == b.type:  # one type: one comparison of that type (unsigned or signed)
+            return self.pure(f"setp.{_CMP[op]}.{a.type}", "pred", (a, b))
         a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
         return self.pure(f"setp.{_CMP[op]}.{t}", "pred", (a, b))
 
@@ -648,7 +672,9 @@ class Builder:
             return a if p.const else b
         if a.key() is not None and a.key() == b.key():
             return a
-        if a.is_int and b.is_int:
+        if a.is_int and b.is_int and a.type == b.type:  # (integers of one type stay that type)
+            t, lo, hi = a.type, min(a.lo, b.lo), max(a.hi, b.hi)
+        elif a.is_int and b.is_int:
             a, b, t = self._widen(a, b, min(a.lo, b.lo), max(a.hi, b.hi))
             lo, hi = min(a.lo, b.lo), max(a.hi, b.hi)
         else:
@@ -768,7 +794,17 @@ def _is_plus_zero(v: Value) -> bool:
 
 
 def _mov_type(t: str) -> str:
-    return {"s32": "b32", "s64": "b64", "f16": "b16"}.get(t, t)
+    return {"s32": "b32", "s64": "b64", "u32": "b32", "u64": "b64", "f16": "b16"}.get(t, t)
+
+
+def _wrap_int(v: int, type_: str) -> int:
+    """``v`` as integer type ``type_`` holds it: modulo its width, two's
+    complement for the signed types."""
+    if type_ not in INT_RANGE:
+        return v
+    bits = 64 if type_ in ("s64", "u64") else 32
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if type_[0] == "s" and v >> (bits - 1) else v
 
 
 def _float_rank(t: str) -> int:

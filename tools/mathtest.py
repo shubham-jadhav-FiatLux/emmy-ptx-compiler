@@ -121,8 +121,8 @@ CASES = {
     "tanh": (mathlib.tanh, np.tanh, [(0.0, 0.6), (0.6, 12.0)]),
     "sigmoid": (mathlib.sigmoid, lambda x: 1.0 / (1.0 + np.exp(-x)), [(0.0, 20.0), (20.0, 104.0)]),
     "erf": (mathlib.erf, _erf, [(0.0, 1.0), (1.0, 6.0)]),
-    "sin": (mathlib.sin, np.sin, [(0.0, 7.0), (7.0, 105615.0), (105615.0, 1e9)]),
-    "cos": (mathlib.cos, np.cos, [(0.0, 7.0), (7.0, 105615.0), (105615.0, 1e9)]),
+    "sin": (mathlib.sin, np.sin, [(0.0, 7.0), (7.0, 105615.0), (105615.0, 1e9), (1e9, 3.4e38)]),
+    "cos": (mathlib.cos, np.cos, [(0.0, 7.0), (7.0, 105615.0), (105615.0, 1e9), (1e9, 3.4e38)]),
     # float64, against long double
     "exp64": (mathlib.exp64, np.exp, [(0.0, 1.0), (1.0, 708.0), (708.0, 746.0)]),
     "log64": (mathlib.log64, np.log, [(0.0, 1e-300), (1e-300, 1e308), (0.5, 2.0)]),

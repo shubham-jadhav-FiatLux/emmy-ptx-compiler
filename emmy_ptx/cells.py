@@ -73,6 +73,8 @@ class CellLayout:
         self.converged = not s.aux_threads and (not needs_guard or (lanes % WARP == 0 and block % WARP == 0))
         cell = b.shr(gid, b.int_const(spread.bit_length() - 1)) if spread > 1 else gid
         self.shared_loop, self.cell_threads = False, spread if spread > WARP else 1
+        # the spread lanes of a cell compute its results alike: one of them stores them
+        self.cell_writer = b.icmp("==", b.bitop("&", gid, b.int_const(spread - 1)), b.int_const(0)) if spread > 1 else None
         coords = self._decode(s, cell, extents, spread)
         with self.block(guarded=needs_guard):
             for name, v in zip((a.name for a in s.axes), coords):
@@ -91,7 +93,7 @@ class CellLayout:
         if plan is not None:  # worth it where every lane group would be larger than the lanes a group has now
             alike = min((v.ug for i, v in enumerate(coords) if i != plan.axis and extents[i] > 1), default=WARP)
             self.wants_place |= min(plan.parts) > alike
-        self.converged, self.cell_threads = False, 1
+        self.converged, self.cell_threads, self.cell_writer = False, 1, None
         b.place(done)
 
     def _spread(self, s, n: int, candidate: bool = False) -> int:

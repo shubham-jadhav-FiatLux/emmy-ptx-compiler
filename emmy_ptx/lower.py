@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import re
 from dataclasses import replace
 
 from . import bulk, cluster, coarsen, elementwise, mapping
@@ -39,7 +40,7 @@ from .frontend import KernelSource
 from .lanes import LANE_BUFFER, LaneSharing
 from .mapping import LOOPS, assigned, kind, produced, reads, walk
 from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, LabelRef, Mem, Reg, Sym, Vec
-from .regroup import fully_combined, regroup
+from .regroup import combine_refusal, regroup
 from .tensorcore import TensorCoreLowering, fragment_index, fragment_refs
 from .vectorize import vectorize_loads
 
@@ -82,6 +83,9 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self.wants_place = False  # would one gain from placed cells (see run)?
         self.placed_shared = False  # did a Tile with placed cells share a loop's work?
         self.store_guard: Value | None = None  # only lanes for which this holds store (_placed_tile)
+        # the one lane of a spread cell that stores the cell's results (its lanes all hold them alike);
+        # a dealt loop's stores, which differ from lane to lane, are each lane's own
+        self.cell_writer: Value | None = None
         # A grid that fits in one wave puts at most one CTA on each SM, so extra
         # registers per thread cannot cost occupancy: let ptxas spend them on
         # keeping more loads in flight (it otherwise caps registers to leave room
@@ -102,7 +106,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self._fmas = 0  # Accum updates contracted into an FMA (for the report)
         self._stash_slots = 0  # iterations a block stashes for each thread (cluster.py)
         self._loops = 0  # loops around the statement being lowered
-        self._reciprocal_of: dict[str, Value] = {}  # SSA name -> the constant it is the reciprocal of
+        self._reciprocal_of: dict[str, Value] = {}  # SSA name -> the source divisor it is the reciprocal of
+        self._constant_from: dict[str, str] = {}  # SSA name -> the ConstantOp buffer it was loaded from
         self.shared = self._layout_shared()
         self.globals = self._prologue()
         self._readonly = frozenset(n for n, g in self.globals.items() if g.readonly)
@@ -188,12 +193,19 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         if not accs or step is None or self.strict:  # (chunks regroup the sums)
             return s
         start = self.expr(s.start)  # the thread's rank among the cooperating threads
-        if start.lo != 0 or start.hi is None or not fully_combined(stmts, i, accs, start.hi + 1):
+        if start.lo != 0 or start.hi is None:
+            return s
+        refusal = combine_refusal(stmts, i, accs, start.hi + 1, self._tree_refusal)
+        if refusal is not None:
+            self.remark(f"loop {s.axis.name}: kept strided, not regrouped: {refusal}")
             return s
         chunked = regroup(s, start.hi, step, int(s.axis.extent.as_static()))
         if chunked is None:
             return s
-        self.remark(f"loop {s.axis.name}: the {step} cooperating threads take contiguous chunks instead of a stride")
+        folds = ", ".join(sorted({f"{st.name} by {st.op.name}" for st in s.body if type(st).__name__ == "Accum"}))
+        self.remark(f"loop {s.axis.name}: the {step} cooperating threads take contiguous chunks instead of a stride "
+                    f"(checked: the partials ({folds}) flow only into combines with the same fold; the sum is "
+                    f"reassociated, so --strict keeps the stride)")
         return chunked
 
     def _fusable(self, s, t) -> bool:
@@ -526,7 +538,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                     raise LoweringError(f"Accum {st.name!r}: op {st.op.name!r} has no identity")
                 if loop.seed:
                     dtype = elementwise.value_type(st.dtype.name if st.dtype is not None else "f32")
-                    self.declare_var(st.name, dtype, self.b.convert(self.b.f32_const(IDENTITY[canon]), dtype))
+                    self.declare_var(st.name, dtype, self.b.const_of(IDENTITY[canon], dtype))
 
     def _loop(self, s, start: Value, step: Value, end: Value, end_name: str | None = None) -> None:
         """``for (v = start; v < end; v += step) body``.
@@ -727,6 +739,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     def stmt_Let(self, s) -> None:
         if s.dtype is None:
             v = self.expr(s.value)
+        elif kind(s.value) == "Literal":  # a number of the declared type, rounded once
+            v = self.b.const_of(s.value.value, elementwise.value_type(s.dtype.name))
         else:
             vtype = elementwise.value_type(s.dtype.name)
             v = self.b.convert(self.expr(s.value, "f64" if vtype == "f64" else "f32"), vtype)
@@ -734,7 +748,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
     def stmt_Init(self, s) -> None:
         dtype = elementwise.value_type(s.dtype.name)
-        self.declare_var(s.name, dtype, self.b.convert(self.b.f32_const(float(s.identity)), dtype))
+        self.declare_var(s.name, dtype, self.b.const_of(s.identity, dtype))
 
     def stmt_Assign(self, s) -> None:
         args = [self.value(a) for a in s.args]
@@ -746,7 +760,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         else:
             v = elementwise.apply(self.b, op, args, dtype)
         self._reciprocal_of.pop(s.name, None)
-        if op == "reciprocal" and len(args) == 1 and args[0].const is not None:
+        if op == "reciprocal" and len(args) == 1 and args[0].const is not None and _divisor_constant(
+                self._constant_from.get(s.args[0] if isinstance(s.args[0], str) else "")):
             self._reciprocal_of[s.name] = args[0]
         if (op == "multiply" and v.type == "f32" and v.const is None and all(a.type == "f32" for a in args)
                 and all(a.key() is not None for a in args)  # a variable read only with its version
@@ -756,12 +771,19 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
     def _constant_quotient(self, s, op: str, args, dtype: str) -> tuple[Value, Value] | None:
         """``(x, c)`` when Assign ``s`` multiplies x by the reciprocal of a
-        constant c outside every loop, with a float32 or float16 result: emmy
-        spells ``x / 3.0`` that way, and x * RN(1/3) can be an ulp from the
-        correctly rounded quotient that numpy's ``x / 3.0`` gives (pointwise
-        problems compare with rtol = 0). A power-of-two c, whose reciprocal is
-        exact, stays a multiply. ``--strict`` and ``--plain`` keep the IR's
-        own operations."""
+        source divisor c outside every loop, with a float32 or float16 result.
+
+        This recovers a division the IR records: emmy's ``split_invariant_divides``
+        (emmy/compiler/ir/stmt/normalize.py) turns ``x / c`` into
+        ``x * reciprocal(c)``, and x * RN(1/3) can be an ulp from the correctly
+        rounded quotient that the source's ``x / 3.0`` gives (pointwise problems
+        compare with numpy at rtol = 0). It applies only where the graph says
+        c divided in the source: a ConstantOp that emmy's tracer named after a
+        division node (``div_c1``, trace/torch.py) or a mean's element count
+        (``*_count``, decomposition/090_mean.py), see ``_divisor_constant``. A
+        reciprocal the IR asks for in its own right keeps its literal meaning,
+        as do ``--strict`` and ``--plain`` everywhere. A power-of-two c, whose
+        reciprocal is exact, stays a multiply."""
         if op != "multiply" or len(args) != 2 or self.strict or self.plain or self._loops:
             return None
         if elementwise.value_type(dtype) not in ("f32", "f16"):
@@ -773,7 +795,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 continue
             if math.frexp(c.const)[0] in (0.5, -0.5):
                 return None  # 1/c is exact: the multiply is already the quotient
-            self.remark("x * reciprocal(c) for a constant c computed as the correctly rounded x / c")
+            self.remark("x * reciprocal(c), where emmy split the source's x / c, computed as the correctly rounded "
+                        "x / c (the divisor is a ConstantOp of a division)")
             return args[1 - i], c
         return None
 
@@ -828,12 +851,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         mtype = MEM_TYPE[s.dtype.name] if s.dtype is not None else buf.type
         if isinstance(buf, GlobalBuffer) and s.input in self.src.constants and s.is_scalar:
             value = self.src.constants[s.input]  # a 1-element buffer holds exactly this
-            vtype = VALUE_TYPE[mtype]
-            if vtype in INT_RANGE:
-                const = self.b.int_const(int(value), vtype)
-            else:
-                const = self.b.convert(self.b.float_const(value, vtype), vtype)
-            self.define(s.names[0], const)
+            self.define(s.names[0], self.b.const_of(value, VALUE_TYPE[mtype]))
+            self._constant_from[s.names[0]] = s.input
             return
         values = self.load(buf, mtype, s.index, len(s.names))
         for name, v in zip(s.names, values):
@@ -855,15 +874,15 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             addr = self.address(buf, flat=base.plus(Affine(const=k)))
             ug = b.ug_of(addr)  # lanes that read the same address read the same value
             if n == 1 and space == "global.nc":
-                out.append(b.pure(f"ld.{space}.{_ldst(mtype)}", vtype, (addr,)))
+                out.append(b.pure(f"ld.{space}.{_ldst(mtype)}", vtype, (addr,), *_type_range(mtype)))
             elif n == 1:
                 reg = self.kernel.reg(vtype)
                 b.emit(f"ld.{space}.{_ldst(mtype)}", reg, addr, ndefs=1, effect=False, ug=ug)
-                out.append(Value(vtype, reg, *_type_range(vtype), ug=ug))
+                out.append(Value(vtype, reg, *_type_range(mtype), ug=ug))
             else:
                 regs = tuple(self.kernel.reg(vtype) for _ in range(n))
                 b.emit(f"ld.{space}.v{n}.{_ldst(mtype)}", Vec(regs), addr, ndefs=1, effect=False, ug=ug)
-                out.extend(Value(vtype, r, *_type_range(vtype), ug=ug) for r in regs)
+                out.extend(Value(vtype, r, *_type_range(mtype), ug=ug) for r in regs)
             k += n
         return out
 
@@ -875,7 +894,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         base = self.flat(buf, s.index)
         shared = isinstance(buf, SharedArray)
         space = "shared" if shared else "global"
-        guard = self.store_guard
+        guard = self.store_guard if self.store_guard is not None else self.cell_writer
         if s.atomic:
             if buf.type not in ATOMIC_ADD:
                 raise LoweringError(f"atomic add on {buf.type} is not supported")
@@ -1153,25 +1172,32 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
 
     def stmt_TreeHalve(self, s) -> None:
-        """emmy's halving tree over the partials in shared memory, computed by
-        every thread on its own. After the barrier that precedes the tree (the
-        partials are written), each thread loads the ``length`` partials of its
-        tree and combines them pairwise exactly as the tree would (slot i with
-        slot i + h, for h = length/2 .. 1), so it holds the root's value without
-        the tree's barrier per step, its branches and its stores. One barrier at
-        the end keeps the ordering the tree's last barrier gave the code after
-        it; the partials themselves are not read again (the root is the tree's
-        only result)."""
-        b = self.b
+        """emmy's halving tree over the partials in shared memory. As written,
+        each level folds the upper half of the slots into the lower half, in
+        shared memory, with a barrier per level; then every thread reads the
+        root. When nothing can observe the slots afterwards (``_tree_refusal``),
+        every thread instead loads the ``length`` partials after the barrier
+        that precedes the tree and combines them pairwise exactly as the tree
+        would (slot i with slot i + h, for h = length/2 .. 1): the root's value,
+        without the tree's barrier per step, its branches and its stores. One
+        barrier at the end keeps the ordering the tree's last barrier gave the
+        code after it."""
         vtype = elementwise.value_type(s.dtype.name)
         bufs = [self.buffer(name) for name in s.bufs]
         length = int(s.length)
         if s.inner is not None:
             iv, scale = self.value(s.inner[0]), int(s.inner[1])
-            slots = [b.add(b.int_const(k * scale), iv) for k in range(length)]
+            slot = lambda k: self.b.add(self.b.mul(k, self.b.int_const(scale)), iv)  # noqa: E731
         else:
-            slots = [b.int_const(k) for k in range(length)]
-        level = [[self.load_one(buf, slot, vtype) for buf in bufs] for slot in slots]
+            slot = lambda k: k  # noqa: E731
+        refusal = "the plain lowering keeps it" if self.plain else self._tree_refusal(s)
+        if refusal is not None:
+            self._literal_tree(s, vtype, bufs, length, slot)
+            self.remark(f"halving tree over {length} partials: emmy's tree, {length.bit_length() - 1} barriers "
+                        f"({refusal})")
+            return
+        b = self.b
+        level = [[self.load_one(buf, slot(b.int_const(k)), vtype) for buf in bufs] for k in range(length)]
         half = length // 2
         while half:
             for i in range(half):
@@ -1181,14 +1207,64 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                     self.merge(s.combine_states, s.state, vtype)
                     level[i] = [self.value(st) for st in s.state]
             half //= 2
-        if s.barrier_id == 0:
-            b.emit("bar.sync", Imm(0, "u32"))
-        else:
-            b.emit("bar.sync", Imm(s.barrier_id, "u32"), Imm(int(s.barrier_count), "u32"))
+        self._tree_barrier(s)
         self.remark(f"halving tree over {length} partials: each thread folds them in the tree's order, "
-                    f"1 barrier instead of {length.bit_length() - 1}")
+                    f"1 barrier instead of {length.bit_length() - 1} (checked: nothing reads {', '.join(s.bufs)} "
+                    f"after the tree, which runs once)")
         for st, v in zip(s.state, level[0]):
             self.reassign(st, v)
+
+    def _literal_tree(self, s, vtype: str, bufs, length: int, slot) -> None:
+        """The tree as emmy writes it: at each level the threads below ``half``
+        fold slot ``t + half`` into their slot ``t``, in shared memory, and a
+        barrier ends the level; then every thread reads the root."""
+        b = self.b
+        tid = self.value(s.tid_var)
+        half = length // 2
+        while half:
+            lower = b.icmp("<", tid, b.int_const(half))
+            after = b.label("tree")
+            b.branch(after, lower, negate=True)
+            with self.block(guarded=True, divergent=lower.ug < WARP):
+                mine, theirs = slot(tid), slot(b.add(tid, b.int_const(half)))
+                for name, buf in zip(s.state, bufs):
+                    self.define(name, self.load_one(buf, mine, vtype))
+                for name, buf in zip(s.state_b, bufs):
+                    self.define(name, self.load_one(buf, theirs, vtype))
+                self.merge(s.combine_states, s.state, vtype)
+                for name, buf in zip(s.state, bufs):
+                    self.store_one(buf, mine, self.value(name))
+            b.place(after)
+            self._tree_barrier(s)
+            half //= 2
+        root = slot(b.int_const(0))
+        for st, buf in zip(s.state, bufs):
+            self.reassign(st, self.load_one(buf, root, vtype))
+
+    def _tree_barrier(self, s) -> None:
+        if s.barrier_id == 0:
+            self.b.emit("bar.sync", Imm(0, "u32"))
+        else:
+            self.b.emit("bar.sync", Imm(s.barrier_id, "u32"), Imm(int(s.barrier_count), "u32"))
+
+    def _tree_refusal(self, tree) -> str | None:
+        """Why the halving tree ``tree`` must leave its shared slabs as its own
+        steps do, or None when nothing can observe them afterwards: no other
+        statement of the kernel reads them, and the tree runs once (in no loop,
+        so no later run reads what an earlier one left)."""
+        if self._loops:
+            return "it runs in a loop, and a later trip could read what this one leaves"
+        slabs = set(tree.bufs)
+        trees = 0
+        for st in walk(self.src.body):
+            k = kind(st)
+            if k == "TreeHalve":
+                trees += bool(slabs & set(st.bufs))
+                continue
+            seen = slabs & _buffers_read(st)
+            if seen:
+                return f"a {k} reads {', '.join(sorted(seen))}"
+        return "another tree reduces the same shared memory" if trees > 1 else None
 
     def merge(self, program, state, vtype: str) -> None:
         """Run a combine program: an Assign to a state name updates that
@@ -1352,8 +1428,44 @@ def _promote_pair(b: Builder, x: Value, y: Value):
     return x, y
 
 
-def _type_range(vtype: str):
-    return INT_RANGE.get(vtype, (None, None))
+
+
+def _divisor_constant(name: str | None) -> bool:
+    """Is ``name`` a ConstantOp that emmy made for the divisor of a source
+    division: a scalar argument of a ``div`` node (named ``<node>_c<k>`` after
+    the FX node, as trace/torch.py does) or a mean's element count
+    (``<out>_count``)?"""
+    return bool(name) and (re.fullmatch(r"(div|divide|true_divide|truediv)(_\d+)?_c\d+", name) is not None
+                           or name.endswith("_count"))
+
+def _buffers_read(s) -> set[str]:
+    """Names of the buffers statement ``s`` reads (its own fields, not nested
+    statements): a Load's input, an ldmatrix or copy source, and for any other
+    kind every name its fields mention, except what it only writes."""
+    k = kind(s)
+    if k in ("Write", "Smem", "Sync"):
+        return set()
+    if k == "Load":
+        return {s.input}
+    if k == "LdmatrixLoad":
+        return {s.src_buffer}
+    if k == "CpAsyncCopy":
+        return {getattr(s, "src", None)} - {None}
+    names = set()
+    for f in getattr(s, "__dataclass_fields__", {}):
+        v = getattr(s, f)
+        if isinstance(v, str):
+            names.add(v)
+        elif isinstance(v, tuple) and all(isinstance(x, str) for x in v):
+            names.update(v)
+    return names
+
+def _type_range(mtype: str):
+    """The values an element of memory type ``mtype`` can hold (a u8 loads as 0..255)."""
+    if mtype in ("u8", "u16", "s8", "s16"):
+        bits = int(mtype[1:])
+        return (0, (1 << bits) - 1) if mtype[0] == "u" else (-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
+    return INT_RANGE.get(mtype, (None, None))
 
 
 def _ldst(mtype: str) -> str:

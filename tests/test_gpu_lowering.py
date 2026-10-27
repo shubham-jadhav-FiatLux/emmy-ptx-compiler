@@ -17,7 +17,7 @@ from kernels import (column_recomputing_mlp, rasterized_row_scale, shared_sum_ad
                      three_column_attention)
 
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F16, F32, F64
+from emmy.compiler.dtype import F16, F32, F64, I32, U32
 from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
@@ -51,22 +51,26 @@ def B(op, a, b):
 
 
 DTYPE = {np.dtype(np.float32): "f32", np.dtype(np.float64): "f64", np.dtype(np.float16): "f16",
-         np.dtype(np.int32): "i32"}
+         np.dtype(np.int32): "i32", np.dtype(np.uint32): "u32"}
 
 
 def run(body, inputs: dict, outputs: dict, grid: int, block: int, out_dtype: str = "f32", ptx_has: str = "",
-        **options) -> dict:
+        constants: dict | None = None, **options) -> dict:
     """Compile ``body`` as a kernel and run it; inputs/outputs map names to arrays/shapes.
-    ``options`` go to the Lowerer; ``ptx_has`` must appear in the PTX unless lowered plainly."""
+    ``options`` go to the Lowerer; ``ptx_has`` must appear in the PTX unless lowered plainly.
+    ``constants`` names inputs that are ConstantOps of the graph (their values known when compiling).
+    The runner has no unsigned argument type: a u32 array travels as the i32 array of the same bits."""
     buffers = {n: Buffer(n, a.shape, DTYPE[a.dtype]) for n, a in inputs.items()}
     buffers.update({n: Buffer(n, s, out_dtype) for n, s in outputs.items()})
     params = tuple(inputs) + tuple(outputs)
-    src = KernelSource("k_test", tuple(body), params, buffers, Launch(grid, block, 0), frozenset(outputs))
+    src = KernelSource("k_test", tuple(body), params, buffers, Launch(grid, block, 0), frozenset(outputs),
+                       constants or {})
     ptx = Lowerer(src, **LOWERING, **options).run().render(PTX_VERSION, TARGET)
     assert LOWERING.get("plain") or ptx_has in ptx
     c = requests.post(f"{RUNNER}/compile", json={"ptx": ptx}, timeout=120).json()
     assert c.get("ok"), c.get("stderr")
-    args = [dict(name=n, dtype=buffers[n].dtype, shape=list(a.shape), data=a.ravel().tolist()) for n, a in inputs.items()]
+    args = [dict(name=n, dtype=buffers[n].dtype.replace("u32", "i32"), shape=list(a.shape),
+                 data=(a.view(np.int32) if a.dtype == np.uint32 else a).ravel().tolist()) for n, a in inputs.items()]
     args += [dict(name=n, dtype=out_dtype, shape=list(s), output=True) for n, s in outputs.items()]
     r = requests.post(f"{RUNNER}/run", json={
         "cubin_id": c["cubin_id"], "entry": "k_test", "grid": [grid, 1, 1], "block": [block, 1, 1], "smem_bytes": 0,
@@ -355,8 +359,7 @@ def test_integer_elementwise_ops():
         Write("out", (Var("a0"),), "v"),
     ))]
     got = run(body, {"a": a, "b": b}, {"out": (256,)}, 1, 256)["out"]
-    s = np.trunc(a / b).astype(np.int64)  # C semantics, as emmy prints `//`
-    m = a - s * b
+    s, m = a // b, a % b  # numpy's floor division and remainder (emmy's CUDA prints C's / and %, which truncate)
     want = (s + m + (a ^ b)).astype(np.float32)
     assert np.array_equal(got, want)
 
@@ -494,24 +497,39 @@ def test_tensor_core_tile_added_atomically_as_f16_pairs():
 
 
 def test_division_by_a_constant_is_correctly_rounded():
-    """emmy spells x / c as x * reciprocal(c). Outside loops the optimized
-    lowering computes the correctly rounded quotient that numpy's x / c gives
-    (pointwise problems compare with rtol = 0); the strict and plain lowerings
-    keep the IR's multiply by RN(1/c)."""
+    """emmy splits the source's x / c into x * reciprocal(c), with c a ConstantOp
+    named after the division (div_c1) or a mean's count (*_count). Outside
+    loops the optimized lowering computes the correctly rounded quotient that
+    numpy's x / c gives (pointwise problems compare with rtol = 0); the strict
+    and plain lowerings keep the IR's multiply by RN(1/c)."""
     n = 4096
     # (no quotient overflows: the runner returns infinities as null)
     x = np.concatenate([rng.standard_normal(n - 6), [0.0, -0.0, 1e-40, -3e37, 3e37, 1e30]]).astype(np.float32)
-    consts = [3.0, 7.0, -0.1, 0.5]
+    consts = {"div_c1": 3.0, "div_2_c1": 7.0, "div_3_c1": -0.1, "x_mean_count": 300.0, "div_4_c1": 0.5}
     stmts = [Load(name="x", input="xs", index=(Var("i"),))]
-    for k, c in enumerate(consts):
-        stmts += [Let(name=f"c{k}", value=Literal(c), dtype=F32), Assign(f"r{k}", "reciprocal", (f"c{k}",)),
+    for k, name in enumerate(consts):
+        stmts += [Load(name=f"c{k}", input=name, index=(I(0),)), Assign(f"r{k}", "reciprocal", (f"c{k}",)),
                   Assign(f"q{k}", "multiply", ("x", f"r{k}")), Write("out", (I(k), Var("i")), f"q{k}")]
     body = [Tile(axes=(Axis("i", Dim(n)),), body=tuple(stmts))]
-    got = run(body, {"xs": x}, {"out": (len(consts), n)}, n // 256, 256)["out"]
-    for k, c in enumerate(consts):
+    inputs = {"xs": x, **{name: np.array([c], np.float32) for name, c in consts.items()}}
+    got = run(body, inputs, {"out": (len(consts), n)}, n // 256, 256, constants=consts)["out"]
+    for k, c in enumerate(consts.values()):
         c32 = np.float32(c)
         want = x / c32 if not LOWERING else x * np.float32(1 / c32)
         assert np.array_equal(got[k], want), (c, LOWERING)
+
+
+def test_a_reciprocal_the_ir_asks_for_keeps_its_meaning():
+    """x * reciprocal(3.0) written in the IR itself (no division in the source
+    graph) is that product, x * RN(1/3), in every lowering."""
+    x = rng.standard_normal(256).astype(np.float32)
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(256)),), body=(
+        Load(name="v", input="x", index=(t,)), Let(name="three", value=Literal(3.0), dtype=F32),
+        Assign("r", "reciprocal", ("three",)), Assign("y", "multiply", ("v", "r")), Write("out", (t,), "y"),
+    ))]
+    got = run(body, {"x": x}, {"out": (256,)}, 1, 256)["out"]
+    assert np.array_equal(got, x * (np.float32(1) / np.float32(3)))
 
 
 def test_fp8_decode_and_encode_match_emmys_definitions():
@@ -626,3 +644,140 @@ def test_matmul_cells_merged_in_pairs():
     b = rng.standard_normal((k, cols)).astype(np.float32)
     got = run(staged_matmul(rows, cols, k), {"a": a, "b": b}, {"out": (rows, cols)}, 1, 512)["out"]
     assert np.allclose(got, a.astype(np.float64) @ b, rtol=1e-4, atol=1e-4)
+
+
+# ---- semantics at the edges: signed zeros, integers past float32's precision, unsigned
+# ---- values, f64 constants, huge trigonometric arguments, a tree's shared memory, and a
+# ---- cross-lane combine unlike the per-lane fold
+
+
+def test_signed_zero_constants_stay_distinct():
+    """x * +0 and x * -0 are different values (their reciprocals are +inf and
+    -inf): constants are value-numbered by their bits, not their numeric value."""
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(32)),), body=(
+        Load(name="xv", input="x", index=(t,)),
+        Let(name="pzero", value=Literal(0.0), dtype=F32), Let(name="nzero", value=Literal(-0.0), dtype=F32),
+        Assign("p", "multiply", ("xv", "pzero")), Assign("n", "multiply", ("xv", "nzero")),
+        Assign("ip", "reciprocal", ("p",)), Assign("inn", "reciprocal", ("n",)),
+        Assign("cp", "greater", ("ip", "pzero")), Assign("cn", "greater", ("inn", "pzero")),
+        Assign("delta", "subtract", ("cp", "cn")), Write("out", (t,), "delta"),
+    ))]
+    got = run(body, {"x": np.ones(32, np.float32)}, {"out": (32,)}, 1, 32)["out"]
+    assert np.array_equal(got, np.ones(32, np.float32))
+
+
+def test_integer_comparisons_min_max_and_select_stay_exact():
+    """Integer operands are compared, selected and clamped as integers, never
+    through float32 (where 16777216 == 16777217)."""
+    a = np.array([16777216, 2147483647, -2147483648, 5, -7, 16777217, 0, -1] * 4, np.int32)
+    b = np.array([16777217, 2147483646, 2147483647, 5, -8, 16777216, -1, 0] * 4, np.int32)
+    ops = ["equal", "not_equal", "less", "less_equal", "greater", "greater_equal"]
+    t = Var("t")
+    stmts = [Load(name="a", input="xa", index=(t,), dtype=I32), Load(name="b", input="xb", index=(t,), dtype=I32)]
+    stmts += [Assign(f"c{k}", op, ("a", "b")) for k, op in enumerate(ops)]
+    stmts += [Assign("mx", "maximum", ("a", "b"), dtype=I32), Assign("mn", "minimum", ("a", "b"), dtype=I32),
+              Assign("w", "where", ("c2", "a", "b"), dtype=I32)]
+    names = [f"c{k}" for k in range(len(ops))] + ["mx", "mn", "w"]
+    stmts += [Write("out", (I(k), t), n) for k, n in enumerate(names)]
+    body = [Tile(axes=(Axis("t", Dim(32)),), body=tuple(stmts))]
+    got = run(body, {"xa": a, "xb": b}, {"out": (len(names), 32)}, 1, 32, out_dtype="f64")["out"]
+    a64, b64 = a.astype(np.int64), b.astype(np.int64)
+    want = [a64 == b64, a64 != b64, a64 < b64, a64 <= b64, a64 > b64, a64 >= b64,
+            np.maximum(a64, b64), np.minimum(a64, b64), np.where(a64 < b64, a64, b64)]
+    assert np.array_equal(got, np.array(want, np.float64))
+
+
+def test_unsigned_and_signed_integer_arithmetic_like_numpy():
+    """u32 values shift, divide, compare and widen as unsigned numbers; signed
+    floor_divide and remainder round down like numpy's // and %, and i32
+    arithmetic wraps around at 32 bits."""
+    u = np.array([0xFFFFFFFF, 0x80000000, 7, 0xFFFFFFFE] * 8, np.uint32)
+    s = np.array([-7, 7, -2147483648, 2147483647] * 8, np.int32)
+    t = Var("t")
+    stmts = [Load(name="a", input="xu", index=(t,), dtype=U32), Load(name="s", input="xs", index=(t,), dtype=I32),
+             Let(name="one", value=I(1)), Let(name="three", value=I(3)),
+             Assign("sh", "right_shift", ("a", "one"), dtype=U32),
+             Assign("dv", "floor_divide", ("a", "three"), dtype=U32),
+             Assign("rm", "remainder", ("a", "three"), dtype=U32),
+             Assign("gt", "greater", ("a", "one")),
+             Assign("fd", "floor_divide", ("s", "three"), dtype=I32),
+             Assign("md", "remainder", ("s", "three"), dtype=I32),
+             Assign("wrap", "add", ("s", "one"), dtype=I32),
+             Assign("ash", "right_shift", ("s", "one"), dtype=I32)]
+    names = ["a", "sh", "dv", "rm", "gt", "fd", "md", "wrap", "ash"]
+    stmts += [Write("out", (I(k), t), n) for k, n in enumerate(names)]
+    body = [Tile(axes=(Axis("t", Dim(32)),), body=tuple(stmts))]
+    got = run(body, {"xu": u, "xs": s}, {"out": (len(names), 32)}, 1, 32, out_dtype="f64")["out"]
+    u64, s64 = u.astype(np.int64), s.astype(np.int64)
+    want = [u64, u64 >> 1, u64 // 3, u64 % 3, u64 > 1, s64 // 3, s64 % 3, (s + np.int32(1)).astype(np.int64), s64 >> 1]
+    with np.errstate(over="ignore"):
+        assert np.array_equal(got, np.array(want, np.float64))
+
+
+def test_initializers_keep_their_own_precision():
+    """An f64 Init keeps all 53 bits, an integer Let all 32: neither passes
+    through float32."""
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(32)),), body=(
+        Init("value", 1.0000000000000002, dtype=F64), Write("out", (I(0), t), "value"),
+        Let(name="big", value=Literal(16777217.0), dtype=I32), Write("out", (I(1), t), "big"),
+    ))]
+    got = run(body, {}, {"out": (2, 32)}, 1, 32, out_dtype="f64")["out"]
+    assert np.array_equal(got, np.array([[1.0000000000000002] * 32, [16777217.0] * 32]))
+
+
+def test_sine_and_cosine_of_any_float32():
+    """sin and cos reduce any finite argument exactly (Payne-Hanek with 2/pi
+    to 192 bits), so huge arguments keep the 2-ulp accuracy of small ones."""
+    x = np.array([1e20, 3.4e38, -1e30, 1e10, 123456789.0, 2.0 ** 60, 1e5, 0.5, -0.0, 4e9, 8.5e37, 1.5e6,
+                  np.float32(np.pi) * 2 ** 40, 7.0e18, -2.5e25, 1.0e38] * 2, np.float32)
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(32)),), body=(
+        Load(name="v", input="x", index=(t,)), Assign("s", "sin", ("v",)), Assign("c", "cos", ("v",)),
+        Write("out", (I(0), t), "s"), Write("out", (I(1), t), "c"),
+    ))]
+    got = run(body, {"x": x}, {"out": (2, 32)}, 1, 32)["out"]
+    want = np.array([np.sin(x.astype(np.float64)), np.cos(x.astype(np.float64))]).astype(np.float32)
+    ulps = np.abs(got.view(np.int32).astype(np.int64) - want.view(np.int32).astype(np.int64))
+    assert np.all((ulps <= 2) | (np.abs(got - want) <= 2 ** -30)), (x[np.argmax(ulps) % 32], got.ravel()[np.argmax(ulps)])
+
+
+def test_tree_halve_leaves_its_tree_in_shared_memory():
+    """emmy's TreeHalve reduces into its shared slab: after it, slot 0 holds
+    the root and the other slots what the tree left there. A read of the slab
+    sees exactly that, so the lowering keeps the tree's own steps."""
+    t = Var("t")
+    warps = B(">>", t, I(5))
+    body = [Tile(axes=(Axis("t", Dim(128)),), block_threads=128, body=(
+        Smem("partials", (4,), "float"), Init("s", 0.0, dtype=F32),
+        Let(name="v", value=B("+", warps, I(1))),
+        Cond(B("==", B("&", t, I(31)), I(0)), (Write("partials", (warps,), "v"),)),
+        Sync(),
+        TreeHalve(bufs=("partials",), state=("s",), state_b=("sb",),
+                  combine_states=(Assign("s", "add", ("s", "sb")),), length=4, tid_var="t"),
+        Load(name="slot", input="partials", index=(B("&", t, I(3)),)),
+        Write("out", (I(0), t), "s"), Write("out", (I(1), t), "slot"),
+    ))]
+    got = run(body, {}, {"out": (2, 128)}, 1, 128)["out"]
+    assert np.array_equal(got[0], np.full(128, 10.0, np.float32))
+    assert np.array_equal(got[1], np.tile(np.array([10, 6, 3, 4], np.float32), 32))
+
+
+def test_a_cross_lane_maximum_of_per_lane_sums_is_not_regrouped():
+    """Each of 32 lanes sums four strided elements, then the lanes take the
+    maximum: the elements must stay with their lanes (ones at 0..3 give 1,
+    not 4). The sum of sums, in contrast, is regrouped into vector loads."""
+    x = np.zeros(128, np.float32)
+    x[:4] = 1
+    t = Var("t")
+    for op, want, ptx in (("maximum", 1.0, ""), ("add", 4.0, "ld.global.nc.v4.f32")):
+        body = [Tile(axes=(Axis("t", Dim(32)),), block_threads=32, body=(
+            StridedLoop(axis=Axis("i", Dim(128)), start=t, step=I(32), body=(
+                Load(name="v", input="x", index=(Var("i"),)), Accum("s", "v"),
+            )),
+            WarpShuffle(state=("s",), state_b=("sb",), combine_states=(Assign("s", op, ("s", "sb")),), length=32),
+            Write("out", (t,), "s"),
+        ))]
+        got = run(body, {"x": x}, {"out": (32,)}, 1, 32, ptx_has=ptx if not LOWERING else "")["out"]
+        assert np.array_equal(got, np.full(32, want, np.float32)), op
