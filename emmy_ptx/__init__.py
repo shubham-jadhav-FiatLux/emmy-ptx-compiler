@@ -17,9 +17,15 @@ from .lower import Lowerer
 from .ptx import PTX_LIMIT, PTX_VERSION, TARGET
 from .report import report as _report
 
+# compile.py --explore: the PTX an autotuner's exploratory candidate may take. ptxas time grows with
+# the module (about 6 s for 1.1 MB); past this size the kernel is lowered again with its complete
+# unrolling scaled down, each step a quarter of the last, until it fits.
+EXPLORE_PTX_CHARS = 250_000
+EXPANSIONS = (1.0, 0.25, 0.0625, 0.0)
+
 
 def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report: bool = False,
-                 bulk_copy: bool = False) -> str:
+                 bulk_copy: bool = False, explore: bool = False) -> str:
     """Compile one ``*.ir.json`` file and return the PTX module text.
 
     Should the optimizing lowering fail (an IR shape one of its rewrites did
@@ -32,13 +38,22 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
     keeps only the rewrites that leave every floating-point result bit for bit
     as the IR's own order and rounding give it (``compile.py --strict``).
     ``report`` writes what the lowering decided to stderr (report.py);
-    ``bulk_copy`` hands contiguous cp.async fills to the copy engine (bulk.py)."""
+    ``bulk_copy`` hands contiguous cp.async fills to the copy engine (bulk.py);
+    ``explore`` bounds the module for a fast ptxas (EXPLORE_PTX_CHARS), at some
+    cost in speed: the policy for an autotuner's exploratory trials, where
+    assembly time counts as much as the kernel's."""
     src = load(ir_path)
     mode = "strictly" if strict else "optimized"
     if not plain:
         try:
-            kernel = Lowerer(src, strict=strict, bulk_copy=bulk_copy).run()
-            ptx = kernel.render(PTX_VERSION, TARGET)
+            for expansion in EXPANSIONS if explore else (1.0,):
+                kernel = Lowerer(src, strict=strict, bulk_copy=bulk_copy, expansion=expansion).run()
+                ptx = kernel.render(PTX_VERSION, TARGET)
+                if explore and len(ptx) <= EXPLORE_PTX_CHARS:
+                    if expansion < 1:
+                        kernel.remarks.append(f"compile budget (--explore): complete unrolling scaled by {expansion} "
+                                              f"to keep the module under {EXPLORE_PTX_CHARS} characters")
+                    break
             if len(ptx) <= PTX_LIMIT:
                 if report:
                     print(_report(src, kernel, ptx, mode), file=sys.stderr)

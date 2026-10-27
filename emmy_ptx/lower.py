@@ -66,8 +66,12 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     it lowers a kernel again with cells re-mapped."""
 
     def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False,
-                 strict: bool = False, bulk_copy: bool = False, disable: frozenset | None = None):
+                 strict: bool = False, bulk_copy: bool = False, disable: frozenset | None = None,
+                 expansion: float = 1.0):
         self.src = src
+        # scales every complete-unrolling limit (compile_file's compile budget lowers it below 1 for a
+        # module that would take ptxas too long; the IR's own unroll marks are then hints like the rest)
+        self.expansion = expansion
         self.bulk_copy = bulk_copy  # hand contiguous cp.async fills to the copy engine (bulk.py)
         # rewrites switched off one by one (EMMY_PTX_DISABLE=split,blocking,...), to measure what each
         # contributes (tools/ablate.py); all of them are on by default
@@ -125,10 +129,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             # share it with more lanes each (_spread) or laid out anew (_placement)
             if self.wants_spread:
                 return Lowerer(self.src, spread=True, strict=self.strict, bulk_copy=self.bulk_copy,
-                               disable=self.disable).run()
+                               disable=self.disable, expansion=self.expansion).run()
             if self.wants_place:
                 placed = Lowerer(self.src, place=True, strict=self.strict, bulk_copy=self.bulk_copy,
-                                 disable=self.disable)
+                                 disable=self.disable, expansion=self.expansion)
                 kernel = placed.run()
                 # each region lowers the Tile's body again: keep it while the module fits the runner
                 if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
@@ -240,8 +244,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         if group >= 2:
             return True
         extent = int(loop.axis.extent.as_static())
-        unrolls = loop.unroll or extent <= self._auto_unroll(loop)
-        return kind(loop) == "Loop" and unrolls and extent * body_size(loop.body) <= UNROLL_BUDGET
+        unrolls = (loop.unroll and self.expansion >= 1) or extent <= self._auto_unroll(loop)
+        return kind(loop) == "Loop" and unrolls and extent * body_size(loop.body) <= UNROLL_BUDGET * self.expansion
 
 
     def _pessimize(self, stmts) -> None:
@@ -610,8 +614,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         elif dealt:
             self.remark(f"loop {name} ({trips[0]} trips): independent iterations dealt over {dealt} lanes")
             self._deal(s, start, step, end, trips[0], dealt)
-        elif trips is not None and (_indexes_fragments(s) or trips[1] * size <= UNROLL_BUDGET
-                                    and (s.unroll or trips[1] <= self._auto_unroll(s))):
+        elif trips is not None and (_indexes_fragments(s) or trips[1] * size <= UNROLL_BUDGET * self.expansion
+                                    and ((s.unroll and self.expansion >= 1) or trips[1] <= self._auto_unroll(s))):
             self.remark(f"loop {name}: unrolled ({trips[1]} trips)")
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
@@ -632,7 +636,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             return 0
         tile = any(kind(x) == "Load" and isinstance(self.scope.lookup(x.input) or self.shared.get(x.input), SharedArray)
                    for x in walk(s.body))
-        return SMEM_UNROLL_TRIPS if tile else AUTO_UNROLL_TRIPS
+        return int((SMEM_UNROLL_TRIPS if tile else AUTO_UNROLL_TRIPS) * self.expansion)
 
 
     def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int, hoist_loads: bool = True) -> None:

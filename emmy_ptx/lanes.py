@@ -18,6 +18,7 @@ The statements that lane blocking rewrites a loop into (``LaneSlot``,
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 from emmy.compiler.dim import Dim
@@ -40,6 +41,10 @@ SPLIT_MIN_TRIPS = 16
 SPLITTABLE = ("add", "multiply", "maximum", "minimum")
 # Bytes of an L1 cache line: a warp load costs one pass per line it touches.
 LINE_BYTES = 128
+SECTOR_BYTES = 32
+# the coalescing cost model: "lines" (128-byte lines a warp load touches) or "sectors" (32-byte sectors it
+# moves, element width included); see _line_cost
+COST_MODEL = os.environ.get("EMMY_PTX_COST", "lines")
 # A split lane lowers consecutive iterations together (unroll-and-jam) only
 # while their inner loops keep at most this many accumulators live.
 JAM_ACCUMULATORS = 64
@@ -303,7 +308,8 @@ class LaneSharing:
                 b = self.b
                 n, size = int(loop.axis.extent.as_static()), body_size(loop.body)
                 registers = min(THREAD_REGISTERS, REGISTER_FILE // self.src.launch.block)
-                unrolls = (loop.unroll or n <= AUTO_UNROLL_TRIPS) and n * size <= UNROLL_BUDGET
+                unrolls = ((loop.unroll and self.expansion >= 1) or n <= AUTO_UNROLL_TRIPS * self.expansion) \
+                    and n * size <= UNROLL_BUDGET * self.expansion
                 if unrolls and plan.invariant <= registers // 2:
                     with self.block(dominated=True):
                         self._loop_body(loop, b.int_const(0), b.int_const(1), b.int_const(n), (n, n), size)
@@ -662,9 +668,27 @@ def _lines(group: int, stride) -> float:
     return min(group, -(-group * abs(stride) // LINE_BYTES))
 
 
+def _sectors(group: int, stride, size: int) -> float:
+    """32-byte sectors one warp load moves when ``group`` consecutive lanes
+    read ``size``-byte elements ``stride`` bytes apart (None: unknown, so a
+    sector run per lane), the unit memory traffic is counted in: lanes within
+    a sector share it, lanes further apart each pay for their own."""
+    per_lane = -(-size // SECTOR_BYTES)
+    if stride is None:
+        return group * per_lane
+    stride = abs(stride)
+    if stride >= SECTOR_BYTES or stride == 0:
+        return per_lane if stride == 0 else group * per_lane
+    return -(-((group - 1) * stride + size) // SECTOR_BYTES)
+
+
 def _line_cost(deltas, group: int) -> float:
-    """Line accesses per iteration of a loop split over ``group`` lanes that
-    take consecutive iterations (``deltas`` as from Lowerer._deltas)."""
+    """Memory cost per iteration of a loop split over ``group`` lanes that take
+    consecutive iterations (``deltas`` as from Lowerer._deltas), in 128-byte
+    line accesses, or with EMMY_PTX_COST=sectors in 32-byte sectors (four to
+    a line, so both weigh a coalesced f32 warp load as one)."""
+    if COST_MODEL == "sectors":
+        return sum(runs * _sectors(group, stride, size) / (LINE_BYTES // SECTOR_BYTES) for runs, stride, size in deltas)
     return sum(runs * _lines(group, stride) for runs, stride, _ in deltas)
 
 
