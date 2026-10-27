@@ -46,9 +46,14 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
     mode = "strictly" if strict else "optimized"
     if not plain:
         try:
+            best = None
             for expansion in EXPANSIONS if explore else (1.0,):
                 kernel = Lowerer(src, strict=strict, bulk_copy=bulk_copy, expansion=expansion).run()
                 ptx = kernel.render(PTX_VERSION, TARGET)
+                if best is not None and len(ptx) > 0.9 * len(best[1]):
+                    kernel, ptx = best  # less unrolling no longer shrinks it: its size comes from elsewhere
+                    break
+                best = kernel, ptx
                 if explore and len(ptx) <= EXPLORE_PTX_CHARS:
                     if expansion < 1:
                         kernel.remarks.append(f"compile budget (--explore): complete unrolling scaled by {expansion} "
