@@ -12,7 +12,10 @@ GPU (set EMMY_RUNNER) and compared with the interpreter:
 * cooperative reductions: a strided loop over the block's threads, then a warp
   butterfly and a tree over the warps whose combine may differ from the
   per-lane fold, sometimes with a read of the tree's shared memory afterwards
-  (exactly where nothing sums, else within rounding).
+  (exactly where nothing sums, else within rounding);
+* attention as emmy fuses it (an online softmax over keys, the lanes of a row
+  sharing its scores, so lane blocking applies), with odd key counts and
+  masks (within the rounding of exp, in every lowering).
 """
 
 from __future__ import annotations
@@ -195,6 +198,36 @@ def cooperative(rng):
     return body, inputs, outputs, 1, block, "exact" if "add" not in (fold, combine) else "sums"
 
 
+def attention(rng):
+    """softmax(q @ kt * scale + mask) @ v, emmy's online-softmax form: each lane holds one query row and one
+    output column, so the lanes of a row compute the same scores (lane blocking shares them)."""
+    rows, cols = int(rng.choice([4, 8, 16])), int(rng.choice([4, 8, 16, 32]))
+    d, keys = int(rng.choice([8, 16, 32])), int(rng.choice([16, 33, 44, 64, 100]))
+    mask = np.where(rng.random(keys) < 0.2, -1e4, 0.0).astype(np.float32)
+    inputs = {"q": rng.standard_normal((rows, d)).astype(np.float32),
+              "kt": rng.standard_normal((d, keys)).astype(np.float32),
+              "v": rng.standard_normal((keys, cols)).astype(np.float32), "mask": mask}
+    scale = float(np.float32(1 / np.sqrt(d)))
+    loop = Loop(axis=Axis("t", Dim(keys)), body=(
+        Loop(axis=Axis("k", Dim(d)), body=(
+            Load(name="qk", input="q", index=(Var("r"), Var("k"))), Load(name="kk", input="kt", index=(Var("k"), Var("t"))),
+            Assign("p", "multiply", ("qk", "kk")), Accum("dot", "p"))),
+        Load(name="mk", input="mask", index=(Var("t"),)), Let(name="scale", value=Literal(scale), dtype=F32),
+        Assign("s0", "multiply", ("dot", "scale")), Assign("s", "add", ("s0", "mk")),
+        Let(name="one", value=Literal(1.0), dtype=F32),
+        Assign("gn", "maximum", ("s", "m")), Assign("dg", "subtract", ("m", "gn")), Assign("alpha", "exp", ("dg",)),
+        Assign("dgo", "subtract", ("s", "gn")), Assign("beta", "exp", ("dgo",)),
+        Assign("la", "multiply", ("alpha", "l")), Assign("lb", "multiply", ("beta", "one")), Accum("l", "lb", base="la"),
+        Assign("oa", "multiply", ("o", "alpha")), Load(name="vv", input="v", index=(Var("t"), Var("c"))),
+        Assign("ob", "multiply", ("vv", "beta")), Accum("o", "ob", base="oa"), Accum("m", "s", op="maximum"),
+    ))
+    body = [Tile(axes=(Axis("r", Dim(rows)), Axis("c", Dim(cols))), body=(
+        loop, Assign("inv", "reciprocal", ("l",)), Assign("res", "multiply", ("o", "inv")),
+        Write("out", (Var("r"), Var("c")), "res"),
+    ))]
+    return body, inputs, {"out": np.zeros((rows, cols), np.float64)}, 1, rows * cols, "approx"
+
+
 def compile_and_run(body, inputs, outputs, grid, block, options) -> dict:
     buffers = {n: Buffer(n, a.shape, DTYPE[a.dtype]) for n, a in inputs.items()}
     buffers.update({n: Buffer(n, a.shape, "f64") for n, a in outputs.items()})
@@ -216,17 +249,18 @@ def compile_and_run(body, inputs, outputs, grid, block, options) -> dict:
             for n, a in outputs.items()}
 
 
-def agree(got: np.ndarray, want: np.ndarray, exact: bool) -> bool:
+def agree(got: np.ndarray, want: np.ndarray, kind: str) -> bool:
     want = np.where(np.isfinite(want), want, np.nan)  # what the runner can return
-    if exact:
+    if kind == "exact":
         same = (got == want) | (np.isnan(got) & np.isnan(want))
         return bool(np.all(same))
-    return bool(np.allclose(got, want, rtol=1e-5, atol=1e-5, equal_nan=True))
+    tol = 1e-4 if kind == "approx" else 1e-5  # (approx: exp within its 2 ulp, then sums)
+    return bool(np.allclose(got, want, rtol=tol, atol=tol / 10, equal_nan=True))
 
 
 @gpu
 @pytest.mark.parametrize("mode", list(MODES))
-@pytest.mark.parametrize("family,seed", [(f, s) for f in ("pointwise", "shared_reduction", "cooperative")
+@pytest.mark.parametrize("family,seed", [(f, s) for f in ("pointwise", "shared_reduction", "cooperative", "attention")
                                          for s in range(6)])
 def test_random_kernels_match_the_independent_interpreter(family, seed, mode):
     rng = np.random.default_rng(1000 * seed + len(family))
@@ -234,6 +268,7 @@ def test_random_kernels_match_the_independent_interpreter(family, seed, mode):
     want = oracle.run(body, {**{k: v.copy() for k, v in inputs.items()}, **{k: v.copy() for k, v in outputs.items()}},
                       grid, block)
     got = compile_and_run(body, inputs, outputs, grid, block, MODES[mode])
-    exact = kind == "exact" or mode == "strict"
+    if mode == "strict" and kind == "sums":
+        kind = "exact"  # the IR's own order of operations: bit for bit
     for name in outputs:
-        assert agree(got[name], want[name], exact), (family, seed, mode, name)
+        assert agree(got[name], want[name], kind), (family, seed, mode, name)
