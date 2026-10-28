@@ -11,4 +11,4 @@ out/
 *.ptx.tmp
 *.cubin
 corpus/
-results/
+/results/

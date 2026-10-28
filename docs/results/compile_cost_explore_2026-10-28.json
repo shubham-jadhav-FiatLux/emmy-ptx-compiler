@@ -1,0 +1,128 @@
+[
+ {
+  "id": "a_b8_32x32",
+  "kernel": "k_matmul_softmax_reduce_79b2f5",
+  "generate_s": 1.59243153501302,
+  "ptx_chars": 40031,
+  "ptxas_s": 0.09955917199840769,
+  "registers": 167,
+  "ok": true
+ },
+ {
+  "id": "a_batched",
+  "kernel": "k_matmul_softmax_reduce_842700",
+  "generate_s": 1.3872951949597336,
+  "ptx_chars": 22754,
+  "ptxas_s": 0.08300801698351279,
+  "registers": 152,
+  "ok": true
+ },
+ {
+  "id": "a_d40",
+  "kernel": "k_matmul_softmax_reduce_b0d39c",
+  "generate_s": 1.21560734603554,
+  "ptx_chars": 14165,
+  "ptxas_s": 0.059789689956232905,
+  "registers": 135,
+  "ok": true
+ },
+ {
+  "id": "a_d40_q128",
+  "kernel": "k_matmul_softmax_reduce_23401b",
+  "generate_s": 2.022866649029311,
+  "ptx_chars": 22093,
+  "ptxas_s": 0.08695928804809228,
+  "registers": 213,
+  "ok": true
+ },
+ {
+  "id": "a_f16_128",
+  "kernel": "k_matmul_softmax_reduce_d8d156",
+  "generate_s": 1.8880361339543015,
+  "ptx_chars": 353964,
+  "ptxas_s": 0.7724240710376762,
+  "registers": 255,
+  "ok": true
+ },
+ {
+  "id": "a_f16_64x128",
+  "kernel": "k_matmul_softmax_reduce_8e4531",
+  "generate_s": 1.5916190160205588,
+  "ptx_chars": 296937,
+  "ptxas_s": 0.634736537002027,
+  "registers": 255,
+  "ok": true
+ },
+ {
+  "id": "a_f16_sdpa",
+  "kernel": "k_sdpa_be3321",
+  "generate_s": 1.5448316620313562,
+  "ptx_chars": 278121,
+  "ptxas_s": 0.7517105509759858,
+  "registers": 255,
+  "ok": true
+ },
+ {
+  "id": "a_sdpa_heads",
+  "kernel": "k_sdpa_9203ad",
+  "generate_s": 1.1336473629926331,
+  "ptx_chars": 22835,
+  "ptxas_s": 0.054093568003736436,
+  "registers": 150,
+  "ok": true
+ },
+ {
+  "id": "h2a_1x512x64",
+  "kernel": "k_softmax_matmul_reduce_2f46ec",
+  "generate_s": 2.393884070974309,
+  "ptx_chars": 57032,
+  "ptxas_s": 0.13922121201176196,
+  "registers": 128,
+  "ok": true
+ },
+ {
+  "id": "h2m_128x2048x128",
+  "kernel": "k_matmul",
+  "generate_s": 1.9099675160250627,
+  "ptx_chars": 37537,
+  "ptxas_s": 0.060599359043408185,
+  "registers": 80,
+  "ok": true
+ },
+ {
+  "id": "h3f_mm_softmax",
+  "kernel": "k_matmul_softmax_reduce_438207",
+  "generate_s": 19.026259762002155,
+  "ptx_chars": 472222,
+  "ptxas_s": 3.45863216399448,
+  "registers": 255,
+  "ok": true
+ },
+ {
+  "id": "ha_64x300x48",
+  "kernel": "k_matmul_softmax_reduce_5f1169",
+  "generate_s": 1.0855562410433777,
+  "ptx_chars": 19989,
+  "ptxas_s": 0.08535432099597529,
+  "registers": 201,
+  "ok": true
+ },
+ {
+  "id": "k_mlp",
+  "kernel": "k_matmul_reduce_bc2b4e",
+  "generate_s": 1.0230875810375437,
+  "ptx_chars": 14969,
+  "ptxas_s": 0.09448524203617126,
+  "registers": 255,
+  "ok": true
+ },
+ {
+  "id": "k_mm_softmax",
+  "kernel": "k_matmul_softmax_reduce_3a2de8",
+  "generate_s": 5.485900683968794,
+  "ptx_chars": 346456,
+  "ptxas_s": 0.5177835750509985,
+  "registers": 128,
+  "ok": true
+ }
+]

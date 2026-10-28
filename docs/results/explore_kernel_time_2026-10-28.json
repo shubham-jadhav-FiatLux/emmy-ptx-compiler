@@ -1,0 +1,100 @@
+[
+ {
+  "id": "a_b8_32x32",
+  "final": 10.864,
+  "final_ok": true,
+  "explore": 29.264,
+  "explore_ok": true
+ },
+ {
+  "id": "a_batched",
+  "final": 10.88,
+  "final_ok": true,
+  "explore": 12.88,
+  "explore_ok": true
+ },
+ {
+  "id": "a_d40",
+  "final": 19.024,
+  "final_ok": true,
+  "explore": 20.016,
+  "explore_ok": true
+ },
+ {
+  "id": "a_d40_q128",
+  "final": 25.184,
+  "final_ok": true,
+  "explore": 23.216,
+  "explore_ok": true
+ },
+ {
+  "id": "a_f16_128",
+  "final": 12.928,
+  "final_ok": true,
+  "explore": 12.928,
+  "explore_ok": true
+ },
+ {
+  "id": "a_f16_64x128",
+  "final": 17.024,
+  "final_ok": true,
+  "explore": 17.024,
+  "explore_ok": true
+ },
+ {
+  "id": "a_f16_sdpa",
+  "final": 10.864,
+  "final_ok": true,
+  "explore": 10.848,
+  "explore_ok": true
+ },
+ {
+  "id": "a_sdpa_heads",
+  "final": 10.864,
+  "final_ok": true,
+  "explore": 12.912,
+  "explore_ok": true
+ },
+ {
+  "id": "h2a_1x512x64",
+  "final": 31.328,
+  "final_ok": true,
+  "explore": 47.712,
+  "explore_ok": true
+ },
+ {
+  "id": "h2m_128x2048x128",
+  "final": 17.248,
+  "final_ok": true,
+  "explore": 17.28,
+  "explore_ok": true
+ },
+ {
+  "id": "h3f_mm_softmax",
+  "final": 181.056,
+  "final_ok": true,
+  "explore": 182.832,
+  "explore_ok": true
+ },
+ {
+  "id": "ha_64x300x48",
+  "final": 8.8,
+  "final_ok": true,
+  "explore": 14.976,
+  "explore_ok": true
+ },
+ {
+  "id": "k_mlp",
+  "final": 76.352,
+  "final_ok": true,
+  "explore": 35.424,
+  "explore_ok": true
+ },
+ {
+  "id": "k_mm_softmax",
+  "final": 211.36,
+  "final_ok": true,
+  "explore": 207.248,
+  "explore_ok": true
+ }
+]
