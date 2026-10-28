@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What compiling each kernel costs: cold compile.py time, PTX size, and ptxas time.
 
-    python tools/compile_cost.py PROBLEMS_DIR [...] [--ptxas PATH] [--flags "--budget explore"] [--json out.json]
+    python tools/compile_cost.py PROBLEMS_DIR [...] [--ptxas PATH] [--flags=--explore] [--jobs N] [--json out.json]
 
 Each kernel is compiled by a fresh ``python compile.py`` process (the
 evaluator's way: interpreter start, imports, lowering), then assembled with a

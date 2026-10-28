@@ -910,8 +910,12 @@ raw pairs are in `docs/results/ablation_2026-10-28.json`.
 
 `tools/compile_cost.py` times a cold `compile.py` (interpreter start, emmy
 import, lowering) and a local ptxas for sm_120, one kernel at a time. Over the
-533 kernels: `compile.py` takes a median 0.45 s (95th percentile 0.86 s, the
-longest 6.1 s), ptxas a median 0.03 s (95th percentile 0.32 s). The modules
+533 kernels: `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the
+longest 2.6 s), ptxas a median 0.03 s (95th percentile 0.32 s). The longest
+used to be 6.1 s (`h3f_mm_softmax`): two thirds of it went to loop fusion's
+legality check, which looked again at every statement between two loops for
+each later loop it tried. It now looks at each once (`mapping._Between`), with
+the same decisions and the same PTX. The modules
 are a median 6 KB of PTX; the largest, `h2a_1x512x64`, is 1.1 MB: a 4-thread
 kernel whose 32 iterations, each of four 64-trip dot products, are all
 unrolled into 28,624 instructions, and ptxas takes 9.7 s over it. An

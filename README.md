@@ -109,7 +109,8 @@ MLP that runs in thread-block clusters.
   the cells that compute the same instance per warp (aligned, uneven or
   strided lanes), per block and per cluster, and the scope where sharing pays
   best (work removed against shuffles, barriers or cluster exchanges). It
-  agrees with the recognisers on 768 of 777 loops (DESIGN 12.5).
+  agrees with the recognisers on 768 of 777 loops (DESIGN 12.5). For now
+  only `--report` runs it, so it cannot change the PTX.
 * Each rewrite can be switched off (`EMMY_PTX_DISABLE`), and
   `tools/ablate.py` measures what each one contributes: with all of them off
   the 326 benchmark problems take 1.9x as long; lane blocking alone is worth
@@ -184,7 +185,7 @@ launch from `meta.json`:
 | Math library accuracy (against correctly rounded results, about two million inputs per range) | exp, tanh ≤ 2 ulp · log, erf ≤ 1 ulp · sin, cos ≤ 1 ulp over the whole float32 range · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
 | Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **72 / 72** match in every lowering (bit for bit wherever the IR's order of operations is kept); 25 of them fail on the build before the fixes of 27 Oct, none of them attention |
 | Tests | 312 (183 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
-| Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.45 s (95th percentile 0.86 s), ptxas a median 0.03 s; `--explore` cuts ptxas on the 14 largest modules from 21.7 s to 6.9 s |
+| Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the longest 2.6 s), ptxas a median 0.03 s; `--explore` cuts ptxas on the 14 largest modules from 21.7 s to 6.9 s |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
 
