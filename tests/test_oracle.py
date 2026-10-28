@@ -27,7 +27,7 @@ import oracle
 import pytest
 import requests
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F32, F64, I32, U32
+from emmy.compiler.dtype import F32, I32, U32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.kernel.ir import Smem, Sync, Tile, TreeHalve, WarpShuffle
