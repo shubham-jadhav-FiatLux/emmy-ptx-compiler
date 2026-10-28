@@ -6,13 +6,18 @@ rolled), fused and merged loops and accumulators, cells re-mapped onto lanes,
 the one-barrier trees, FMA contraction, vector loads and launch hints. A
 decision repeated in unrolled code is listed once with its count. The last
 line profiles the PTX: static instruction counts by kind, the ones that show
-where a kernel spends its issue slots and memory traffic.
+where a kernel spends its issue slots and memory traffic. Before the
+decisions come the planner's plans (planner.py): the loops whose repeated work
+pays to share, and at which scope. Only the report runs the planner, so it
+cannot change the PTX.
 """
 
 from __future__ import annotations
 
 import re
 from collections import Counter
+
+from . import planner
 
 # (singular, plural, test on the opcode) in the order they are printed
 _KINDS = (
@@ -62,14 +67,23 @@ def profile(ptx: str) -> str:
     return f"{lines} instructions: " + ", ".join(parts)
 
 
+def plan_remarks(src) -> list[str]:
+    """The planner's plan for every loop whose repeated work pays to share."""
+    try:
+        return [p.describe() for p in planner.plans(src.body, src.launch.block, src.launch.grid) if p.best != "none"]
+    except Exception as e:  # noqa: BLE001 - a report must not stop the kernel from compiling
+        return [f"plan: none ({type(e).__name__}: {e})"]
+
+
 def report(src, kernel, ptx: str, mode: str) -> str:
-    """The report for one kernel: launch, decisions, PTX profile."""
+    """The report for one kernel: launch, plans, decisions, PTX profile."""
     launch = src.launch
     smem = f", {launch.smem_bytes} B of dynamic shared memory" if launch.smem_bytes else ""
     blocks = "1 block" if launch.grid == 1 else f"{launch.grid} blocks"
     out = [f"{kernel.name}: {blocks} x {launch.block} threads{smem}; lowered {mode}"]
-    counts = Counter(kernel.remarks)
-    for text in dict.fromkeys(kernel.remarks):  # first appearance order, each once
+    remarks = plan_remarks(src) + kernel.remarks
+    counts = Counter(remarks)
+    for text in dict.fromkeys(remarks):  # first appearance order, each once
         out.append(f"  {text}" + (f"  (x{counts[text]})" if counts[text] > 1 else ""))
     out.append(f"  PTX: {profile(ptx)}")
     return "\n".join(out)

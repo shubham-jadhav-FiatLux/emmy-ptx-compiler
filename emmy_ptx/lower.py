@@ -30,7 +30,7 @@ import os
 import re
 from dataclasses import replace
 
-from . import bulk, cluster, coarsen, planner, elementwise, mapping
+from . import bulk, cluster, coarsen, elementwise, mapping
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .cells import CellLayout
 from .common import (ATOMIC_ADD, AUTO_UNROLL_TRIPS, C_TYPE, IDENTITY, MEM_TYPE, REDUCE_CANON, SMEM_UNROLL_TRIPS,
@@ -123,10 +123,6 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     # ------------------------------------------------------------------ driver
 
     def run(self) -> Kernel:
-        if not self.plain:  # the repeated work and where it pays to share it (planner.py), for --report
-            for p in planner.plans(self.src.body, self.src.launch.block, self.src.launch.grid):
-                if p.best != "none":
-                    self.remark(p.describe())
         self.body(self.src.body)
         if not (self.spread or self.place):
             # cells that, as emmy lays them out, share no work with the lanes beside them may

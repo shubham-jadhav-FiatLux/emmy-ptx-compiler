@@ -957,7 +957,8 @@ a warp costs issue slots only once), against what sharing costs at that scope:
 shuffles in a warp; shared memory and a barrier in a block; cluster barriers
 and distributed shared memory in a cluster. Each barrier is spread over the
 instances one exchange carries, as `cluster.py` does. `--report` prints the
-plan beside what the recognisers did. For example, for `k_gelu_mlp`:
+plan beside what the recognisers did; only the report runs the planner, so it
+cannot change the PTX. For example, for `k_gelu_mlp`:
 `plan: loop a3 depends on a0, a2_co; each instance is computed by 128 cells
 (1 a warp, 1 a block, 8 a cluster); ... best shared at: cluster`, the choice
 `cluster.py` makes.
