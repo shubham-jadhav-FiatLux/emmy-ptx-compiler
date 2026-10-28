@@ -13,6 +13,7 @@ python compile.py path/to/<kernel>.ir.json > out.ptx            # PTX on stdout,
 python compile.py --strict path/to/<kernel>.ir.json > out.ptx   # no rewrite that changes rounding
 python compile.py --plain path/to/<kernel>.ir.json > out.ptx    # the fallback lowering alone
 python compile.py --report path/to/<kernel>.ir.json > out.ptx   # what the compiler decided, on stderr
+python compile.py --explore path/to/<kernel>.ir.json > out.ptx  # a bounded module for a fast ptxas (autotuning trials)
 ```
 
 `meta.json`, next to the IR, supplies the parameter order and the launch. With
@@ -104,6 +105,19 @@ MLP that runs in thread-block clusters.
 * `--report` shows what the compiler did to any kernel: the shape it gave
   each loop (split across lanes, lane-blocked, unrolled...), the cells it
   moved, the trees it folded, and a profile of the PTX.
+* One planner for repeated work at every scope (`planner.py`): for each loop,
+  the cells that compute the same instance per warp (aligned, uneven or
+  strided lanes), per block and per cluster, and the scope where sharing pays
+  best (work removed against shuffles, barriers or cluster exchanges). It
+  agrees with the recognisers on 768 of 777 loops (DESIGN 12.5).
+* Each rewrite can be switched off (`EMMY_PTX_DISABLE`), and
+  `tools/ablate.py` measures what each one contributes: with all of them off
+  the 326 benchmark problems take 1.9x as long; lane blocking alone is worth
+  2.6x on the 57 problems it changes (DESIGN 12.2). The raw measurements
+  behind every number are in `docs/results/`.
+* A compile budget: `--explore` keeps a module small enough for a fast ptxas
+  (the largest: 9.7 → 0.14 s) for an autotuner's trials, at 1.11x kernel time
+  on average (DESIGN 12.3).
 
 **Novelty**
 * The merge of two online-softmax states derived from the IR's own update,
@@ -130,7 +144,12 @@ MLP that runs in thread-block clusters.
   merge from it.
 
 **Testing**
-* 237 tests: unit, compile and GPU tests, each kernel lowered three ways,
+* An independent interpreter of the IR (`tests/oracle.py`, numpy, the IR's
+  own types, no code shared with the compiler) checks randomly generated
+  kernels in every lowering on the GPU, attention with lane blocking
+  included; on the build before the 27 Oct fixes it finds 25 failures among
+  72 kernels, on the current one none.
+* 312 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking. The GPU tests include
   edge cases found by an independent review: signed zeros, integers past
   2^24, unsigned shifts, f64 constants, `sin(1e20)`, a read of a tree's shared
@@ -163,8 +182,9 @@ launch from `meta.json`:
 | Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.005x to 0.08x** the time of nvcc's build (13x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
 | Speed against nvcc's build of emmy's reference CUDA (321 problems, same launches) | **0.51x the time** (geometric mean of the per-problem ratios, a 1.96x speedup): chained 0.13x, attention 0.16x, fused 0.53x, reductions 0.65x, matmul 0.88x, pointwise 1.00x (launch-bound). Total 4.0 ms against 158.2 ms, a sum dominated by the slowest problems. Measured on 26 Oct (commit 13ee1e4); the runner's clocks are not locked, so single problems vary by up to a third between runs |
 | Math library accuracy (against correctly rounded results, about two million inputs per range) | exp, tanh ≤ 2 ulp · log, erf ≤ 1 ulp · sin, cos ≤ 1 ulp over the whole float32 range · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Tests | 237 (111 run hand-built IR on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
-| Compile time | under 2 s per kernel (mostly importing emmy) |
+| Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **72 / 72** match in every lowering (bit for bit wherever the IR's order of operations is kept); 25 of them fail on the build before the fixes of 27 Oct, none of them attention |
+| Tests | 312 (183 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.45 s (95th percentile 0.86 s), ptxas a median 0.03 s; `--explore` cuts ptxas on the 14 largest modules from 21.7 s to 6.9 s |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
 
@@ -273,11 +293,15 @@ emmy_ptx/
   bulk.py              compile.py --bulk-copy: which cp.async fills the copy engine can take
   cluster.py           work neighbouring blocks repeat, shared across a thread-block cluster
   coarsen.py           two matmul cells a thread, sharing their shared-memory loads
+  planner.py           repeated work at every scope (warp, block, cluster) and where sharing pays
 tests/                 unit tests (builder, rewrites, cell placement, strict mode, a lane-level IR
-                       interpreter) and GPU tests
-tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy
+                       interpreter), GPU tests, and oracle.py: an independent IR interpreter that
+                       random kernels are checked against
+tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy,
+                       per-rewrite ablation, compile cost, planner survey
 examples/              four problems with their PTX, walked through in examples/README.md
 docs/DESIGN.md
+docs/results/          the raw measurements behind the numbers (what, when, which code: its README)
 requirements.txt
 ```
 
@@ -308,4 +332,9 @@ python tools/bitwise.py <problems-dir>
 
 # accuracy of the math library on the GPU
 python tools/mathtest.py
+
+# what each rewrite contributes to speed; compile cost; the planner against the recognisers
+python tools/ablate.py <problems-dir> [--rewrites split,blocking]
+python tools/compile_cost.py <problems-dir> --ptxas <ptxas> [--flags=--explore]
+python tools/plan_survey.py <problems-dir>
 ```

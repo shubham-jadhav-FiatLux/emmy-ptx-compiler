@@ -822,10 +822,154 @@ hint (8); no result depends on it.
 | The fallback catches failures, not wrong code; strict-versus-plain is not an independent oracle | stated as such (3, 9); the GPU tests compare with numpy models |
 | Claims too broad: bit-exact, race-free, accuracy, the 17x broadcast | qualified, with datasets and revisions (README, 4.3, 9) |
 | Fresh held-out data after the fixes | `holdout3`: 39 of 39 on first run (9) |
-| An independent dtype-faithful IR interpreter, with randomly generated kernels checked against it in every lowering | next step |
-| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | next step: today lane splits, blocking, placement and clusters are separate recognisers over the same uniformity analysis |
-| A coalescing model in 32-byte sectors (alignment, dtype width, reuse) instead of 128-byte lines | next step |
-| Raw paired benchmark data in alternating order, a family-weighted view, and an ablation table per rewrite | partly: the 27 Oct fixes were raced in alternating order (9); the rest is next |
-| Compile cost: the largest module (`h2a_1x512x64`, 1.1 MB of PTX) takes about 1.8 s to generate and 6 s in ptxas | next step: an expansion budget from the estimated PTX size, with a cheaper policy for an autotuner's exploratory trials |
+| An independent dtype-faithful IR interpreter, with randomly generated kernels checked against it in every lowering | done: `tests/oracle.py`, 72 random kernels in every lowering (12.1) |
+| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | the analysis and cost model: `planner.py` (12.5); it agrees with the recognisers on 768 of 777 loops. Letting it drive them is next |
+| A coalescing model in 32-byte sectors (alignment, dtype width, reuse) instead of 128-byte lines | `EMMY_PTX_COST=sectors`; the same decisions as the line model on all 533 kernels (12.4) |
+| Raw paired benchmark data in alternating order, a family-weighted view, and an ablation table per rewrite | `tools/ablate.py`: per rewrite, alternating order, family-weighted (12.2) |
+| Compile cost: the largest module (`h2a_1x512x64`, 1.1 MB of PTX) takes about 1.8 s to generate and 6 s in ptxas | `tools/compile_cost.py`, and `compile.py --explore`, a compile budget for exploratory trials (12.3) |
 | Analyses that produce facts, plans that record their preconditions, a checker, then emission | the regroup and tree checks follow that shape; the other rewrites still decide while they emit |
 | GPU tests and the corpus-dependent compile tests skip when the runner or the problem folders are absent | `EMMY_REQUIRE_ALL=1` turns those skips into failures |
+
+## 12. Checking and measuring the compiler itself
+
+Five longer-term suggestions of the review (28 Oct), as far as they were taken
+before the deadline.
+
+### 12.1 An independent interpreter (`tests/oracle.py`)
+
+`tests/oracle.py` runs emmy's Kernel IR directly with numpy: every thread of a
+block in lockstep (a value is an array over the block's threads), every value
+in the type the IR gives it, result types from emmy's own `dtype_promote` and
+reduction identities from emmy's `ElementwiseImpl`. It shares no code with
+`emmy_ptx`. Arithmetic is numpy's, the reference the problems are checked
+against: float32 in float32 without fused multiply-adds, integers in fixed
+width. Cross-thread statements follow emmy's definitions: a butterfly over
+aligned lane groups, a tree that folds its shared slab level by level and
+leaves it so.
+
+`tests/test_oracle.py` generates random kernels in four families: typed
+pointwise expressions over f32, i32 and u32 (−0.0 and 2^24 + 1 among the
+constants); reductions that several lanes share, folded with add, maximum or
+minimum; cooperative reductions whose cross-lane combine may differ from the
+per-lane fold, some reading the tree's shared memory afterwards; and attention
+as emmy fuses it, an online softmax over 16 to 100 keys with masks, which the
+optimizing lowering lane-blocks (groups of 4 to 32 lanes, partial blocks
+included). Each is compiled optimized, strictly and plainly, run on the GPU,
+and compared with the interpreter: bit for bit wherever the IR's order of
+operations is kept (`--strict`, and every kernel without a sum or an `exp`),
+within rounding otherwise. All 72 kernels pass in every lowering. Run against
+the build from before the fixes of section 9, 25 of them fail: every pointwise
+kernel (integers, unsigned values, signed zeros), the cooperative kernels that
+read a tree's slab (in all three lowerings) and one maximum of per-lane sums
+(optimized only); the attention kernels pass on both builds. The generator
+finds the review's classes of bugs by itself.
+
+### 12.2 What each rewrite contributes (`tools/ablate.py`)
+
+`EMMY_PTX_DISABLE=split,blocking,...` switches rewrites off one at a time
+(`lower.REWRITES`); with none set, the PTX is byte-for-byte unchanged. Over the
+326 problems of the open set, the corpus and the schedule sweep, each rewrite is
+switched off in turn. A problem whose PTX does not change then runs the same
+code (its ratio is exactly 1); the others are raced on the runner, full build
+against reduced build, in the order full, reduced, reduced, full.
+
+| switched off | problems it changes | time without it (those) | (all 326) | (per family) | most affected |
+|---|---|---|---|---|---|
+| every rewrite (`--plain`) | 307 | 1.97x | 1.895x | 1.874x | `k_mm_softmax` 294.91x |
+| `blocking`: lane blocking (4.3) | 57 | 2.60x | 1.182x | 1.246x | `a_1024x64` 8.04x |
+| `hint`: the one-wave launch hint (8) | 289 | 1.10x | 1.087x | 1.108x | `a_256x32` 4.53x |
+| `split`: reductions split across the lanes that share them (4.2) | 29 | 5.18x | 1.157x | 1.062x | `k_mm_softmax` 195.78x |
+| `placement`: cells placed anew (4.5) | 12 | 2.72x | 1.038x | 1.054x | `k_mlp_gelu_8x512x2048x64` 53.33x |
+| `unroll`: short loops unrolled though the IR does not ask | 219 | 1.08x | 1.050x | 1.045x | `a_b8_32x32` 2.70x |
+| `fma`: a product folded into a sum as one FMA | 178 | 1.06x | 1.035x | 1.040x | `a_d80` 2.11x |
+| `vectorize`: adjacent loads merged into vector loads | 152 | 1.10x | 1.043x | 1.035x | `x_attn__raster-gm8` 3.64x |
+| `congruence`: provably equal accumulators merged (5) | 33 | 1.26x | 1.024x | 1.034x | `k_softmax_then_mm` 2.67x |
+| `fusion`: sibling loops over the same iterations fused | 8 | 1.74x | 1.014x | 1.020x | `k_mm_softmax` 23.79x |
+| `spread`: idle threads joining cells (4.4) | 23 | 5.55x | 1.128x | 1.013x | `x_sum__work-t128_reduce-coop-t` 48.60x |
+| `early_loads`: loads issued ahead of the statements that need them | 198 | 1.01x | 1.007x | 1.009x | `p_mix3` 1.52x |
+| `regroup`: cooperative reductions in contiguous chunks (4.6) | 41 | 1.09x | 1.011x | 1.005x | `x_sum__work-t32_reduce-coop-r2` 2.84x |
+| `dealing`: independent loops dealt to the lanes of a cell (4.4) | 9 | 3.10x | 1.032x | 1.004x | `x_rms__reduce-r4` 4.42x |
+| `clusters`: work repeated across blocks shared in a cluster (4.8) | 1 | 2.24x | 1.002x | 1.004x | `k_gelu_mlp` 2.24x |
+| `tree`: block reductions with one barrier (4.7) | 100 | 1.01x | 1.002x | 1.002x | `x_rms__work-t512_reduce-coop` 1.36x |
+| `coarsen`: two matmul cells a thread (4.9) | 3 | 1.24x | 1.002x | 1.001x | `x_mm_rect__reduce-g4a` 1.39x |
+
+Times are ratios of the reduced build to the full one, geometric means; "per
+family" counts the schedule variants of one expression (`x_sum__...`) once, so
+the sweep's 106 variants of eight expressions do not outweigh the rest. With
+every rewrite off the problems take 1.9x as long; the rewrites that change the
+most kernels are the one-wave hint, unrolling, FMAs and vector loads (a few
+percent each), while those aimed at repeated work matter a great deal where they
+apply: lane blocking 2.6x on 57 problems, the lane split 5.2x on 29, spread cells
+5.5x on 23, placement 2.7x on 12 (53x on one fused MLP), clusters 2.2x on one.
+The rewrites overlap (a kernel without the split is often lane-blocked instead),
+so the rows do not multiply. No reduced build gave a wrong answer. Single
+extremes near the ~3 µs launch floor (`p_mix3`'s 1.52x) are runner noise; the
+raw pairs are in `docs/results/ablation_2026-10-28.json`.
+
+### 12.3 Compile cost, and a compile budget for exploration (`--explore`)
+
+`tools/compile_cost.py` times a cold `compile.py` (interpreter start, emmy
+import, lowering) and a local ptxas for sm_120, one kernel at a time. Over the
+533 kernels: `compile.py` takes a median 0.45 s (95th percentile 0.86 s, the
+longest 6.1 s), ptxas a median 0.03 s (95th percentile 0.32 s). The modules
+are a median 6 KB of PTX; the largest, `h2a_1x512x64`, is 1.1 MB: a 4-thread
+kernel whose 32 iterations, each of four 64-trip dot products, are all
+unrolled into 28,624 instructions, and ptxas takes 9.7 s over it. An
+autotuner pays T = T_compile + T_ptxas + n · T_kernel for every candidate it
+tries, so for exploration a smaller module can be the better trade.
+
+`compile.py --explore` bounds the module: past 250,000 characters the kernel is
+lowered again with its complete unrolling scaled by 1/4, then 1/16, then none,
+until it fits, stopping as soon as less unrolling no longer shrinks it. On the
+14 kernels past the bound, ptxas time falls from 21.7 s to 6.9 s in all (9.7 s
+→ 0.14 s for the largest); ten modules shrink 7 to 48 times, while four keep
+their size, which comes from fragment loops and lane blocks that must stay
+unrolled. Their kernels take 1.11x as long (geometric mean of 14). The range
+is wide: from 2.7x slower (`a_b8_32x32`) to 2.2x faster (`k_mlp`, 76 → 35 µs,
+which the default unrolls past its best). The default, for final kernels,
+stays as it was; choosing per kernel would take measurements a compile cannot
+make, which is what a calibrated schedule selector would supply.
+
+### 12.4 Coalescing counted in 32-byte sectors
+
+The cost model that picks which loop of a nested reduction to split counts
+the 128-byte lines a warp load touches (4.2). `EMMY_PTX_COST=sectors` counts
+instead the 32-byte sectors it moves, element width included (a warp load of
+32 f32 at stride 64 bytes: 16 lines, but 32 sectors, a quarter of the lines'
+bytes). Over the 533 kernels it reaches the same decision everywhere: no
+module changes. The line model, which the decisions were tuned with on the
+RTX 5090, stays the default; the sector model is there for workloads that do
+tell them apart.
+
+### 12.5 One planner for repeated work at every scope (`planner.py`)
+
+The recognisers of section 4 each remove one form of repeated work: lanes
+split or block a loop, cells move or spread, clusters share across blocks.
+`planner.py` looks at the repetition itself, the same way at every scope. For
+each loop of a Tile, at any depth, it finds the Tile axes the loop's work
+depends on (through every value defined before it), and so how many cells
+compute each instance and how they lie: per warp (an aligned power-of-two run
+of lanes, which the uniformity analysis of 4.1 sees; a run of another length,
+which only cell placement can regroup; or a strided set), per block, and per
+cluster of 8 blocks. It weighs the instructions a warp saves, C (1 − 1/R) for
+a loop of cost C repeated R times (lanes run in lockstep, so repetition within
+a warp costs issue slots only once), against what sharing costs at that scope:
+shuffles in a warp; shared memory and a barrier in a block; cluster barriers
+and distributed shared memory in a cluster. Each barrier is spread over the
+instances one exchange carries, as `cluster.py` does. `--report` prints the
+plan beside what the recognisers did. For example, for `k_gelu_mlp`:
+`plan: loop a3 depends on a0, a2_co; each instance is computed by 128 cells
+(1 a warp, 1 a block, 8 a cluster); ... best shared at: cluster`, the choice
+`cluster.py` makes.
+
+`tools/plan_survey.py` compares the plan with the recognisers' decisions over
+the 777 loops of the 533 kernels. They agree on whether to share 768 loops;
+84 of these are loops the lowering blocks in order to share the inner work the
+planner points at. Where sharing pays, a warp's repeating lanes form an aligned run in
+83 loops and a run of another length in 13: the cases cell placement exists
+for. Four loops with an estimated saving are left unshared: `m_deep_k`
+(cluster), `h2a_1x512x64` (cluster), `h3a_33x77x40` (block) and one schedule
+variant of a softmax (warp). Next: let the planner choose among the
+recognisers, which today apply in a fixed order (clusters, then spread cells,
+then placement), and widen the uniformity analysis to the strided lane sets
+it describes.
