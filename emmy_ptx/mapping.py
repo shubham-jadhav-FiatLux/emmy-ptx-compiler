@@ -242,10 +242,11 @@ def absorb_siblings(stmts: list, i: int, compatible):
     s = stmts[i]
     if not is_pure_loop(s):
         return s
+    between = _Between(stmts, i + 1)
     j = i + 1
     while j < len(stmts):
         t = stmts[j]
-        if (is_pure_loop(t) and same_space(s, t) and _movable(t, stmts[i + 1 : j]) and _disjoint(s, t)
+        if (is_pure_loop(t) and same_space(s, t) and _movable(t, between.upto(j)) and _disjoint(s, t)
                 and compatible(s, t)):
             s = stmts[i] = _fuse(s, t)
             del stmts[j]
@@ -254,18 +255,35 @@ def absorb_siblings(stmts: list, i: int, compatible):
     return s
 
 
-def _movable(t, between) -> bool:
+class _Between:
+    """What the statements ``stmts[start:end]`` do, as far as :func:`_movable`
+    asks: each is looked at once, however many later loops are tried."""
+
+    def __init__(self, stmts: list, start: int):
+        self.stmts, self.end = stmts, start
+        self.cross = False  # one of them talks to other threads
+        self.produced: set[str] = set()
+        self.reads: set[str] = set()
+        self.written: set[str] = set()
+
+    def upto(self, end: int) -> _Between:
+        for u in self.stmts[self.end : end]:
+            self.cross = self.cross or any(kind(x) in CROSS_THREAD for x in walk((u,)))
+            self.produced |= produced(u)
+            self.reads |= reads((u,))
+            self.written |= written((u,))
+        self.end = max(self.end, end)
+        return self
+
+
+def _movable(t, between: _Between) -> bool:
     """Can pure loop ``t`` run before ``between``? Not if one of those statements
     produces a name ``t`` reads or folds, reads a name ``t`` folds, stores to
     memory ``t`` loads, or talks to other threads."""
     t_reads, t_folds = reads((t,)), assigned((t,))
     t_loads = {x.input for x in walk((t,)) if kind(x) == "Load"}
-    for u in between:
-        if any(kind(x) in CROSS_THREAD for x in walk((u,))):
-            return False
-        if produced(u) & (t_reads | t_folds) or reads((u,)) & t_folds or written((u,)) & t_loads:
-            return False
-    return True
+    return not (between.cross or between.produced & (t_reads | t_folds) or between.reads & t_folds
+                or between.written & t_loads)
 
 
 def _disjoint(s, t) -> bool:
