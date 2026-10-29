@@ -10,6 +10,11 @@ blocked it (warp), spread its cell over a block or merged warps (block), ran
 it in a cluster (cluster), or nothing. The table counts loops by both; the
 loops with the most saving left to the planner's estimate and nothing done
 are listed: work the separate recognisers do not reach.
+
+The two agree on a loop when the planner shares it exactly when the lowering
+does, and also when the lowering shares a loop the planner would not because
+of a loop inside it that the planner shares (lane blocking shares attention's
+key loop for the scores inside it): both are counted, apart.
 """
 
 from __future__ import annotations
@@ -65,9 +70,17 @@ def survey(ir: str) -> list[dict]:
             done = tile_level  # a cell-level re-mapping (placement, spreading, a cluster) shares the Tile's loops
         if p.best == "none" and done != "none" and idle:
             done = "idle"  # idle threads joined the cell: spare lanes put to work, not repeated work removed
-        rows.append({"problem": Path(ir).parent.name, "loop": p.loop, "planned": p.best, "done": done,
-                     "saving": p.net.get(p.best, 0.0), "cost": p.cost, "lanes": p.lanes, "repeats": p.repeats})
+        rows.append({"problem": Path(ir).parent.name, "kernel": Path(ir).name, "loop": p.loop, "outer": list(p.outer),
+                     "planned": p.best, "done": done, "saving": p.net.get(p.best, 0.0), "cost": p.cost,
+                     "lanes": p.lanes, "repeats": p.repeats})
     return rows
+
+
+def for_inner_work(row: dict, rows: list[dict]) -> bool:
+    """Does the lowering share loop ``row``, which the planner would not, for a
+    loop inside it that the planner shares?"""
+    return row["planned"] == "none" and row["done"] not in ("none", "idle") and any(
+        r["kernel"] == row["kernel"] and row["loop"] in r["outer"] and r["planned"] != "none" for r in rows)
 
 
 def main() -> int:
@@ -86,7 +99,9 @@ def main() -> int:
     for p in SCOPES:
         print(f"{p:>16} " + " ".join(f"{table[(p, d)]:>8}" for d in DONE))
     agree = sum(v for (p, d), v in table.items() if (p == "none") == (d in ("none", "idle")))
-    print(f"share or not as the planner says: {agree} of {len(rows)} loops (idle: cells spread over spare threads)")
+    inner = sum(for_inner_work(r, rows) for r in rows)
+    print(f"share or not as the planner says: {agree} of {len(rows)} loops (idle: cells spread over spare threads), "
+          f"and {inner} more the lowering shares for a loop inside them that the planner shares: {agree + inner}")
     lanes = Counter(r["lanes"] for r in rows if r["planned"] != "none")
     print(f"repeating lanes in a warp, where sharing pays: {dict(lanes)}")
     left = sorted((r for r in rows if r["planned"] != "none" and r["done"] == "none"), key=lambda r: -r["saving"])

@@ -858,7 +858,7 @@ hint (8); no result depends on it.
 | Claims too broad: bit-exact, race-free, accuracy, the 17x broadcast | qualified, with datasets and revisions (README, 4.3, 9) |
 | Fresh held-out data after the fixes | `holdout3`: 39 of 39 on first run (9) |
 | An independent dtype-faithful IR interpreter, with randomly generated kernels checked against it in every lowering | done: `tests/oracle.py`, 72 random kernels in every lowering (12.1) |
-| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | the analysis and cost model: `planner.py` (12.5); it agrees with the recognisers on 768 of 777 loops. Letting it drive them is next |
+| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | the analysis and cost model: `planner.py` (12.5); it agrees with the recognisers on 769 of 777 loops (85 of them through a loop inside). Letting it drive them is next |
 | A coalescing model in 32-byte sectors (alignment, dtype width, reuse) instead of 128-byte lines | `EMMY_PTX_COST=sectors`; the same decisions as the line model on all 533 kernels (12.4) |
 | Raw paired benchmark data in alternating order, a family-weighted view, and an ablation table per rewrite | `tools/ablate.py`: per rewrite, alternating order, family-weighted (12.2) |
 | Compile cost: the largest module (`h2a_1x512x64`, 1.1 MB of PTX) takes about 1.8 s to generate and 6 s in ptxas | `tools/compile_cost.py`, and `compile.py --explore`, a compile budget for exploratory trials (12.3) |
@@ -957,13 +957,22 @@ unrolled into 28,624 instructions, and ptxas takes 9.7 s over it. An
 autotuner pays T = T_compile + T_ptxas + n · T_kernel for every candidate it
 tries, so for exploration a smaller module can be the better trade.
 
-`compile.py --explore` bounds the module: past 250,000 characters the kernel is
-lowered again with its complete unrolling scaled by 1/4, then 1/16, then none,
-until it fits, stopping as soon as less unrolling no longer shrinks it. On the
-14 kernels past the bound, ptxas time falls from 21.7 s to 6.9 s in all (9.7 s
-→ 0.14 s for the largest); ten modules shrink 7 to 48 times, while four keep
-their size, which comes from fragment loops and lane blocks that must stay
-unrolled. Their kernels take 1.11x as long (geometric mean of 14). The range
+`compile.py --explore` aims the module at 250,000 characters: past that the
+kernel is lowered again with its complete unrolling scaled by 1/4, then 1/16,
+then none, until it fits or no smaller budget can change what is unrolled
+(each complete unrolling the budget allowed is noted on the kernel,
+`Lowerer.unrolls_within`). A candidate replaces the one kept only if it is
+10% smaller or reaches the size the other misses, and when none does
+`--report` says the target is not met. It is a target, not a bound: an
+independent review showed that the earlier rule, stop as soon as a step does
+not shrink the module, could stop on a plateau (16 trips of eight chained
+sines: 505,201 characters at budgets 1 and 1/4, 120,775 at 1/16); that kernel
+now gets the small module. On the 14 kernels past the target, ptxas time
+falls from 21.7 s to 6.9 s in all (9.7 s → 0.14 s for the largest); ten
+modules shrink 7 to 48 times, while four keep their size, which comes from
+fragment loops and lane blocks that must stay unrolled (the same modules as
+before the change; `h3f_mm_softmax` now stops after one lowering, while
+`k_mm_softmax` tries all four budgets, 2.8 → 5.1 s). Their kernels take 1.11x as long (geometric mean of 14). The range
 is wide: from 2.7x slower (`a_b8_32x32`) to 2.2x faster (`k_mlp`, 76 → 35 µs,
 which the default unrolls past its best). The default, for final kernels,
 stays as it was; choosing per kernel would take measurements a compile cannot
@@ -1002,10 +1011,21 @@ cannot change the PTX. For example, for `k_gelu_mlp`:
 (1 a warp, 1 a block, 8 a cluster); ... best shared at: cluster`, the choice
 `cluster.py` makes.
 
+The dependences follow each value in order: a statement's result depends on
+what it reads (an accumulator's update on its old value too), a value set
+under a condition on the condition, and at a loop's head a value the loop
+changes on its value at entry and after any trip, to a fixed point (a loop's
+seeded accumulator starts from the identity). An independent review found
+that the first version kept, for a reassigned accumulator, the dependences of
+its first definition: after `s = 0; for k: s += x[t]`, a loop folding
+`s * w[j]` looked shareable by every lane. The plans of the 533 kernels are
+the same with either.
+
 `tools/plan_survey.py` compares the plan with the recognisers' decisions over
-the 777 loops of the 533 kernels. They agree on whether to share 768 loops;
-84 of these are loops the lowering blocks in order to share the inner work the
-planner points at. Where sharing pays, a warp's repeating lanes form an aligned run in
+the 777 loops of the 533 kernels. They agree on whether to share 684 loops,
+and on 85 more that the lowering shares for a loop inside them that the
+planner shares (lane blocking shares attention's key loop for the scores
+inside it): 769, both counted by the tool. Where sharing pays, a warp's repeating lanes form an aligned run in
 83 loops and a run of another length in 13: the cases cell placement exists
 for. Four loops with an estimated saving are left unshared: `m_deep_k`
 (cluster), `h2a_1x512x64` (cluster), `h3a_33x77x40` (block) and one schedule

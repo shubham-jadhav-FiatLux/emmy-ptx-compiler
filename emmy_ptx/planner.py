@@ -41,7 +41,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .mapping import CROSS_THREAD, LOOPS, binds, kind, reads, trip_estimate, walk
+from .mapping import CROSS_THREAD, LOOPS, assigned, binds, kind, own_reads, trip_estimate, walk
 
 WARP, CLUSTER = 32, 8
 # rough costs, in instructions
@@ -95,27 +95,61 @@ def _depends(names, deps) -> frozenset:
     return frozenset().union(*(deps.get(n, frozenset()) for n in names))
 
 
-def _visit(stmts, deps: dict, axes, extents, cells: int, block: int, grid: int, out: list,
-           batch: float = 1.0, outer: tuple = ()) -> None:
-    """Plan each loop of ``stmts`` and those nested in it; ``deps`` maps every
-    name bound so far to the Tile axes its value depends on, ``batch`` is the
-    trips of the loops around ``stmts``."""
+def _visit(stmts, deps: dict, axes, extents, cells: int, block: int, grid: int, out: list | None,
+           batch: float = 1.0, outer: tuple = ()) -> frozenset:
+    """Follow ``stmts`` in order, keeping in ``deps`` the Tile axes the value
+    each name holds may depend on, and plan each loop met (into ``out``; None
+    only follows the dependences). Returns the axes what the statements read
+    depends on: for a loop's body (with its bounds), the loop's key.
+
+    A statement's result depends on what it reads (an accumulator's update on
+    its old value too) and a value set under a condition on the condition. At
+    a loop's head, a value the loop changes depends on its value at entry and
+    after any trip (the back edge, to a fixed point: dependences only grow,
+    within the Tile's few axes), except an accumulator the loop seeds, which
+    starts from its fold's identity; after the loop, on its value at entry
+    (no trip) or after any trip."""
+    used: frozenset = frozenset()
     for s in stmts:
         k = kind(s)
         if k in LOOPS:
-            inside = binds((s,))
-            key = _depends(reads((s,)) - inside, deps)
-            out.append(_plan_loop(s, sorted(key, key=axes.index), axes, extents, cells, block, grid, batch, outer))
-            inner = dict(deps)
-            bounds = [x for x in (getattr(s, "start", None), getattr(s, "end", None)) if x is not None]
-            inner[s.axis.name] = _depends({v for e in bounds for v in e.free_vars()}, deps)
-            _visit(s.body, inner, axes, extents, cells, block, grid, out, batch * trip_estimate(s),
-                   outer + (s.axis.name,))
+            head = dict(deps)
+            if getattr(s, "seed", False):  # the loop's own accumulators start from the identity
+                head.update((x.name, frozenset()) for x in s.body if kind(x) == "Accum")
+            bounds = [x for x in (getattr(s, "start", None), getattr(s, "step", None), getattr(s, "end", None))
+                      if x is not None]
+            head[s.axis.name] = _depends({v for e in bounds for v in e.free_vars()}, deps)
+            changed = binds((s,)) | assigned((s,))
+            while True:  # the back edge
+                trip = dict(head)
+                _visit(s.body, trip, axes, extents, cells, block, grid, None)
+                grown = {n: head.get(n, frozenset()) | trip[n] for n in changed & set(trip)}
+                if all(v == head.get(n, frozenset()) for n, v in grown.items()):
+                    break
+                head.update(grown)
+            body, at = dict(head), len(out) if out is not None else 0
+            work = head[s.axis.name] | _visit(s.body, body, axes, extents, cells, block, grid, out,
+                                              batch * trip_estimate(s), outer + (s.axis.name,))
+            if out is not None:
+                out.insert(at, _plan_loop(s, sorted(work, key=axes.index), axes, extents, cells, block, grid, batch,
+                                          outer))
+            for n in changed & set(body):
+                deps[n] = deps.get(n, frozenset()) | body[n]
+            used |= work
         elif k == "Cond":
-            _visit(s.body, dict(deps), axes, extents, cells, block, grid, out, batch, outer)
-            _visit(s.else_body, dict(deps), axes, extents, cells, block, grid, out, batch, outer)
-        for name in binds((s,)) - set(deps):  # what a statement defines depends on what it reads
-            deps[name] = _depends(reads((s,)), deps)
+            test = _depends(own_reads(s), deps)
+            branches = [dict(deps), dict(deps)]
+            for branch, part in zip(branches, (s.body, s.else_body)):
+                used |= _visit(part, branch, axes, extents, cells, block, grid, out, batch, outer)
+            for n in binds((s,)) | assigned((s,)):  # whatever a branch sets, its value depends on the test
+                deps[n] = deps.get(n, frozenset()).union(test, *(b.get(n, frozenset()) for b in branches))
+            used |= test
+        else:
+            read = _depends(own_reads(s), deps)
+            used |= read
+            for n in binds((s,)) | assigned((s,)):
+                deps[n] = read
+    return used
 
 
 def _plan_loop(loop, key: list[str], axes, extents, cells: int, block: int, grid: int, batch: float,

@@ -91,3 +91,32 @@ def test_report_lists_the_decisions_and_changes_no_ptx(flags, capsys):
     name = Path(ir).name.removesuffix(".ir.json")
     assert err.startswith(f"{name}: ") and "\n  PTX: " in err and "instructions:" in err
     assert ("launch hints: .maxntid" in err) and ("lowered plainly" in err) == bool(flags.get("plain"))
+
+
+def test_explore_keeps_trying_while_a_smaller_budget_can_change_the_module(monkeypatch, capsys):
+    """Eight chained sines in a 16-trip loop stay unrolled at budgets 1 and 1/4
+    (the same module), and roll at 1/16 (a quarter of the size): a plateau is
+    not the end while the budget still decides an unrolling. A module that
+    stays large says so."""
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.expr import Var
+    from emmy.compiler.ir.kernel.ir import Tile
+    from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Write
+
+    from emmy_ptx.frontend import Buffer, KernelSource, Launch
+
+    sines = [Load(name="v0", input="x", index=(Var("t"), Var("i")))]
+    sines += [Assign(f"v{k + 1}", "sin", (f"v{k}",)) for k in range(8)] + [Accum("s", "v8")]
+    body = (Tile(axes=(Axis("t", Dim(32)),), block_threads=32, body=(
+        Loop(axis=Axis("i", Dim(16)), body=tuple(sines)), Write("out", (Var("t"),), "s"))),)
+    src = KernelSource("k_sines", body, ("x", "out"), {"x": Buffer("x", (32, 16), "f32"),
+                       "out": Buffer("out", (32,), "f32")}, Launch(1, 32, 0), frozenset({"out"}))
+    monkeypatch.setattr(emmy_ptx, "load", lambda path: src)
+    full = compile_file("k_sines")
+    assert len(full) > emmy_ptx.EXPLORE_PTX_CHARS
+    assert len(compile_file("k_sines", explore=True, report=True)) <= emmy_ptx.EXPLORE_PTX_CHARS
+    assert "complete unrolling scaled by 0.0625" in capsys.readouterr().err
+    monkeypatch.setattr(emmy_ptx, "EXPLORE_PTX_CHARS", 1000)  # beyond reach: nothing optional is left to roll
+    assert len(compile_file("k_sines", explore=True, report=True)) > 1000
+    assert "target not met" in capsys.readouterr().err

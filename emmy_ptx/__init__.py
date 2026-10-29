@@ -17,9 +17,10 @@ from .lower import Lowerer
 from .ptx import PTX_LIMIT, PTX_VERSION, TARGET
 from .report import report as _report
 
-# compile.py --explore: the PTX an autotuner's exploratory candidate may take. ptxas time grows with
-# the module (about 6 s for 1.1 MB); past this size the kernel is lowered again with its complete
-# unrolling scaled down, each step a quarter of the last, until it fits.
+# compile.py --explore: the PTX an autotuner's exploratory candidate should take. ptxas time grows
+# with the module (about 6 s for 1.1 MB); past this size the kernel is lowered again with its
+# complete unrolling scaled down, each step a quarter of the last, until it fits or no smaller
+# budget can change what is unrolled. A target, not a bound: what is not optional unrolling stays.
 EXPLORE_PTX_CHARS = 250_000
 EXPANSIONS = (1.0, 0.25, 0.0625, 0.0)
 
@@ -39,9 +40,10 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
     as the IR's own order and rounding give it (``compile.py --strict``).
     ``report`` writes what the lowering decided to stderr (report.py);
     ``bulk_copy`` hands contiguous cp.async fills to the copy engine (bulk.py);
-    ``explore`` bounds the module for a fast ptxas (EXPLORE_PTX_CHARS), at some
-    cost in speed: the policy for an autotuner's exploratory trials, where
-    assembly time counts as much as the kernel's."""
+    ``explore`` aims the module at a size ptxas assembles fast
+    (EXPLORE_PTX_CHARS), at some cost in speed: the policy for an autotuner's
+    exploratory trials, where assembly time counts as much as the kernel's.
+    ``--report`` says when the size cannot be reached."""
     src = load(ir_path)
     mode = "strictly" if strict else "optimized"
     if not plain:
@@ -50,15 +52,18 @@ def compile_file(ir_path: str, plain: bool = False, strict: bool = False, report
             for expansion in EXPANSIONS if explore else (1.0,):
                 kernel = Lowerer(src, strict=strict, bulk_copy=bulk_copy, expansion=expansion).run()
                 ptx = kernel.render(PTX_VERSION, TARGET)
-                if best is not None and len(ptx) > 0.9 * len(best[1]):
-                    kernel, ptx = best  # less unrolling no longer shrinks it: its size comes from elsewhere
-                    break
-                best = kernel, ptx
-                if explore and len(ptx) <= EXPLORE_PTX_CHARS:
-                    if expansion < 1:
-                        kernel.remarks.append(f"compile budget (--explore): complete unrolling scaled by {expansion} "
-                                              f"to keep the module under {EXPLORE_PTX_CHARS} characters")
-                    break
+                if best is None or len(ptx) < 0.9 * len(best[1]) or len(ptx) <= EXPLORE_PTX_CHARS < len(best[1]):
+                    best = kernel, ptx, expansion  # (a module barely smaller is not worth its rolled loops)
+                if len(best[1]) <= EXPLORE_PTX_CHARS or not kernel.budgeted:
+                    break  # small enough, or no smaller budget can change what is unrolled
+            kernel, ptx, expansion = best
+            if explore and (expansion < 1 or len(ptx) > EXPLORE_PTX_CHARS):
+                scaled = f"complete unrolling scaled by {expansion}" if expansion < 1 else "the unrolling kept"
+                kernel.remarks.append(
+                    f"compile budget (--explore): {scaled} to keep the module under {EXPLORE_PTX_CHARS} characters"
+                    if len(ptx) <= EXPLORE_PTX_CHARS else
+                    f"compile budget (--explore): target not met: {scaled}, {len(ptx)} characters remain, more than "
+                    f"{EXPLORE_PTX_CHARS} (less optional unrolling does not make the module 10% smaller)")
             if len(ptx) <= PTX_LIMIT:
                 if report:
                     print(_report(src, kernel, ptx, mode), file=sys.stderr)

@@ -13,7 +13,7 @@ python compile.py path/to/<kernel>.ir.json > out.ptx            # PTX on stdout,
 python compile.py --strict path/to/<kernel>.ir.json > out.ptx   # no rewrite that changes rounding
 python compile.py --plain path/to/<kernel>.ir.json > out.ptx    # the fallback lowering alone
 python compile.py --report path/to/<kernel>.ir.json > out.ptx   # what the compiler decided, on stderr
-python compile.py --explore path/to/<kernel>.ir.json > out.ptx  # a bounded module for a fast ptxas (autotuning trials)
+python compile.py --explore path/to/<kernel>.ir.json > out.ptx  # a smaller module for a fast ptxas (autotuning trials)
 ```
 
 `meta.json`, next to the IR, supplies the parameter order and the launch. With
@@ -112,17 +112,21 @@ MLP that runs in thread-block clusters.
 * One planner for repeated work at every scope (`planner.py`): for each loop,
   the cells that compute the same instance per warp (aligned, uneven or
   strided lanes), per block and per cluster, and the scope where sharing pays
-  best (work removed against shuffles, barriers or cluster exchanges). It
-  agrees with the recognisers on 768 of 777 loops (DESIGN 12.5). For now
-  only `--report` runs it, so it cannot change the PTX.
+  best (work removed against shuffles, barriers or cluster exchanges). Its
+  dependences follow each value in order, to a fixed point around loops. It
+  agrees with the recognisers on 684 of 777 loops, and on 85 more that the
+  lowering shares for a loop inside them that the planner shares
+  (`tools/plan_survey.py` counts both; DESIGN 12.5). For now only `--report`
+  runs it, so it cannot change the PTX.
 * Each rewrite can be switched off (`EMMY_PTX_DISABLE`), and
   `tools/ablate.py` measures what each one contributes: with all of them off
   the 326 benchmark problems take 1.9x as long; lane blocking alone is worth
   2.6x on the 57 problems it changes (DESIGN 12.2). The raw measurements
   behind every number are in `docs/results/`.
-* A compile budget: `--explore` keeps a module small enough for a fast ptxas
+* A compile budget: `--explore` aims a module at a size ptxas assembles fast
   (the largest: 9.7 → 0.14 s) for an autotuner's trials, at 1.11x kernel time
-  on average (DESIGN 12.3).
+  on average; a target, not a bound: `--report` says when it is not met
+  (DESIGN 12.3).
 
 **Novelty**
 * The merge of two online-softmax states derived from the IR's own update,

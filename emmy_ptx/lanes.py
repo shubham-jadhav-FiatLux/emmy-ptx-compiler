@@ -308,8 +308,9 @@ class LaneSharing:
                 b = self.b
                 n, size = int(loop.axis.extent.as_static()), body_size(loop.body)
                 registers = min(THREAD_REGISTERS, REGISTER_FILE // self.src.launch.block)
-                unrolls = ((loop.unroll and self.expansion >= 1) or n <= AUTO_UNROLL_TRIPS * self.expansion) \
-                    and n * size <= UNROLL_BUDGET * self.expansion
+                unrolls = self.unrolls_within(
+                    ((loop.unroll and self.expansion >= 1) or n <= AUTO_UNROLL_TRIPS * self.expansion)
+                    and n * size <= UNROLL_BUDGET * self.expansion)
                 if unrolls and plan.invariant <= registers // 2:
                     with self.block(dominated=True):
                         self._loop_body(loop, b.int_const(0), b.int_const(1), b.int_const(n), (n, n), size)

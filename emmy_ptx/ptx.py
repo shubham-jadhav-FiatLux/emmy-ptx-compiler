@@ -227,6 +227,7 @@ class Kernel:
     min_version: str = "0.0"  # the PTX ISA an instruction needs beyond the module default (fp8 casts: 8.1)
     min_target: str = "sm_0"  # the target an instruction needs beyond the default (the copy engine: sm_90)
     cluster: int | None = None  # blocks a thread-block cluster (.reqnctapercluster), if any
+    budgeted: bool = False  # did the unrolling budget allow a complete unrolling (Lowerer.unrolls_within)?
     _counts: dict[str, int] = field(default_factory=dict)
     _labels: int = 0
 

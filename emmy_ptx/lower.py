@@ -304,7 +304,16 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             return True
         extent = int(loop.axis.extent.as_static())
         unrolls = (loop.unroll and self.expansion >= 1) or extent <= self._auto_unroll(loop)
-        return kind(loop) == "Loop" and unrolls and extent * body_size(loop.body) <= UNROLL_BUDGET * self.expansion
+        return kind(loop) == "Loop" and self.unrolls_within(
+            unrolls and extent * body_size(loop.body) <= UNROLL_BUDGET * self.expansion)
+
+    def unrolls_within(self, unrolls: bool) -> bool:
+        """``unrolls``, a complete unrolling the budget (``expansion``) allows:
+        noted on the kernel, since a smaller budget could then change the
+        module (compile_file --explore tries one only while that holds)."""
+        if unrolls and self.expansion > 0:
+            self.kernel.budgeted = True
+        return unrolls
 
 
     def _pessimize(self, stmts) -> None:
@@ -676,8 +685,9 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         elif dealt:
             self.remark(f"loop {name} ({trips[0]} trips): independent iterations dealt over {dealt} lanes")
             self._deal(s, start, step, end, trips[0], dealt)
-        elif trips is not None and (_indexes_fragments(s) or trips[1] * size <= UNROLL_BUDGET * self.expansion
-                                    and ((s.unroll and self.expansion >= 1) or trips[1] <= self._auto_unroll(s))):
+        elif trips is not None and (_indexes_fragments(s) or self.unrolls_within(
+                trips[1] * size <= UNROLL_BUDGET * self.expansion
+                and ((s.unroll and self.expansion >= 1) or trips[1] <= self._auto_unroll(s)))):
             self.remark(f"loop {name}: unrolled ({trips[1]} trips)")
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
