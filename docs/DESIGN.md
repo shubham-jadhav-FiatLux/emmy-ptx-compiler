@@ -303,7 +303,7 @@ no shared reduction. `mapping.blocked` rewrites it IR to IR:
 The rewrite is checked by a small interpreter that runs the rewritten loop on
 a group of lanes in lockstep and compares with each lane running the original
 alone (`tests/test_blocking.py`), and on the GPU. On 37 attention problems:
-geometric mean 0.44x the previous time (total 2015 → 597 µs), e.g.
+geometric mean 0.44x the time without it (total 2015 → 597 µs), e.g.
 `a_q64_k1024` 646 → 102 µs, `a_1024x64` 285 → 35 µs, the open `a01` 15 → 7.2 µs.
 
 ### 4.4 Idle threads
@@ -426,12 +426,13 @@ read memory no thread writes (a thread may read back what it wrote itself
 without a barrier, but not what another wrote). `regroup` also requires the R
 copies to compute alike, name for name, since an element can change copy.
 What cannot be shown is refused. The 51 loops the open problems and the
-corpora regroup pass all of these checks, so their PTX is unchanged. An
-independent review found three sums the earlier checks let through (a weight
-`t`, a row `x[t, i]`, a partial written for one warp only), and two more
-turned up with them (copies that compute differently, a loop starting at the
-row of a 4 x 8 Tile): all five gave wrong answers and are now GPU tests (with
-a sixth, a thread folding back its own writes; `tests/kernels.py`).
+corpora regroup pass all of these checks. Six sums that must stay strided are
+GPU tests (`tests/kernels.py`), each wrong if regrouped: a weight `t`, a row
+`x[t, i]`, a partial written for one warp only, copies that compute
+differently, a loop starting at the row of a 4 x 8 Tile, and a thread folding
+back its own writes. `_alike_threads` counts each register once per check, so
+a value built from a long chain of shared operands (`x + x`, then that plus
+itself, and so on) costs no more to check than to compute.
 `--report` prints the reason for each refusal, e.g.
 `loop i: kept strided, not regrouped: the butterfly combines s with maximum,
 but the loop folds it with add`, or `... w may differ between the cooperating
@@ -637,9 +638,9 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   emmy's renderer emits for them. PTX `max` and `min` compute exactly that,
   measured on the runner: a NaN gives the other operand, and -0 is below +0
   whichever operand comes first. Constants fold by the same rule
-  (`elementwise._fmax`). They used to fold with Python's `max`, which keeps
-  the first of two zeros: `maximum(-0.0, 0.0)` of two literals gave -0.0
-  where the GPU gives +0.0. The bit-exact oracle (12.1) led to this.
+  (`elementwise._fmax`; Python's `max` would keep the first of two zeros, so
+  `maximum(-0.0, 0.0)` of two literals would give -0.0 where the GPU gives
+  +0.0).
 * **Integers** follow numpy's fixed-width arithmetic in the result's type:
   `add`, `multiply` and the rest wrap at the width; comparisons compare the
   operands in their own types, exactly at any magnitude (never through
@@ -654,10 +655,15 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   declares the type (`elementwise.declared`, used by a typed `Let`, `Init`, a
   loop's seed, an accumulator's update and a butterfly's or tree's combine):
   an integer keeps that width's low bits, as C converts it (255 + 1 in a u8
-  is 0, found by an independent review: it was 256), and a float, or a
+  is 0), and a float, or a
   literal (which emmy writes as a float), saturates at the type's range, as
   `cvt.rzi` does, where C leaves it undefined. Results of u8, u16 and i16
   operations wrap to their width too.
+* **A bool holds 0 or 1**, as C converts a value to bool: any non-zero
+  value, a NaN included, gives 1 (`bool(2)` and `bool(0.5)` are 1,
+  `bool(-0.0)` is 0). The same `elementwise.declared` does it at every typed
+  definition; an operation whose result type is bool is computed in f32 first,
+  as emmy renders it, and a store into a bool array stores 0 or 1.
 * **Signed zeros, NaN and the policy for rewrites.** Every rewrite is in one
   of three classes: exact (bit for bit the IR's result: CSE, fusion,
   congruent accumulators, unrolling, vector loads, the one-barrier tree, cell
@@ -804,28 +810,28 @@ instead was 1.25x slower on the 72 kernels that use more than 128.
   memory or barriers eight times each gives bit-identical outputs (apart from atomic
   split-K sums). That is evidence, not a proof of race freedom (Compute Sanitizer
   cannot run on the evaluation runner); where lanes would store the same value to the
-  same place (a spread cell's outputs, a warp's total), one lane now stores it.
-* `tools/corpus_holdout2.py` is a second held-out set, written on 26 Oct after every
+  same place (a spread cell's outputs, a warp's total), one lane stores it.
+* `tools/corpus_holdout2.py` is a second held-out set, written after every
   optimization above: prime and odd sizes, single rows and queries, middle-axis and column
   reductions, matrix-vector and batched products, fused epilogues around a matmul, causal and
   multi-head attention, float16. 64 of 66 pass; the other two no compiler can pass (the
   generator lists a consumer kernel first; emmy traces `A @ v` into a 500x300 output). It
   found the division by a constant (section 7), which nvcc's build of emmy's CUDA fails too.
-* An independent review (27 Oct) built small legal kernels that the corpus never forms:
-  a maximum of per-lane sums after a cooperative loop, `x*(+0)` against `x*(-0)`, integers
-  past 2^24, a u32 shifted right, an f64 `Init` of 1.0000000000000002, `sin(1e20)`, a read
-  of a tree's shared memory, and a reciprocal written in the IR. Seven were wrong (the
-  first only when optimized, the next six in every lowering) and the eighth was the
-  division policy. Each is now a GPU test in all three lowerings
+* Small legal kernels that the corpus never forms are GPU tests in all three lowerings
   (`tests/test_gpu_lowering.py`), next to positive cases (a sum of sums is still
-  regrouped). The fixes changed the PTX of 43 of the 493 kernels; raced against the
-  previous build (alternating order, best of three), the 42 that run (the 43rd is a
-  generator fault) take 0.999x its time (geometric mean).
-  It also showed that agreement between `--strict` and `--plain` is not an independent
-  oracle: both share the builder, the math library and, until then, the tree's lowering.
-  The GPU tests compare against numpy models instead.
-* `tools/corpus_holdout3.py` is a third held-out set, written on 27 Oct after those
-  fixes were frozen and run once: sines and cosines of large arguments, divisions by
+  regrouped): a maximum of per-lane sums after a cooperative loop, `x*(+0)` against
+  `x*(-0)`, integers past 2^24, a u32 shifted right, an f64 `Init` of
+  1.0000000000000002, `sin(1e20)`, a read of a tree's shared memory, a reciprocal written
+  in the IR, the six sums that regrouping must leave strided (4.6), a u8 bound to
+  255 + 1, bools converted from 2, 0.5 and NaN, and `maximum` and `minimum` of signed
+  zeros and NaN, folded or not. Agreement between `--strict` and `--plain` is no
+  independent oracle (both share the builder and the math library), so these tests
+  compare with numpy models, and the random kernels of 12.1 with an independent
+  interpreter. Handling these edge cases changed the PTX of 43 kernels of the corpora;
+  the 42 that run (the 43rd is a generator fault) take 0.999x their earlier time
+  (geometric mean, alternating order, best of three).
+* `tools/corpus_holdout3.py` is a third held-out set, written after those edge cases were
+  handled and run once: sines and cosines of large arguments, divisions by
   constants and means at `rtol = 0`, minima, maxima and clamps, norms over odd lengths,
   and new shapes in all five categories. 39 of 39 pass on the first run (the generator
   could not trace a fortieth), the largest error 6.2% of its tolerance.
@@ -880,47 +886,26 @@ copy engine say sm_90, those with fp8 casts ISA 8.1, and every module runs on
 the sm_120 runner. The 170-SM count of the RTX 5090 only steers a scheduling
 hint (8); no result depends on it.
 
-**What an independent review (27 Oct) raised, and where it stands**
+**Limits and open points**
 
-| Point | Status |
+| Area | Where it stands |
 |---|---|
-| Regrouping must check the combine program; a maximum of partial sums is not a sum | fixed, with refusal reasons in `--report` (4.6) |
-| +0 and -0 merged by value numbering | fixed: constants keyed by their bits (7) |
-| A tree's shared memory may be read afterwards | fixed: emmy's tree as written unless provably unobservable (4.7) |
-| Integer comparisons through f32; unsignedness lost; f64 `Init` through f32 | fixed (7) |
-| `sin`/`cos` wrong past about 2^40 | fixed: Payne-Hanek, ≤ 1 ulp for every float (7) |
-| Recovering `x / c` from `x * reciprocal(c)` changes the IR's meaning | now only where emmy's graph records a source division (7) |
-| Same-value stores by several lanes | one writer per spread cell output and per warp total (4.4, 4.7) |
-| The fallback catches failures, not wrong code; strict-versus-plain is not an independent oracle | stated as such (3, 9); the GPU tests compare with numpy models |
-| Claims too broad: bit-exact, race-free, accuracy, the 17x broadcast | qualified, with datasets and revisions (README, 4.3, 9) |
-| Fresh held-out data after the fixes | `holdout3`: 39 of 39 on first run (9) |
-| An independent dtype-faithful IR interpreter, with randomly generated kernels checked against it in every lowering | done: `tests/oracle.py`, 24 random kernels in every lowering, 72 runs (12.1) |
-| One planner for repeated work at every scope (lane, warp, block, cluster), choosing by work removed against communication, synchronization and register cost; strided lane classes the `lowbit` domain cannot describe | the analysis and cost model: `planner.py` (12.5); it agrees with the recognisers on 769 of 777 loops (85 of them through a loop inside). Letting it drive them is next |
-| A coalescing model in 32-byte sectors (alignment, dtype width, reuse) instead of 128-byte lines | `EMMY_PTX_COST=sectors`; the same decisions as the line model on all 533 kernels (12.4) |
-| Raw paired benchmark data in alternating order, a family-weighted view, and an ablation table per rewrite | `tools/ablate.py`: per rewrite, alternating order, family-weighted (12.2) |
-| Compile cost: the largest module (`h2a_1x512x64`, 1.1 MB of PTX) takes about 1.8 s to generate and 6 s in ptxas | `tools/compile_cost.py`, and `compile.py --explore`, a compile budget for exploratory trials (12.3) |
-| Analyses that produce facts, plans that record their preconditions, a checker, then emission | the regroup and tree checks follow that shape; the other rewrites still decide while they emit |
-| GPU tests and the corpus-dependent compile tests skip when the runner or the problem folders are absent | `EMMY_REQUIRE_ALL=1` turns those skips into failures |
-
-**What a second independent review (29 Oct) raised, and where it stands**
-
-| Point | Status |
-|---|---|
-| Regrouping can move an element to a thread that computes it differently (a weight `t`, a row `x[t, i]`), and its check let a partial written for one warp only reach a total | fixed: each element must keep its value, the threads must be exactly the combine's groups, and every warp must hand its partial to the tree (4.6). Two more such sums found with them (copies that compute differently, a loop starting at a Tile's row) are GPU tests too. The 533 kernels keep their PTX |
-| A u8 bound to `255 + 1` held 256 in every lowering | fixed: a narrow type keeps its width at every typed definition (7) |
-| `--explore` stopped on a plateau before a much smaller candidate | fixed: it goes on while the budget still decides an unrolling, and `--report` says when the target is not met (12.3) |
-| The planner kept, for a reassigned accumulator, the dependences of its first definition | fixed: dependences follow each value in order, to a fixed point around loops (12.5). The plans of the 533 kernels are unchanged |
-| The planner's agreement count was adjusted by hand | `tools/plan_survey.py` counts the loops shared for a loop inside them itself (12.5) |
-| Recovering a division by the divisor's name is a convention, not a proof | stated as emmy 0.3.11's convention, with a GPU test that renames the constant (7) |
-| Claims: 72 random kernels, 43 kernels raced, bit-for-bit, what `--plain` keeps, "bounds" | reworded: 24 kernels in 3 lowerings, 42 of the 43 timed, outputs as the runner returns them, the builder's work and FMA, "targets" |
-| `k_mlp` runs 2.2x faster under `--explore`, others slower: choose rolled or unrolled per kernel | fixed for its cause: complete unrollings that copy a rolled loop are undone in a kernel past 4,096 instructions, and ptxas then unrolls that loop itself (3). `k_mlp` takes 35.4 µs instead of 76.3 by default, the only one of the 533 kernels to change. A selector for the other kernels stays the next step (12.3) |
-| One checker of who owns each contribution, shared by regrouping, lane splitting and cell sharing | the regroup check is its first instance (4.6); the other rewrites still decide while they emit |
-| The oracle sees NaN and both infinities as one value (the runner returns them as null) | fixed: outputs come back as their bits, so NaN, the sign of an infinity and of a zero are compared (12.1). The first run showed `maximum(+0, -0)`: +0 on the GPU, -0 in numpy. The contract is now emmy's own, `fmaxf` and `fminf`, in the interpreter and in the compiler's constant folding, which kept the first of two zeros (7) |
+| The fallback lowering | catches a lowering that fails, not one that is wrong; the tests check results (3, 9) |
+| A division recovered from `x * reciprocal(c)` | only where emmy's graph records a source division, recognised by the names emmy 0.3.11 gives a divisor: a convention, not a proof; a GPU test renames the constant (7) |
+| Race freedom | evidence, not a proof: kernels that use shared memory or barriers give bit-identical outputs over eight launches, and where lanes would store the same value to one place, one lane stores it; Compute Sanitizer cannot run on the runner (9) |
+| Accuracy figures | measured on about a million inputs per range, not proven bounds (7) |
+| Bit-for-bit comparisons on the runner | every finite value exactly, signed zeros included; the runner returns NaN and infinities as null, so the oracle's tests read outputs back as bits to compare those too (12.1) |
+| `--explore` | a target size, not a bound, and `--report` says when it is missed. Choosing rolled or unrolled per kernel needs measurements a compile cannot make: 13 kernels stay past the target, at 1.17x the time (12.3) |
+| The planner | runs for `--report` only and agrees with the recognisers on 769 of 777 loops (12.5); letting it choose among them is next |
+| Legality checks | regrouping and the one-barrier tree have checkers that state their reasons (4.6, 4.7); the other rewrites still decide while they emit. One checker of who owns each contribution, shared by regrouping, lane splitting and cell sharing, is next |
+| Coalescing model | 128-byte lines; a 32-byte sector model (`EMMY_PTX_COST=sectors`) reaches the same decisions on all 533 kernels (12.4) |
+| Tests that need the runner or the hackathon's problems | the GPU tests skip without the runner, and the compile tests use `examples/` without the hackathon's problems; `EMMY_REQUIRE_ALL=1` turns any skip into a failure |
 
 ## 12. Checking and measuring the compiler itself
 
-Five longer-term suggestions of the review (28 Oct), as far as they were taken
-before the deadline.
+Tools that check and measure the compiler rather than the kernels: an
+independent interpreter, what each rewrite contributes, compile cost, a finer
+coalescing model and one planner for repeated work.
 
 ### 12.1 An independent interpreter (`tests/oracle.py`)
 
@@ -939,7 +924,7 @@ shared slab level by level and leaves it so.
 
 `tests/test_oracle.py` generates random kernels in four families: typed
 pointwise expressions over f32, i32 and u32 (−0.0 and 2^24 + 1 among the
-constants); reductions that several lanes share, folded with add, maximum or
+constants, each value also converted to bool); reductions that several lanes share, folded with add, maximum or
 minimum; cooperative reductions whose cross-lane combine may differ from the
 per-lane fold, some reading the tree's shared memory afterwards; and attention
 as emmy fuses it, an online softmax over 16 to 100 keys with masks, which the
@@ -951,12 +936,11 @@ within rounding otherwise. Outputs come back as their bits, each f64 as two
 32-bit words (the runner returns NaN and both infinities as null otherwise):
 a NaN matches any NaN, an infinity only one of its sign, and a bit-for-bit
 comparison sees the sign of a zero. All 24 kernels (4 families, 6 seeds
-each) pass in every lowering, 72 runs. Run
-against the build from before the fixes of section 9, 25 of the 72 runs fail: every pointwise
-kernel (integers, unsigned values, signed zeros), the cooperative kernels that
-read a tree's slab (in all three lowerings) and one maximum of per-lane sums
-(optimized only); the attention kernels pass on both builds. The generator
-finds the review's classes of bugs by itself.
+each) pass in every lowering, 72 runs. The generator finds the edge cases of
+section 9 by itself: on a build that did not yet handle them, 25 of the 72
+runs fail (every pointwise kernel, the cooperative kernels that read a tree's
+slab, and one maximum of per-lane sums, optimized only), and a build that
+keeps `bool(2)` as 2 fails all 18 pointwise runs.
 
 ### 12.2 What each rewrite contributes (`tools/ablate.py`)
 
@@ -1005,11 +989,10 @@ raw pairs are in `docs/results/ablation_2026-10-28.json`.
 `tools/compile_cost.py` times a cold `compile.py` (interpreter start, emmy
 import, lowering) and a local ptxas for sm_120, one kernel at a time. Over the
 533 kernels: `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the
-longest 2.6 s), ptxas a median 0.03 s (95th percentile 0.32 s). The longest
-used to be 6.1 s (`h3f_mm_softmax`): two thirds of it went to loop fusion's
-legality check, which looked again at every statement between two loops for
-each later loop it tried. It now looks at each once (`mapping._Between`), with
-the same decisions and the same PTX. The modules
+longest 2.6 s), ptxas a median 0.03 s (95th percentile 0.32 s). Loop
+fusion's legality check looks at each statement between two loops once
+(`mapping._Between`); looking again for each later loop it tried took two
+thirds of `h3f_mm_softmax`'s 6.1 s. The modules
 are a median 6 KB of PTX; the largest, `h2a_1x512x64`, is 1.1 MB: a 4-thread
 kernel whose 32 iterations, each of four 64-trip dot products, are all
 unrolled into 28,624 instructions, and ptxas takes 9.7 s over it. An
@@ -1022,21 +1005,21 @@ then none, until it fits or no smaller budget can change what is unrolled
 (each complete unrolling the budget allowed is noted on the kernel,
 `Lowerer.unrolls_within`). A candidate replaces the one kept only if it is
 10% smaller or reaches the size the other misses, and when none does
-`--report` says the target is not met. It is a target, not a bound: an
-independent review showed that the earlier rule, stop as soon as a step does
-not shrink the module, could stop on a plateau (16 trips of eight chained
-sines: 505,201 characters at budgets 1 and 1/4, 120,775 at 1/16); that kernel
-now gets the small module. On the 14 kernels past the target, ptxas time
+`--report` says the target is not met. It is a target, not a bound.
+Stopping as soon as a step does not shrink the module could stop on a plateau
+(16 trips of eight chained sines: 505,201 characters at budgets 1 and 1/4,
+120,775 at 1/16), so the search goes on while the budget still decides an
+unrolling. On the 14 kernels past the target, ptxas time
 falls from 21.7 s to 6.9 s in all (9.7 s → 0.14 s for the largest); ten
 modules shrink 7 to 48 times, while four keep their size, which comes from
-fragment loops and lane blocks that must stay unrolled (the same modules as
-before the change; `h3f_mm_softmax` now stops after one lowering, while
-`k_mm_softmax` tries all four budgets, 2.8 → 5.1 s). Their kernels took 1.11x
+fragment loops and lane blocks that must stay unrolled (`h3f_mm_softmax`
+stops after one lowering, while `k_mm_softmax` tries all four budgets,
+2.8 → 5.1 s). Their kernels took 1.11x
 as long (geometric mean of 14, measured on 28 Oct). The range was wide: from
 2.7x slower (`a_b8_32x32`) to 2.2x faster (`k_mlp`, 76 → 35 µs). That one had a
 cause a compile can see: its unrolling copied a rolled loop into a large
 kernel, and once the copies are gone ptxas unrolls that loop itself. The
-default now gives `k_mlp` the same small module (section 3). That leaves 13
+default gives `k_mlp` the same small module (section 3). That leaves 13
 kernels past the target, and with `k_mlp` at 1 the 14 take 1.17x as long
 under `--explore`. For the others, choosing per kernel would take
 measurements a compile cannot make, which is what a calibrated schedule
@@ -1079,11 +1062,9 @@ The dependences follow each value in order: a statement's result depends on
 what it reads (an accumulator's update on its old value too), a value set
 under a condition on the condition, and at a loop's head a value the loop
 changes on its value at entry and after any trip, to a fixed point (a loop's
-seeded accumulator starts from the identity). An independent review found
-that the first version kept, for a reassigned accumulator, the dependences of
-its first definition: after `s = 0; for k: s += x[t]`, a loop folding
-`s * w[j]` looked shareable by every lane. The plans of the 533 kernels are
-the same with either.
+seeded accumulator starts from the identity). Order matters for a
+reassigned accumulator: after `s = 0; for k: s += x[t]`, a loop folding
+`s * w[j]` depends on `t`, though the first definition of `s` does not.
 
 `tools/plan_survey.py` compares the plan with the recognisers' decisions over
 the 777 loops of the 533 kernels. They agree on whether to share 684 loops,
