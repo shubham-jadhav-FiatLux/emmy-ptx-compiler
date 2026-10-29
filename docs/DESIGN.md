@@ -119,7 +119,8 @@ register.
 3. *dealt* (4.4): independent iterations that a group of lanes would each run;
 4. *unrolled*: bounded and small (a loop over a shared-memory tile up to 128
    trips, so all its loads take immediate offsets: a 256³ `cp.async` matmul
-   6.8 → 4.8 µs), or marked `unroll`;
+   6.8 → 4.8 µs), or marked `unroll`; one whose body holds a loop that stays
+   rolled, only in a kernel of up to 4,096 instructions (below);
 5. *rolled*: 4-8 iterations per trip plus the leftover (in one-wave grids even
    large bodies, by a divisor of the trip count).
 
@@ -127,6 +128,29 @@ Unrolled and rolled loops run iterations in their original order, so their
 sums round exactly as the IR specifies. Read-only loads are issued as early as
 their indices allow (`_issue_loads_early`), so their latencies overlap the
 arithmetic between them.
+
+**Copies of a rolled loop.** A complete unrolling copies every loop in its
+body. Copies of a loop that stays rolled (too many trips) gain no
+straight-line code: each still branches, and value numbering shares nothing
+across loops. Measured, they can pay in a small kernel (`a_d80`, 2,438 PTX
+instructions: 12.9 µs with them, 18.9 without). They made no difference to a
+synthetic kernel at any size from 640 to 5,008 instructions. And they cost
+`k_mlp` (7,613) more than half its speed. Its lane-blocked loop copied the
+128-trip dot product of each hidden unit 48 times. With one copy left, ptxas
+unrolls that loop itself and issues its loads ahead (255 registers; 584 loads
+in the machine code against 104 in the PTX), and the kernel takes 35.4 µs
+instead of 76.3, the module `--explore` found. Its strict lowering, whose loop
+ptxas leaves rolled either way, takes 78 µs with or without the copies: what
+the copies cost is ptxas's own unrolling, not instruction fetch. So a kernel
+past 4,096 PTX instructions (`COPY_BUDGET`) with such copies is lowered again
+without them (`Lowerer._may_copy` notes them, `Lowerer.run` decides), and
+`--report` says so. Of the 533 kernels only `k_mlp` changes
+(`docs/results/copies_race_2026-10-29.json`, `copies_sweep_2026-10-29.json`).
+At about two machine instructions of 16 bytes a PTX one, the bound is also the
+128 KB a loop can run from the instruction cache, measured with
+`tools/icache.py`: a loop body of up to 112 KB runs at 0.70 ns an instruction
+a warp, one of 160 KB or more at 1.50 (`docs/results/icache_2026-10-29.json`).
+Copies that each run once do not pay that, as the strict `k_mlp` shows.
 
 **The plain lowering, a fallback.** Every rewrite in this document is
 optional: each applies only when its preconditions hold, and each has been
@@ -272,7 +296,9 @@ no shared reduction. `mapping.blocked` rewrites it IR to IR:
   keep the shuffles (no gain measured).
 * Unrolled blocks keep the query rows in registers; that pays while they take
   at most half the registers a thread may have, else the blocks run as a rolled
-  loop that reloads them (ptxas hoists what fits).
+  loop that reloads them (ptxas hoists what fits). They run rolled too when a
+  block's own loop stays rolled and the kernel would pass 4,096 instructions
+  (3).
 
 The rewrite is checked by a small interpreter that runs the rewritten loop on
 a group of lanes in lockstep and compares with each lane running the original
@@ -607,6 +633,13 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   typed `Let` of a literal and a reduction's seed are built in their own type,
   rounded once: an f64 constant keeps all 53 bits, an integer one all its
   bits.
+* **`maximum`, `minimum` and `relu` are CUDA's `fmaxf` and `fminf`**, which
+  emmy's renderer emits for them. PTX `max` and `min` compute exactly that,
+  measured on the runner: a NaN gives the other operand, and -0 is below +0
+  whichever operand comes first. Constants fold by the same rule
+  (`elementwise._fmax`). They used to fold with Python's `max`, which keeps
+  the first of two zeros: `maximum(-0.0, 0.0)` of two literals gave -0.0
+  where the GPU gives +0.0. The bit-exact oracle (12.1) led to this.
 * **Integers** follow numpy's fixed-width arithmetic in the result's type:
   `add`, `multiply` and the rest wrap at the width; comparisons compare the
   operands in their own types, exactly at any magnitude (never through
@@ -880,9 +913,9 @@ hint (8); no result depends on it.
 | The planner's agreement count was adjusted by hand | `tools/plan_survey.py` counts the loops shared for a loop inside them itself (12.5) |
 | Recovering a division by the divisor's name is a convention, not a proof | stated as emmy 0.3.11's convention, with a GPU test that renames the constant (7) |
 | Claims: 72 random kernels, 43 kernels raced, bit-for-bit, what `--plain` keeps, "bounds" | reworded: 24 kernels in 3 lowerings, 42 of the 43 timed, outputs as the runner returns them, the builder's work and FMA, "targets" |
-| `k_mlp` runs 2.2x faster under `--explore`, others slower: choose rolled or unrolled per kernel | open: the default stays; a selector calibrated offline is the next step (12.3) |
+| `k_mlp` runs 2.2x faster under `--explore`, others slower: choose rolled or unrolled per kernel | fixed for its cause: complete unrollings that copy a rolled loop are undone in a kernel past 4,096 instructions, and ptxas then unrolls that loop itself (3). `k_mlp` takes 35.4 µs instead of 76.3 by default, the only one of the 533 kernels to change. A selector for the other kernels stays the next step (12.3) |
 | One checker of who owns each contribution, shared by regrouping, lane splitting and cell sharing | the regroup check is its first instance (4.6); the other rewrites still decide while they emit |
-| The oracle sees NaN and both infinities as one value (the runner returns them as null) | stated (12.1); transporting the bits is a next step |
+| The oracle sees NaN and both infinities as one value (the runner returns them as null) | fixed: outputs come back as their bits, so NaN, the sign of an infinity and of a zero are compared (12.1). The first run showed `maximum(+0, -0)`: +0 on the GPU, -0 in numpy. The contract is now emmy's own, `fmaxf` and `fminf`, in the interpreter and in the compiler's constant folding, which kept the first of two zeros (7) |
 
 ## 12. Checking and measuring the compiler itself
 
@@ -897,9 +930,12 @@ in the type the IR gives it, result types from emmy's own `dtype_promote` and
 reduction identities from emmy's `ElementwiseImpl`. It shares no code with
 `emmy_ptx`. Arithmetic is numpy's, the reference the problems are checked
 against: float32 in float32 without fused multiply-adds, integers in fixed
-width. Cross-thread statements follow emmy's definitions: a butterfly over
-aligned lane groups, a tree that folds its shared slab level by level and
-leaves it so.
+width. `maximum`, `minimum` and `relu` are the exception, defined on purpose
+as emmy's CUDA defines them, `fmaxf` and `fminf`: numpy's `maximum`
+propagates a NaN and, of two zeros, returns the second operand (its x86 SIMD
+habit), which is no contract. Cross-thread statements follow emmy's
+definitions: a butterfly over aligned lane groups, a tree that folds its
+shared slab level by level and leaves it so.
 
 `tests/test_oracle.py` generates random kernels in four families: typed
 pointwise expressions over f32, i32 and u32 (−0.0 and 2^24 + 1 among the
@@ -911,9 +947,11 @@ optimizing lowering lane-blocks (groups of 4 to 32 lanes, partial blocks
 included). Each is compiled optimized, strictly and plainly, run on the GPU,
 and compared with the interpreter: bit for bit wherever the IR's order of
 operations is kept (`--strict`, and every kernel without a sum or an `exp`),
-within rounding otherwise. All 24 kernels (4 families, 6 seeds each) pass in
-every lowering, 72 runs; the runner returns NaN and both infinities as null,
-so those are told apart from finite values but not from each other. Run
+within rounding otherwise. Outputs come back as their bits, each f64 as two
+32-bit words (the runner returns NaN and both infinities as null otherwise):
+a NaN matches any NaN, an infinity only one of its sign, and a bit-for-bit
+comparison sees the sign of a zero. All 24 kernels (4 families, 6 seeds
+each) pass in every lowering, 72 runs. Run
 against the build from before the fixes of section 9, 25 of the 72 runs fail: every pointwise
 kernel (integers, unsigned values, signed zeros), the cooperative kernels that
 read a tree's slab (in all three lowerings) and one maximum of per-lane sums
@@ -993,11 +1031,16 @@ falls from 21.7 s to 6.9 s in all (9.7 s → 0.14 s for the largest); ten
 modules shrink 7 to 48 times, while four keep their size, which comes from
 fragment loops and lane blocks that must stay unrolled (the same modules as
 before the change; `h3f_mm_softmax` now stops after one lowering, while
-`k_mm_softmax` tries all four budgets, 2.8 → 5.1 s). Their kernels take 1.11x as long (geometric mean of 14). The range
-is wide: from 2.7x slower (`a_b8_32x32`) to 2.2x faster (`k_mlp`, 76 → 35 µs,
-which the default unrolls past its best). The default, for final kernels,
-stays as it was; choosing per kernel would take measurements a compile cannot
-make, which is what a calibrated schedule selector would supply.
+`k_mm_softmax` tries all four budgets, 2.8 → 5.1 s). Their kernels took 1.11x
+as long (geometric mean of 14, measured on 28 Oct). The range was wide: from
+2.7x slower (`a_b8_32x32`) to 2.2x faster (`k_mlp`, 76 → 35 µs). That one had a
+cause a compile can see: its unrolling copied a rolled loop into a large
+kernel, and once the copies are gone ptxas unrolls that loop itself. The
+default now gives `k_mlp` the same small module (section 3). That leaves 13
+kernels past the target, and with `k_mlp` at 1 the 14 take 1.17x as long
+under `--explore`. For the others, choosing per kernel would take
+measurements a compile cannot make, which is what a calibrated schedule
+selector would supply.
 
 ### 12.4 Coalescing counted in 32-byte sectors
 

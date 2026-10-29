@@ -77,6 +77,9 @@ MLP that runs in thread-block clusters.
   * swizzled `ldmatrix` slabs.
 * Registers: unrolling bounded by the per-thread register budget, and launch
   hints (`.maxntid`, `.minnctapersm`) for one-wave grids.
+* Copies of a rolled loop: a complete unrolling that copies a loop which
+  stays rolled is undone in a kernel past 4,096 instructions, and ptxas then
+  unrolls that loop itself (`k_mlp` 76.3 → 35.4 µs, DESIGN 3).
 * Result: 0.51x the time of nvcc's build of emmy's own CUDA over 321
   problems (a 1.96x geometric-mean speedup), attention at 0.16x and fused MLPs
   down to 0.005x. The baseline is nvcc compiling emmy's own schedule, not
@@ -126,7 +129,7 @@ MLP that runs in thread-block clusters.
   2.6x on the 57 problems it changes (DESIGN 12.2). The raw measurements
   behind every number are in `docs/results/`.
 * A compile budget: `--explore` aims a module at a size ptxas assembles fast
-  (the largest: 9.7 → 0.14 s) for an autotuner's trials, at 1.11x kernel time
+  (the largest: 9.7 → 0.14 s) for an autotuner's trials, at 1.17x kernel time
   on average; a target, not a bound: `--report` says when it is not met
   (DESIGN 12.3).
 
@@ -160,14 +163,18 @@ MLP that runs in thread-block clusters.
   kernels in every lowering on the GPU, attention with lane blocking
   included: 24 kernels, each in the three lowerings (72 runs). On the build
   before the 27 Oct fixes 25 of the 72 runs fail, on the current one none.
-* 354 tests: unit, compile and GPU tests, each kernel lowered three ways,
+  Outputs come back as their bits, so NaN, infinities and the sign of a zero
+  are compared too; `maximum` and `minimum` are emmy's CUDA `fmaxf` and
+  `fminf`, a contract the constant folder now keeps as well (DESIGN 7, 12.1).
+* 367 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking. The GPU tests include
   edge cases found by an independent review: signed zeros, integers past
   2^24, unsigned shifts, f64 constants, `sin(1e20)`, a read of a tree's shared
   memory, and a maximum of per-lane sums; and from a second review, sums that
   regrouping must leave strided (a weight or a row that is the thread's own,
   a partial written for one warp only, and three more like them) and a u8
-  bound to 255 + 1.
+  bound to 255 + 1; and `maximum` and `minimum` of signed zeros and NaN,
+  folded or not.
 * 512 problems, generated with the organisers' tool: the open set, a wider
   corpus of 205 (20 of them f16), a schedule sweep of 106, and three held-out
   sets (81, 66, then 39) written after the compiler.
@@ -197,9 +204,11 @@ launch from `meta.json`:
 | Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.005x to 0.08x** the time of nvcc's build (13x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
 | Speed against nvcc's build of emmy's reference CUDA (321 problems, same launches) | **0.51x the time** (geometric mean of the per-problem ratios, a 1.96x speedup): chained 0.13x, attention 0.16x, fused 0.53x, reductions 0.65x, matmul 0.88x, pointwise 1.00x (launch-bound). Total 4.0 ms against 158.2 ms, a sum dominated by the slowest problems. Measured on 26 Oct (commit 13ee1e4); the runner's clocks are not locked, so single problems vary by up to a third between runs |
 | Math library accuracy (against correctly rounded results, about two million inputs per range) | exp, tanh ≤ 2 ulp · log, erf ≤ 1 ulp · sin, cos ≤ 1 ulp over the whole float32 range · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **24 kernels in 3 lowerings: 72 / 72** runs match (bit for bit wherever the IR's order of operations is kept); 25 of the 72 fail on the build before the fixes of 27 Oct, none of them attention |
-| Tests | 354 (210 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
-| Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the longest 2.6 s), ptxas a median 0.03 s; `--explore` cuts ptxas on the 14 largest modules from 21.7 s to 6.9 s |
+| Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **24 kernels in 3 lowerings: 72 / 72** runs match (bit for bit wherever the IR's order of operations is kept, NaN, infinities and signed zeros included); 25 of the 72 fail on the build before the fixes of 27 Oct, none of them attention |
+| Tests | 367 (219 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Copies of a rolled loop (29 Oct) | `k_mlp`, whose unrolling copied a rolled loop 48 times, now keeps one copy, which ptxas unrolls itself: **76.3 → 35.4 µs**, the only one of the 533 kernels whose PTX changes. A synthetic kernel runs as fast with copies as without up to 5,008 instructions, and `a_d80`, below the bound, keeps copies that pay (DESIGN 3) |
+| Instruction cache (`tools/icache.py`, 29 Oct) | a loop body of up to 112 KB of machine code runs at full speed, one of 160 KB or more takes 2.1x as long an instruction |
+| Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the longest 2.6 s), ptxas a median 0.03 s; `--explore` cut ptxas on the 14 largest modules of 28 Oct from 21.7 s to 6.9 s |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
 
@@ -317,7 +326,7 @@ tests/                 unit tests (builder, rewrites, cell placement, strict mod
                        interpreter), GPU tests, and oracle.py: an independent IR interpreter that
                        random kernels are checked against
 tools/                 corpus generation, GPU suite runner, nvcc race, tuning, math accuracy,
-                       per-rewrite ablation, compile cost, planner survey
+                       per-rewrite ablation, compile cost, planner survey, instruction cache
 examples/              four problems with their PTX, walked through in examples/README.md
 docs/DESIGN.md
 docs/results/          the raw measurements behind the numbers (what, when, which code: its README)
@@ -356,4 +365,7 @@ python tools/mathtest.py
 python tools/ablate.py <problems-dir> [--rewrites split,blocking]
 python tools/compile_cost.py <problems-dir> --ptxas <ptxas> [--flags=--explore]
 python tools/plan_survey.py <problems-dir>
+
+# how much machine code a loop can run from the GPU's instruction cache
+python tools/icache.py
 ```

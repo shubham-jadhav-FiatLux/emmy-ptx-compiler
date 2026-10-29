@@ -1,0 +1,93 @@
+[
+ {
+  "fmas": 256,
+  "body_kb": 4.0,
+  "trips": 7812,
+  "median_us": 1375.44,
+  "ns_per_instruction": 0.6877640168970814
+ },
+ {
+  "fmas": 512,
+  "body_kb": 8.0,
+  "trips": 3906,
+  "median_us": 1406.112,
+  "ns_per_instruction": 0.7031009984639017
+ },
+ {
+  "fmas": 1024,
+  "body_kb": 16.0,
+  "trips": 1953,
+  "median_us": 1390.432,
+  "ns_per_instruction": 0.695260496671787
+ },
+ {
+  "fmas": 2048,
+  "body_kb": 32.0,
+  "trips": 976,
+  "median_us": 1388.816,
+  "ns_per_instruction": 0.6948082095286885
+ },
+ {
+  "fmas": 3072,
+  "body_kb": 48.0,
+  "trips": 651,
+  "median_us": 1455.504,
+  "ns_per_instruction": 0.727798579109063
+ },
+ {
+  "fmas": 4096,
+  "body_kb": 64.0,
+  "trips": 488,
+  "median_us": 1429.312,
+  "ns_per_instruction": 0.7150678790983607
+ },
+ {
+  "fmas": 5120,
+  "body_kb": 80.0,
+  "trips": 390,
+  "median_us": 1414.368,
+  "ns_per_instruction": 0.7083173076923077
+ },
+ {
+  "fmas": 6144,
+  "body_kb": 96.0,
+  "trips": 325,
+  "median_us": 1410.288,
+  "ns_per_instruction": 0.7062740384615385
+ },
+ {
+  "fmas": 7168,
+  "body_kb": 112.0,
+  "trips": 279,
+  "median_us": 1410.176,
+  "ns_per_instruction": 0.7051331285202252
+ },
+ {
+  "fmas": 8192,
+  "body_kb": 128.0,
+  "trips": 244,
+  "median_us": 1664.096,
+  "ns_per_instruction": 0.8325275358606558
+ },
+ {
+  "fmas": 10240,
+  "body_kb": 160.0,
+  "trips": 195,
+  "median_us": 3001.568,
+  "ns_per_instruction": 1.5031891025641027
+ },
+ {
+  "fmas": 12288,
+  "body_kb": 192.0,
+  "trips": 162,
+  "median_us": 2972.848,
+  "ns_per_instruction": 1.4934011702674896
+ },
+ {
+  "fmas": 16384,
+  "body_kb": 256.0,
+  "trips": 122,
+  "median_us": 2981.184,
+  "ns_per_instruction": 1.4914510758196722
+ }
+]
