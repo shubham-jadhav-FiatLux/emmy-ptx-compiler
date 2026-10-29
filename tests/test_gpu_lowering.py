@@ -17,7 +17,7 @@ from kernels import (column_recomputing_mlp, rasterized_row_scale, regroup_hazar
                      staged_matmul, three_column_attention)
 
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F16, F32, F64, I32, U32
+from emmy.compiler.dtype import F16, F32, F64, I16, I32, U8, U16, U32
 from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
@@ -714,6 +714,28 @@ def test_unsigned_and_signed_integer_arithmetic_like_numpy():
     with np.errstate(over="ignore"):
         assert np.array_equal(got, np.array(want, np.float64))
 
+
+def test_narrow_integers_keep_their_width_where_they_are_defined():
+    """A u8, u16 or i16 value lives in a 32-bit register, but where a definition
+    declares the type, C keeps that width's low bits: 255 + 1 in a u8 is 0 (so
+    adding 1 then gives 1, and it equals 0), 65535 + 2 in a u16 is 1, 32767 + 1
+    in an i16 is -32768, a u8 accumulator of three 100s holds 44, and a u8 sum
+    of 32 lanes' 100s is 128."""
+    t = Var("t")
+    sum8 = (Assign("lane_sum", "add", ("lane_sum", "lane_sum_b")),)
+    stmts = [Let(name="n", value=B("+", I(255), I(1)), dtype=U8), Let(name="one", value=I(1)),
+             Let(name="nil", value=I(0)), Assign("next", "add", ("n", "one")), Assign("is_zero", "equal", ("n", "nil")),
+             Let(name="h", value=B("+", I(65535), I(2)), dtype=U16), Let(name="k", value=B("+", I(32767), I(1)), dtype=I16),
+             Let(name="hundred", value=I(100), dtype=U8), Init("acc", 0.0, dtype=U8),
+             Loop(axis=Axis("j", Dim(3)), body=(Accum("acc", "hundred", dtype=U8),), seed=False),
+             Init("lane_sum", 0.0, dtype=U8), Accum("lane_sum", "hundred", dtype=U8),
+             WarpShuffle(state=("lane_sum",), state_b=("lane_sum_b",), combine_states=sum8, length=32, dtype=U8)]
+    names = ["n", "next", "is_zero", "h", "k", "acc", "lane_sum"]
+    stmts += [Write("out", (I(k), t), n) for k, n in enumerate(names)]
+    body = [Tile(axes=(Axis("t", Dim(32)),), block_threads=32, body=tuple(stmts))]
+    got = run(body, {}, {"out": (len(names), 32)}, 1, 32, out_dtype="f64")["out"]
+    want = np.repeat(np.array([[0], [1], [1], [1], [-32768], [44], [128]], np.float64), 32, axis=1)
+    assert np.array_equal(got, want), got[:, 0]
 
 def test_initializers_keep_their_own_precision():
     """An f64 Init keeps all 53 bits, an integer Let all 32: neither passes

@@ -217,6 +217,26 @@ def _wrapped(t: str, v: int) -> int:
     return v - (1 << bits) if t[0] == "s" and v >> (bits - 1) else v
 
 
+NARROW_RANGE = {"u8": (0, 255), "u16": (0, 65535), "i8": (-128, 127), "i16": (-32768, 32767)}
+
+
+def declared(b: Builder, v: Value, dtype: str, literal: bool = False) -> Value:
+    """``v`` as the value a definition of emmy dtype ``dtype`` holds (a typed
+    Let or Init, an accumulator), converted as C converts it. An integer
+    keeps the low bits of a narrow type (C's rule for unsigned types, two's
+    complement for signed ones): 255 + 1 in a u8 is 0, though its register
+    holds 32 bits. A float, and a ``literal`` (which emmy writes as a float),
+    truncates and saturates at the type's range, as cvt.rzi does (C leaves an
+    out-of-range float undefined)."""
+    out = b.convert(v, value_type(dtype))
+    if dtype not in NARROW_RANGE or not out.is_int:
+        return out
+    if literal or v.is_float:
+        lo, hi = NARROW_RANGE[dtype]
+        return b.imax(b.imin(out, b.int_const(hi, out.type)), b.int_const(lo, out.type))
+    return _narrow(b, out, dtype)
+
+
 def _narrow(b: Builder, v: Value, dtype: str) -> Value:
     """A u8, u16, i8 or i16 result computed in 32 bits, wrapped to its width."""
     width = {"u8": 8, "u16": 16, "i8": 8, "i16": 16}.get(dtype)

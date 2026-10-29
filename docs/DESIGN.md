@@ -615,8 +615,15 @@ f16 accumulator, a coordinate mask, a bias read and atomic f16x2 stores.
   problems are checked against; emmy's CUDA prints C's `/` and `%`, which
   truncate, so the two differ for negative operands. Unsigned values (u8 to
   u64) keep their sign: logical right shifts, unsigned division, remainder
-  and comparison, and zero-extension when widened. u8, u16 and i16 results
-  wrap to their width.
+  and comparison, and zero-extension when widened. u8, u16 and i16 values
+  live in 32-bit registers but keep their own width wherever a definition
+  declares the type (`elementwise.declared`, used by a typed `Let`, `Init`, a
+  loop's seed, an accumulator's update and a butterfly's or tree's combine):
+  an integer keeps that width's low bits, as C converts it (255 + 1 in a u8
+  is 0, found by an independent review: it was 256), and a float, or a
+  literal (which emmy writes as a float), saturates at the type's range, as
+  `cvt.rzi` does, where C leaves it undefined. Results of u8, u16 and i16
+  operations wrap to their width too.
 * **Signed zeros, NaN and the policy for rewrites.** Every rewrite is in one
   of three classes: exact (bit for bit the IR's result: CSE, fusion,
   congruent accumulators, unrolling, vector loads, the one-barrier tree, cell

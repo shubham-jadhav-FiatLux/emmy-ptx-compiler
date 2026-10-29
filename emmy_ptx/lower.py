@@ -611,8 +611,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 if canon is None:
                     raise LoweringError(f"Accum {st.name!r}: op {st.op.name!r} has no identity")
                 if loop.seed:
-                    dtype = elementwise.value_type(st.dtype.name if st.dtype is not None else "f32")
-                    self.declare_var(st.name, dtype, self.b.const_of(IDENTITY[canon], dtype))
+                    name = st.dtype.name if st.dtype is not None else "f32"
+                    dtype = elementwise.value_type(name)
+                    init = elementwise.declared(self.b, self.b.const_of(IDENTITY[canon], dtype), name, literal=True)
+                    self.declare_var(st.name, dtype, init)
 
     def _loop(self, s, start: Value, step: Value, end: Value, end_name: str | None = None) -> None:
         """``for (v = start; v < end; v += step) body``.
@@ -815,14 +817,16 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             v = self.expr(s.value)
         elif kind(s.value) == "Literal":  # a number of the declared type, rounded once
             v = self.b.const_of(s.value.value, elementwise.value_type(s.dtype.name))
-        else:
-            vtype = elementwise.value_type(s.dtype.name)
-            v = self.b.convert(self.expr(s.value, "f64" if vtype == "f64" else "f32"), vtype)
+            v = elementwise.declared(self.b, v, s.dtype.name, literal=True)
+        else:  # converted as C converts it to the declared type (a u8 keeps 8 bits)
+            ftype = "f64" if elementwise.value_type(s.dtype.name) == "f64" else "f32"
+            v = elementwise.declared(self.b, self.expr(s.value, ftype), s.dtype.name)
         self.define(s.name, v)
 
     def stmt_Init(self, s) -> None:
         dtype = elementwise.value_type(s.dtype.name)
-        self.declare_var(s.name, dtype, self.b.const_of(s.identity, dtype))
+        init = elementwise.declared(self.b, self.b.const_of(s.identity, dtype), s.dtype.name, literal=True)
+        self.declare_var(s.name, dtype, init)
 
     def stmt_Assign(self, s) -> None:
         args = [self.value(a) for a in s.args]
@@ -903,8 +907,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                     new = b.fma(factors[0], factors[1], addend)
                     self._fmas += 1
                     break
-        if new is None:
-            new = elementwise.apply(b, canon, [base, b.convert(value, acc.type)], _dtype_name(acc.type))
+        if new is None:  # (in the accumulator's declared type: a u8 keeps 8 bits)
+            new = elementwise.apply(b, canon, [base, b.convert(value, acc.type)], _declared(s.dtype, acc.type))
         b.assign(acc, new)
 
     def stmt_Select(self, s) -> None:
@@ -1203,12 +1207,14 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     # ------------------------------------------------------------- statements: cross-thread
 
     def stmt_WarpShuffle(self, s) -> None:
-        self._butterfly(s.state, s.state_b, s.combine_states, int(s.length), 1, elementwise.value_type(s.dtype.name))
+        self._butterfly(s.state, s.state_b, s.combine_states, int(s.length), 1, elementwise.value_type(s.dtype.name),
+                        s.dtype.name)
 
 
-    def _butterfly(self, state, state_b, program, length: int, low: int, vtype: str) -> None:
+    def _butterfly(self, state, state_b, program, length: int, low: int, vtype: str, dtype: str | None = None) -> None:
         """For lane distances ``length/2`` down to ``low``: swap the state with
-        the lane that far away and combine the pair with ``program``."""
+        the lane that far away and combine the pair with ``program`` (in emmy
+        dtype ``dtype``, by default that of ``vtype``)."""
         b = self.b
         mask = self.kernel.reg("s32")
         b.emit("activemask.b32", mask, ndefs=1, effect=False)
@@ -1218,7 +1224,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 for st, sb in zip(state, state_b):
                     cur = b.in_reg(b.convert(self.value(st), vtype))
                     self.define(sb, self._shuffle_xor(cur, lane_mask, mask))
-                self.merge(program, state, vtype)
+                self.merge(program, state, vtype, dtype)
             lane_mask //= 2
         for st in state:  # the butterfly leaves each aligned group of `length` lanes agreeing
             var = self.scope.lookup(st)
@@ -1279,7 +1285,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 with self.block():  # the tree's temporaries shadow the outer state
                     for name, v in zip((*s.state, *s.state_b), (*level[i], *level[i + half])):
                         self.define(name, v)
-                    self.merge(s.combine_states, s.state, vtype)
+                    self.merge(s.combine_states, s.state, vtype, s.dtype.name)
                     level[i] = [self.value(st) for st in s.state]
             half //= 2
         self._tree_barrier(s)
@@ -1306,7 +1312,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                     self.define(name, self.load_one(buf, mine, vtype))
                 for name, buf in zip(s.state_b, bufs):
                     self.define(name, self.load_one(buf, theirs, vtype))
-                self.merge(s.combine_states, s.state, vtype)
+                self.merge(s.combine_states, s.state, vtype, s.dtype.name)
                 for name, buf in zip(s.state, bufs):
                     self.store_one(buf, mine, self.value(name))
             b.place(after)
@@ -1341,13 +1347,14 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                 return f"a {k} reads {', '.join(sorted(seen))}"
         return "another tree reduces the same shared memory" if trees > 1 else None
 
-    def merge(self, program, state, vtype: str) -> None:
-        """Run a combine program: an Assign to a state name updates that
-        (innermost) variable; any other Assign declares a temporary."""
+    def merge(self, program, state, vtype: str, dtype: str | None = None) -> None:
+        """Run a combine program, in emmy dtype ``dtype`` (by default that of
+        ``vtype``): an Assign to a state name updates that (innermost)
+        variable; any other Assign declares a temporary."""
         state = set(state)
         for a in program:
             args = [self.value(x) for x in a.args]
-            v = elementwise.apply(self.b, a.op.name, args, _dtype_name(vtype))
+            v = elementwise.apply(self.b, a.op.name, args, dtype or _dtype_name(vtype))
             if a.name in state:
                 self.reassign(a.name, v)
             else:
@@ -1590,3 +1597,9 @@ def _dtype_of(v: Value) -> str:
 
 def _dtype_name(vtype: str) -> str:
     return {"s32": "i32", "s64": "i64", "pred": "f32"}.get(vtype, vtype)
+
+
+def _declared(dtype, vtype: str) -> str:
+    """The emmy dtype an accumulator declared ``dtype`` (or None) computes in:
+    a narrow integer type itself, so that it wraps; else that of ``vtype``."""
+    return dtype.name if dtype is not None and dtype.name in elementwise.NARROW_RANGE else _dtype_name(vtype)
