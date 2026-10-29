@@ -51,7 +51,9 @@ class _Block:
         self.shared_shape: dict[str, tuple] = {}
         self.ctaid, self.block = ctaid, block
         self.tid = np.arange(block, dtype=np.int64)
-        self.env: dict[str, np.ndarray] = {}
+        # the thread's lane and warp, which emmy's kernels name without binding them
+        self.env: dict[str, np.ndarray] = {"lane": (self.tid & 31).astype(np.int32),
+                                           "warp": (self.tid >> 5).astype(np.int32)}
 
     # ---------------------------------------------------------------- values
 

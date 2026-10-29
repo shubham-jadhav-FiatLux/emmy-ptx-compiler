@@ -90,9 +90,13 @@ MLP that runs in thread-block clusters.
   invariant work.
 * Rewrites check their own legality and say why they refuse. Regrouping a
   cooperative reduction requires every partial to flow only into combines
-  with its own fold (a maximum of partial sums is refused); the one-barrier
-  halving tree requires that nothing reads its shared memory afterwards
-  (otherwise emmy's tree runs as written). `--report` prints the reasons.
+  with its own fold (a maximum of partial sums is refused) and every warp's
+  partial to reach the tree once, and every element to keep its value on
+  the thread that now folds it: nothing the loop reads from outside may differ
+  between the threads (a weight `t`, a row `x[t, i]`), and unrolled copies
+  must compute alike. The one-barrier halving tree requires that nothing reads
+  its shared memory afterwards (otherwise emmy's tree runs as written).
+  `--report` prints the reasons.
 * `--strict` keeps only the rewrites that leave every bit of every result as
   the IR's own order of operations gives it. Checked against the plain
   lowering on 371 problems; the two share the builder and math library, so
@@ -177,6 +181,7 @@ launch from `meta.json`:
 | Second held-out set (`tools/corpus_holdout2.py`: 66 problems written on 26 Oct, after every optimization) | **64 / 66** pass. The other two fail for any compiler, nvcc's build included: the generator lists a consumer kernel before its producer, and emmy traces `A @ v` into a 500x300 output. The set found one bug: emmy's `x * reciprocal(3.0)` is an ulp off numpy's `x / 3.0` at `rtol = 0`, so it is now computed as the correctly rounded quotient (nvcc's build still fails it; `--strict` and `--plain` keep emmy's multiply, 62 / 66) |
 | Third held-out set (`tools/corpus_holdout3.py`: 39 problems written on 27 Oct, after the fixes below were frozen, and run once) | **39 / 39** pass on the first run; worst error 6.2% of the tolerance. Aimed also at the edges the fixes cover: sines and cosines of arguments up to 1e30, divisions by constants and means at `rtol = 0`, clamps, minima and maxima |
 | Edge cases from an independent review (a maximum of per-lane sums, `x*(+0)` against `x*(-0)`, integers past 2^24, a u32 right shift, an f64 constant, `sin(1e20)`, a read of a tree's shared memory, a reciprocal written in the IR) | all pass in every lowering, as GPU tests; seven were wrong before the fixes of 27 Oct (DESIGN 9). The fixes leave the speed unchanged: the 43 kernels whose PTX they changed run at 0.999x their previous time |
+| Edge cases from a second independent review (sums whose elements regrouping moved to a thread that computes them differently: a weight `t`, a row `x[t, i]`, a partial written for one warp only; and two more found with them: unrolled copies that compute differently, a loop starting at a Tile's row) | all pass in every lowering, as GPU tests; the five were wrong in the optimized lowering before 29 Oct. The stricter check keeps every regrouping the 533 kernels had: their PTX is unchanged (DESIGN 4.6) |
 | Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **469 / 473** pass: all but the two generator faults and the two `rtol = 0` divisions, where it keeps emmy's multiply by the reciprocal |
 | Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **469 / 473** pass, the same four aside. Checked bit for bit on 402 problems: the 371 without float atomics give outputs identical to the plain lowering's (so every rewrite it keeps is exact) |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **26% of the tolerance** (`k_mlp_gelu_64x256x1024x128`), median 0.14%, over the 471 passing problems at commit 8b76863 (an observation on these inputs, not a bound). On the 402-problem set of 26 Oct, numpy's own float32 had median 0.12%, nvcc's build 0.18% and failed 2 bit-exact problems |

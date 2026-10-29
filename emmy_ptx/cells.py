@@ -20,6 +20,7 @@ from .common import STATIC_SMEM_LIMIT, lowbit
 from .frontend import DEFAULT_BLOCK
 from .lanes import SPLIT_MIN_TRIPS
 from .mapping import LOOPS, kind, reads, walk
+from .ptx import Reg
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,7 @@ class CellLayout:
             coords.append(b.uniform(coord, min(cap, lowbit(stride) * spread)))
         raster = _raster_plan(s, extents)
         if raster is None:
+            self._note_coordinates(s, coords, strides, spread, ranked=True)
             return coords
         gi, oi, g = raster
         ea, eb = extents[gi], extents[oi]
@@ -244,7 +246,23 @@ class CellLayout:
         group = min(cap, lowbit(strides[ni]) * spread)  # both are functions of gid / strides[ni]
         coords[gi] = b.uniform(b.assume(a, 0, ea - 1), group)
         coords[oi] = b.uniform(b.assume(o, 0, eb - 1), group)
+        alike = [strides[ni] if i in (gi, oi) else stride for i, stride in enumerate(strides)]
+        self._note_coordinates(s, coords, alike, spread, ranked=ni < len(extents) - 1)
         return coords
+
+    def _note_coordinates(self, s, coords: list[Value], cells: list[int], spread: int, ranked: bool) -> None:
+        """Note what regrouping must know of the coordinates (see
+        ``Lowerer._ownership_refusal``): coordinate i is the same throughout each
+        aligned group of ``cells[i] * spread`` consecutive threads, and when
+        ``ranked`` (the last axis decoded on its own) and a thread runs each
+        cell, the last coordinate is the thread's flat id modulo its extent."""
+        if s.aux_threads:
+            return  # (auxiliary threads repeat the cell ids)
+        for v, n in zip(coords, cells):
+            if isinstance(v.op, Reg):
+                self._cell_alike[v.op.name] = n * spread
+        if ranked and spread == 1 and coords and isinstance(coords[-1].op, Reg):
+            self._cell_rank[coords[-1].op.name] = int(s.axes[-1].extent.as_static())
 
 
 def _thread_free(body) -> bool:

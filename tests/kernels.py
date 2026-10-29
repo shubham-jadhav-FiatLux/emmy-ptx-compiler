@@ -1,12 +1,14 @@
 """Hand-built Kernel IR shared by the tests: Tiles whose cells the lowering places
 anew (Lowerer._placement), a loop whose work neighbouring blocks repeat
-(cluster.py), and a staged matmul whose cells coarsen.py merges."""
+(cluster.py), a staged matmul whose cells coarsen.py merges, and cooperative
+sums regrouping must leave alone."""
 
+import numpy as np
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync, Tile, WarpShuffle
+from emmy.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync, Tile, TreeHalve, WarpShuffle
 from emmy.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, StridedLoop, Write
 from emmy.compiler.ir.stmt.leaves import Init, Let
 
@@ -156,3 +158,65 @@ def staged_matmul(rows: int = 32, cols: int = 64, k: int = 64, stage: int = 32) 
         Loop(axis=Axis("ks", Dim(k // stage)), body=step),
         *(Write("out", (row(i), col(j)), name) for (i, j), name in acc.items()),
     ))]
+
+
+def regroup_hazards() -> dict:
+    """Cooperative sums that regrouping (regroup.py) must leave strided, each as
+    (body, inputs, output shape, threads, answer): an element moved to another
+    thread or copy would be folded differently there, or a warp's partial
+    would join a total it stays out of. The inputs are small integers in
+    float32, so a wrong grouping shows exactly."""
+    t, i = Var("t"), Var("i")
+    add = (Assign("s", "add", ("s", "sb")),)
+
+    def tile(threads, *body, axes=None):
+        return [Tile(axes=axes or (Axis("t", Dim(threads)),), block_threads=threads, body=body)]
+
+    def strided(n, step, *body, start=t):
+        return StridedLoop(axis=Axis("i", Dim(n)), start=start, step=I(step), body=body)
+
+    butterfly = WarpShuffle(state=("s",), state_b=("sb",), combine_states=add, length=32)
+    ones = np.zeros(128, np.float32)
+    ones[:4] = 1
+    one_at_0_1 = np.zeros((32, 128), np.float32)
+    one_at_0_1[0, 1] = 1
+    one_at = {(k, n): np.eye(1, n, k, dtype=np.float32)[0] for k, n in ((1, 256), (1, 64), (63, 256))}
+    return {
+        # thread t scales its elements by t: the ones at 0..3 give 0 + 1 + 2 + 3
+        "weight": (tile(32, Let(name="w", value=t, dtype=F32), strided(128, 32, Load(name="v", input="x", index=(i,)),
+                   Assign("vw", "multiply", ("v", "w")), Accum("s", "vw")), butterfly, Write("out", (t,), "s")),
+                   {"x": ones}, (32,), 32, np.full(32, 6, np.float32)),
+        # thread t reads row t: the one at (0, 1) is in no thread's elements
+        "row_of_thread": (tile(32, strided(128, 32, Load(name="v", input="x", index=(t, i)), Accum("s", "v")),
+                          butterfly, Write("out", (t,), "s")), {"x": one_at_0_1}, (32,), 32, np.zeros(32, np.float32)),
+        # emmy's two-copy unrolling, but the copies scale differently: element 1 is copy 0's, times 2
+        "copies": (tile(32, Let(name="two", value=Literal(2.0), dtype=F32),
+                   Let(name="three", value=Literal(3.0), dtype=F32),
+                   strided(256, 64, Load(name="v0", input="x", index=(i,)), Assign("w0", "multiply", ("v0", "two")),
+                           Accum("s", "w0"), Load(name="v1", input="x", index=(B("+", i, I(32)),)),
+                           Assign("w1", "multiply", ("v1", "three")), Accum("s1", "w1")),
+                   Accum("s", "s1"), butterfly, Write("out", (t,), "s")), {"x": one_at[1, 256]}, (32,), 32,
+                   np.full(32, 2, np.float32)),
+        # 4 x 8 cells whose loop starts at the row: the lanes of a row repeat its rank, and row 1 owns element 1
+        "start": (tile(32, strided(64, 4, Load(name="v", input="x", index=(i,)), Accum("s", "v"), start=Var("r")),
+                  WarpShuffle(state=("s",), state_b=("sb",), combine_states=add, length=4),
+                  Write("out", (B("+", B("*", Var("r"), I(8)), Var("c")),), "s"),
+                  axes=(Axis("r", Dim(4)), Axis("c", Dim(8)))), {"x": one_at[1, 64]}, (32,), 32,
+                  np.repeat(np.array([0, 4, 0, 0], np.float32), 8)),
+        # only thread 0 writes a partial (slot 0, warp 0's) to the tree: warp 1 owns element 63
+        "one_warp_handed": (tile(64, Smem("slab", (2,), "float"), Let(name="zero", value=Literal(0.0), dtype=F32),
+                            Cond(cond=B("<", t, I(2)), body=(Write("slab", (t,), "zero"),)), Sync(),
+                            strided(256, 64, Load(name="v", input="x", index=(i,)), Accum("s", "v")), butterfly,
+                            Cond(cond=B("==", t, I(0)), body=(Write("slab", (I(0),), "s"),)), Sync(),
+                            TreeHalve(bufs=("slab",), state=("s",), state_b=("sb",), combine_states=add, length=2,
+                                      tid_var="warp"), Write("out", (t,), "s")),
+                            {"x": one_at[63, 256]}, (64,), 64, np.zeros(64, np.float32)),
+        # each thread folds back what it wrote itself (no barrier needed); moved, it would read others' writes
+        "own_writes": (tile(32, Smem("buf", (128,), "float"),
+                       StridedLoop(axis=Axis("j", Dim(128)), start=t, step=I(32), body=(
+                           Load(name="u", input="x", index=(Var("j"),)), Let(name="tf", value=t, dtype=F32),
+                           Assign("ut", "multiply", ("u", "tf")), Write("buf", (Var("j"),), "ut"))),
+                       strided(128, 32, Load(name="v", input="buf", index=(i,)), Accum("s", "v")), butterfly,
+                       Write("out", (t,), "s")), {"x": np.ones(128, np.float32)}, (32,), 32,
+                       np.full(32, 4 * sum(range(32)), np.float32)),
+    }

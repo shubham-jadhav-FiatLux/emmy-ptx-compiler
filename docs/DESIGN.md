@@ -378,9 +378,37 @@ rewrite: each partial must be combined with its own fold and its partner
 elements must then stay with their lanes), in the fold's dtype, with nothing
 else in the program reading it; the warp partials may reach shared memory
 only as the input of the tree over the warps, and that tree's slab must be
-private to it (4.7). `--report` prints the reason for each refusal, e.g.
+private to it (4.7). Every warp's partial must also reach the tree exactly
+once: lane 0 of each warp writes it to slot `warp` of the array the tree folds
+it from, then a barrier, with `lane` and `warp` still the thread's own lane
+and warp index (a partial written by thread 0 alone, or to slot 0, may stay
+out of the total on purpose).
+
+Keeping every element once is not enough: each element must also keep its
+value, computed now by another thread and another copy. A value that does not
+change in the loop may still change with the thread (a weight `t`, a load
+`x[t, a]`), so `Lowerer._ownership_refusal` requires that the loop start at
+each thread's own rank (the cell id modulo the threads, the last coordinate
+of a Tile with one thread per cell, so the threads are exactly the groups the
+combine spans); that every value the body reads from outside be the same
+throughout each group, which the cell decode proves for the Tile's other
+coordinates (a coordinate with stride s is the same on aligned groups of s
+threads; `_alike_threads` follows a value's pure definition down to them, to
+constants and to `%ctaid`, and anything else is unknown); and that its loads
+read memory no thread writes (a thread may read back what it wrote itself
+without a barrier, but not what another wrote). `regroup` also requires the R
+copies to compute alike, name for name, since an element can change copy.
+What cannot be shown is refused. The 51 loops the open problems and the
+corpora regroup pass all of these checks, so their PTX is unchanged. An
+independent review found three sums the earlier checks let through (a weight
+`t`, a row `x[t, i]`, a partial written for one warp only), and two more
+turned up with them (copies that compute differently, a loop starting at the
+row of a 4 x 8 Tile): all five gave wrong answers and are now GPU tests (with
+a sixth, a thread folding back its own writes; `tests/kernels.py`).
+`--report` prints the reason for each refusal, e.g.
 `loop i: kept strided, not regrouped: the butterfly combines s with maximum,
-but the loop folds it with add`.
+but the loop folds it with add`, or `... w may differ between the cooperating
+threads`.
 
 ### 4.7 Block reductions with one barrier
 

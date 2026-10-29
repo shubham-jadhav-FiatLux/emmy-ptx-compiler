@@ -281,9 +281,10 @@ class Builder:
             self._defs[v.key()] = (op, args)
         return v
 
-    def def_of(self, v: Value):
-        """``(opcode, operands)`` of the pure instruction that computed ``v``."""
-        return self._defs.get(v.key()) if v.key() is not None else None
+    def def_of(self, v: Value | Reg):
+        """``(opcode, operands)`` of the pure instruction that computed ``v`` (or the register it holds)."""
+        key = ("reg", v.name) if isinstance(v, Reg) else v.key()
+        return self._defs.get(key) if key is not None else None
 
     def ug_of(self, x) -> int:
         """Uniform group of an operand (a Value, an address, a symbol, a special register)."""

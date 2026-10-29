@@ -31,6 +31,15 @@ own fold (``combine_refusal`` checks the whole combine program and says why
 not), the body is a pure fold (loads, arithmetic, accumulations nothing else
 reads), every load reads the loop variable plus a multiple of B, and V*B
 divides N, so no thread needs a partial chunk.
+
+Keeping each element once is not enough: the element must also keep its
+value. Its new thread computes it, and its new copy, so the copies must
+compute alike (``_same_copy``), and the lowering checks that nothing the
+body reads from outside (``outer_values``) differs between the threads, that
+the threads are exactly the groups the combine spans, and that the loads read
+memory no thread writes (``Lowerer._ownership_refusal``). A value that does
+not change in the loop may still change with the thread: ``x[t, a]``, or a
+weight ``t``.
 """
 
 from __future__ import annotations
@@ -42,7 +51,7 @@ from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.stmt import StridedLoop
 
-from .mapping import reads
+from .mapping import binds, own_reads, reads, renamed
 
 VECTOR = 4  # elements per chunk: one 16-byte load of f32
 _FOLDS = ("add", "sum", "maximum", "amax", "minimum", "multiply", "prod")
@@ -52,7 +61,19 @@ def _int(e):
     return e.value if type(e).__name__ == "Literal" and not isinstance(e.value, float) else None
 
 
-def combine_refusal(stmts, i: int, accs: set[str], width: int, private=lambda tree: None) -> str | None:
+def outer_values(loop) -> set[str]:
+    """The names ``loop``'s body reads from outside it: whatever it reads
+    before binding it, but its own loop variable and accumulators."""
+    bound = {loop.axis.name} | {s.name for s in loop.body if type(s).__name__ == "Accum"}
+    out: set[str] = set()
+    for s in loop.body:
+        out |= own_reads(s) - bound
+        bound |= binds((s,))
+    return out
+
+
+def combine_refusal(stmts, i: int, accs: set[str], width: int, private=lambda tree: None,
+                    builtin=lambda name: True) -> str | None:
     """Why the statements after ``stmts[i]`` are not a full combine of ``accs``
     across all ``width`` threads of the group (a warp butterfly, then a tree
     over the warps) that folds each accumulator with its own fold, or None
@@ -64,7 +85,10 @@ def combine_refusal(stmts, i: int, accs: set[str], width: int, private=lambda tr
     loop's own associative fold to it and to its partner (a maximum of partial
     sums is not a sum), in the same dtype, and the per-warp partials may reach
     shared memory only as the tree's input, read by nothing but the tree
-    (``private(tree)`` says why not, or None)."""
+    (``private(tree)`` says why not, or None). And every warp's partial must
+    reach the tree, once: lane 0 of each warp writes it to slot ``warp`` of
+    the array the tree folds it from, then a barrier (``builtin(name)``: do
+    ``lane`` and ``warp`` still mean the thread's lane and warp index?)."""
     loop = stmts[i]
     folds = {s.name: s for s in loop.body if type(s).__name__ == "Accum"}
     ops = {n: _canon(s.op.name) for n, s in folds.items()}
@@ -89,24 +113,44 @@ def combine_refusal(stmts, i: int, accs: set[str], width: int, private=lambda tr
     reason = _same_combine(shuffle, live, folds, ops, "butterfly")
     if reason is not None or width <= 32:
         return reason
-    slabs: set[str] = set()
+    if not (builtin("lane") and builtin("warp")) or any(
+            type(s).__name__ == "Smem" and s.name in ("lane", "warp") for s in rest):
+        return "lane or warp is bound to something other than the thread's lane and warp index"
+    handed: dict[str, str] = {}  # warp partial -> the shared array lane 0 of each warp writes it to
+    synced = False  # a barrier since those writes
     for s in rest[1:]:
         kind = type(s).__name__
         if kind == "TreeHalve":
             if not (int(s.length) * 32 == width and s.tid_var == "warp" and s.inner is None):
                 return "the tree over the warps does not span the cooperating threads"
             reason = _same_combine(s, live, folds, ops, "tree")
-            if reason is None and slabs - set(s.bufs):
-                reason = f"warp partials are written to {sorted(slabs - set(s.bufs))}, which the tree does not reduce"
-            return reason if reason is not None else private(s)
+            if reason is not None:
+                return reason
+            slot = dict(zip(s.state, s.bufs))
+            lost = sorted(n for n in live if handed.get(n) != slot[n])
+            if lost:
+                return f"the tree does not fold {', '.join(lost)} from where lane 0 of every warp wrote it"
+            return private(s) if synced else "no barrier between the warps' writes and the tree"
         if kind == "Cond":
-            for x in (*s.body, *s.else_body):
-                if type(x).__name__ != "Write" or set(x.values) - live:
-                    return "something other than the warp partials is written between the butterfly and the tree"
-                slabs.add(x.output)
-        elif kind not in ("Smem", "Sync"):
+            if not _is_lane_zero(s.cond) or s.else_body:
+                return "the warp partials are written under a condition other than lane == 0"
+            for x in s.body:
+                if not (type(x).__name__ == "Write" and len(x.values) == 1 and x.values[0] in live - set(handed)
+                        and tuple(x.index) == (Var("warp"),) and not x.atomic and x.swizzle == "NONE"):
+                    return "something other than each warp's partials, once each to slot warp, is written there"
+                handed[x.values[0]] = x.output
+            synced = False
+        elif kind == "Sync":
+            synced = synced or not (s.warp or s.count is not None)  # (a warp's or a partial barrier: not all)
+        elif kind != "Smem":
             return f"a {kind} sits between the butterfly and the tree"
     return "the warp partials are not combined by a tree over the warps"
+
+
+def _is_lane_zero(e) -> bool:
+    """Is condition ``e`` the test ``lane == 0``?"""
+    return type(e).__name__ == "BinaryExpr" and e.op == "==" and any(
+        x == Var("lane") and _int(y) == 0 for x, y in ((e.left, e.right), (e.right, e.left)))
 
 
 def _canon(op: str) -> str:
@@ -186,6 +230,8 @@ def regroup(loop, start_hi: int, step: int, extent: int):
             if group.setdefault(n, g) != g:
                 return None  # an accumulator two copies fold into
         parts[g].append(s)
+    if not all(_same_copy(parts[0], part, a) for part in parts[1:]):
+        return None  # element j of a chunk goes to copy j mod R, wherever it was: each must compute it alike
     k = f"{a}$chunk"
     chunk = BinaryExpr("+", BinaryExpr("*", Literal(VECTOR, "int"), loop.start),
                        BinaryExpr("*", Literal(VECTOR * threads, "int"), Var(k)))
@@ -198,6 +244,27 @@ def regroup(loop, start_hi: int, step: int, extent: int):
             body.append(_copy(s, a, element, local, f"${j}", accs))
     return StridedLoop(axis=Axis(k, Dim(extent // (VECTOR * threads))), start=Literal(0, "int"),
                        step=Literal(1, "int"), body=tuple(body), unroll=loop.unroll, seed=loop.seed)
+
+
+def _same_copy(first: list, other: list, a: str) -> bool:
+    """Does the copy with statements ``other`` compute what copy ``first``
+    computes, name for name, each reading the loop variable plus its own offset?"""
+    if len(first) != len(other):
+        return False
+    names: dict[str, str] = {}  # other's names -> first's
+    for s, t in zip(first, other):
+        ours, theirs = (x.names if type(x).__name__ == "Load" else (x.name,) for x in (s, t))
+        if type(s) is not type(t) or len(ours) != len(theirs):
+            return False
+        names.update(zip(theirs, ours))
+        if renamed(_at_loop_variable(t, a), names) != _at_loop_variable(s, a):
+            return False
+    return True
+
+
+def _at_loop_variable(s, a: str):
+    """``s``, a Load reading the loop variable itself instead of its copy's offset from it."""
+    return replace(s, index=(*s.index[:-1], Var(a))) if type(s).__name__ == "Load" else s
 
 
 def _offset(e, a: str):

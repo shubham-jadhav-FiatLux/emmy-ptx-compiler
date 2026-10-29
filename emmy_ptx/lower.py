@@ -41,7 +41,7 @@ from .frontend import KernelSource
 from .lanes import LANE_BUFFER, LaneSharing
 from .mapping import LOOPS, assigned, kind, produced, reads, walk
 from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, LabelRef, Mem, Reg, Sym, Vec
-from .regroup import combine_refusal, regroup
+from .regroup import combine_refusal, outer_values, regroup
 from .tensorcore import TensorCoreLowering, fragment_index, fragment_refs
 from .vectorize import vectorize_loads
 
@@ -116,6 +116,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self._loops = 0  # loops around the statement being lowered
         self._reciprocal_of: dict[str, Value] = {}  # SSA name -> the source divisor it is the reciprocal of
         self._constant_from: dict[str, str] = {}  # SSA name -> the ConstantOp buffer it was loaded from
+        # Tile coordinates (cells._note_coordinates): register -> how many consecutive threads, in
+        # aligned groups, hold it alike; register -> n where it is the thread's flat id modulo n
+        self._cell_alike: dict[str, int] = {}
+        self._cell_rank: dict[str, int] = {}
         self.shared = self._layout_shared()
         self.globals = self._prologue()
         self._readonly = frozenset(n for n, g in self.globals.items() if g.readonly)
@@ -201,7 +205,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
     def _regrouped(self, stmts, i: int, s):
         """``s`` in chunked order when its accumulators flow straight into a full
-        combine across the cooperating threads (see regroup.py), else ``s``."""
+        combine across the cooperating threads and what it folds for an element
+        does not depend on which of them folds it (see regroup.py), else ``s``."""
         accs = {st.name for st in s.body if type(st).__name__ == "Accum"}
         step = _int_value(s.step)
         if not accs or step is None or self.strict or self.off("regroup"):  # (chunks regroup the sums)
@@ -209,18 +214,72 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         start = self.expr(s.start)  # the thread's rank among the cooperating threads
         if start.lo != 0 or start.hi is None:
             return s
-        refusal = combine_refusal(stmts, i, accs, start.hi + 1, self._tree_refusal)
+        builtin = lambda name: self.scope.lookup(name) is self._ids[name]  # noqa: E731
+        refusal = combine_refusal(stmts, i, accs, start.hi + 1, self._tree_refusal, builtin)
         if refusal is not None:
             self.remark(f"loop {s.axis.name}: kept strided, not regrouped: {refusal}")
             return s
         chunked = regroup(s, start.hi, step, int(s.axis.extent.as_static()))
         if chunked is None:
             return s
+        refusal = self._ownership_refusal(s, start)
+        if refusal is not None:
+            self.remark(f"loop {s.axis.name}: kept strided, not regrouped: {refusal}")
+            return s
         folds = ", ".join(sorted({f"{st.name} by {st.op.name}" for st in s.body if type(st).__name__ == "Accum"}))
         self.remark(f"loop {s.axis.name}: the {step} cooperating threads take contiguous chunks instead of a stride "
-                    f"(checked: the partials ({folds}) flow only into combines with the same fold; the sum is "
-                    f"reassociated, so --strict keeps the stride)")
+                    f"(checked: the partials ({folds}) flow only into combines with the same fold, and no element's "
+                    f"value depends on the thread that folds it; the sum is reassociated, so --strict keeps the "
+                    f"stride)")
         return chunked
+
+    def _ownership_refusal(self, loop, start: Value) -> str | None:
+        """Why regrouping cooperative loop ``loop`` could change the value folded
+        for an element, or None. Each element moves to another of the threads,
+        so those must be exactly the aligned groups the combine spans (``start``
+        is the thread's flat id modulo their number, the last coordinate of a
+        Tile with one thread per cell), and what the body computes for an
+        element must not depend on the thread computing it: every value it
+        reads from outside is the same throughout each group (``_alike_threads``;
+        a loop-invariant value need not be), and it loads only memory no thread
+        writes."""
+        threads, block = start.hi + 1, self.src.launch.block
+        if self._cell_rank.get(getattr(start.op, "name", None)) != threads or block % threads or (
+                threads > WARP and threads != block):
+            return "it does not start at each thread's own rank among the cooperating threads"
+        for name in sorted(outer_values(loop)):
+            v = self.scope.lookup(name)
+            if not isinstance(v, Value) or self._alike_threads(v) % threads:
+                return f"{name} may differ between the cooperating threads (an element would take its new thread's)"
+        for st in loop.body:
+            if kind(st) == "Load" and st.input not in self._readonly:
+                return f"it reads {st.input}, which the kernel also writes"
+        return None
+
+    def _alike_threads(self, x) -> int:
+        """How many consecutive threads, in aligned groups, surely hold operand
+        ``x`` alike: 0 for any number (a constant, a kernel parameter), a block
+        for ``%ctaid``, a Tile coordinate's count (cells.py), and the gcd of the
+        operands' counts for what a pure instruction computes (a read-only load
+        too); 1 when nothing is known (a variable's read, a shuffle)."""
+        if isinstance(x, Value):
+            if x.const is not None:
+                return 0
+            x = x.op
+        if isinstance(x, Mem):
+            x = x.base
+        if isinstance(x, (Imm, Sym)):
+            return 0
+        if not isinstance(x, Reg):
+            return 1
+        if x.name in self._cell_alike:
+            return self._cell_alike[x.name]
+        if x.name.startswith(("%nctaid", "%ntid")):
+            return 0
+        if x.name.startswith("%ctaid"):
+            return self.src.launch.block
+        d = self.b.def_of(x)
+        return 1 if d is None else math.gcd(*(self._alike_threads(a) for a in d[1]))
 
     def _fusable(self, s, t) -> bool:
         """May sibling loops ``s`` and ``t`` be fused? Only loops that stay loops:
@@ -266,6 +325,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         self.ctaid = b.special("%ctaid.x", 0, launch.grid - 1)
         self.scope.names["lane"] = b.bitop("&", self.tid, b.int_const(31))
         self.scope.names["warp"] = b.uniform(b.shr(self.tid, b.int_const(5)), WARP)
+        self._ids = {name: self.scope.names[name] for name in ("lane", "warp")}
         out = {}
         for name in self.src.params:
             buf = self.src.buffers.get(name)

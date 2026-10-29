@@ -13,8 +13,8 @@ import sys
 import numpy as np
 import pytest
 import requests
-from kernels import (column_recomputing_mlp, rasterized_row_scale, shared_sum_added_atomically, staged_matmul,
-                     three_column_attention)
+from kernels import (column_recomputing_mlp, rasterized_row_scale, regroup_hazards, shared_sum_added_atomically,
+                     staged_matmul, three_column_attention)
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F16, F32, F64, I32, U32
@@ -781,3 +781,15 @@ def test_a_cross_lane_maximum_of_per_lane_sums_is_not_regrouped():
         ))]
         got = run(body, {"x": x}, {"out": (32,)}, 1, 32, ptx_has=ptx if not LOWERING else "")["out"]
         assert np.array_equal(got, np.full(32, want, np.float32)), op
+
+
+@pytest.mark.parametrize("case", list(regroup_hazards()))
+def test_regrouping_leaves_alone_a_sum_whose_elements_would_change(case):
+    """Cooperative sums whose elements another thread or copy would fold
+    differently (a weight or a row that is the thread's own, copies that
+    compute differently, a start that is not each thread's rank, a buffer
+    each thread reads back from itself), or whose warp partials do not all
+    reach the tree (tests/kernels.py): every lowering gives the IR's answer."""
+    body, inputs, shape, threads, want = regroup_hazards()[case]
+    got = run(body, inputs, {"out": shape}, 1, threads)["out"]
+    assert np.array_equal(got, want), (case, got)
