@@ -6,7 +6,8 @@ compiler's rewrites, are compiled optimized, strictly and plainly, run on the
 GPU (set EMMY_RUNNER) and compared with the interpreter:
 
 * typed pointwise expressions over float32, int32 and uint32 inputs, with
-  constants such as -0.0 and 2^24 + 1 (every lowering must match exactly);
+  constants such as -0.0 and 2^24 + 1, each value also converted to bool
+  (every lowering must match exactly);
 * reductions that several lanes share, folded with add, maximum or minimum
   (strict exactly; the others reassociate sums, so within rounding);
 * cooperative reductions: a strided loop over the block's threads, then a warp
@@ -27,7 +28,7 @@ import oracle
 import pytest
 import requests
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F32, I32, U32
+from emmy.compiler.dtype import BOOL, F32, I32, U32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.kernel.ir import Smem, Sync, Tile, TreeHalve, WarpShuffle
@@ -140,8 +141,10 @@ def pointwise(rng):
         dtype = {"f": F32, "i": I32, "u": U32}[kind]
         name = f"v{k}"
         stmts.append(Assign(name, op, args, dtype=dtype))
+        # and as a bool, which C makes 1 for any non-zero value (a typed Let, a typed Assign)
+        stmts += [Let(name=f"b{k}", value=Var(name), dtype=BOOL), Assign(f"d{k}", "add", (name, name), dtype=BOOL)]
         names[kind].append(name)
-        made.append(name)
+        made += [name, f"b{k}", f"d{k}"]
         if rng.random() < 0.4:  # a comparison of two values of one type, kept as its 0/1
             kind2 = str(rng.choice(["f", "i"]))
             cmp_op = str(rng.choice(["equal", "not_equal", "less", "greater_equal"]))

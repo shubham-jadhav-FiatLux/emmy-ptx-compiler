@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from emmy_ptx import elementwise
 from emmy_ptx.builder import Builder, Value, eliminate_dead_code
 from emmy_ptx.ptx import Imm, Instr, Kernel, Reg
 
@@ -120,6 +121,17 @@ def test_float64_arithmetic_stays_in_double_precision():
     assert ops(k) == ["ld.global.f64", "mul.rn.f64", "mul.rn.f64", "setp.lt.f64", "setp.lt.f64", "selp.f64"]
 
 
+def test_a_bool_is_one_for_any_non_zero_value():
+    """C's conversion to bool, folded for constants (2, 0.5 and NaN give 1,
+    -0.0 gives 0) and otherwise a test against zero that keeps a NaN true."""
+    k, b = make()
+    for x, want in ((b.int_const(2), 1), (b.f32_const(0.5), 1), (b.f32_const(float("nan")), 1),
+                    (b.f32_const(-0.0), 0), (b.int_const(256), 1)):
+        assert elementwise.declared(b, x, "bool").const == want
+    flag = elementwise.declared(b, b.pure("ld.global.f32", "f32", (Imm(0, "u64"),)), "bool")
+    assert (flag.lo, flag.hi) == (0, 1) and ops(k) == ["ld.global.f32", "setp.neu.f32", "selp.b32"]
+
+
 def test_dead_code_elimination_keeps_effects():
     k, b = make()
     x = ranged(b, 0, 9)
@@ -146,3 +158,25 @@ def test_double_product_with_the_reciprocal_rounds_like_float_division(c):
         got = (x.astype(np.float64) * (1.0 / float(c32))).astype(np.float32)
     same = (got.view(np.uint32) == want.view(np.uint32)) | (np.isnan(got) & np.isnan(want))
     assert same.all(), x[~same][:5]
+
+
+def test_a_store_into_a_bool_array_writes_0_or_1():
+    """Each element of a bool array is one byte, 0 or 1: storing 0.5 stores 1
+    (truncated, it would store 0) and 256 stores 1 (its low byte is 0)."""
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.expr import Var
+    from emmy.compiler.ir.kernel.ir import Tile
+    from emmy.compiler.ir.stmt import Load, Write
+
+    from emmy_ptx import PTX_VERSION, TARGET
+    from emmy_ptx.frontend import Buffer, KernelSource, Launch
+    from emmy_ptx.lower import Lowerer
+
+    body = (Tile(axes=(Axis("t", Dim(32)),), body=(Load(name="v", input="x", index=(Var("t"),)),
+                                                     Write("flags", (Var("t"),), "v"))),)
+    buffers = {"x": Buffer("x", (32,), "f32"), "flags": Buffer("flags", (32,), "bool")}
+    src = KernelSource("k", body, ("x", "flags"), buffers, Launch(1, 32, 0), frozenset({"flags"}))
+    for options in ({}, {"plain": True}):
+        ptx = Lowerer(src, **options).run().render(PTX_VERSION, TARGET)
+        assert "setp.neu.f32" in ptx and "st.global.u8" in ptx and "cvt.rzi" not in ptx, ptx

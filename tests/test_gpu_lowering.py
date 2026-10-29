@@ -17,7 +17,7 @@ from kernels import (column_recomputing_mlp, rasterized_row_scale, regroup_hazar
                      short_loop_around_a_long_one, staged_matmul, three_column_attention)
 
 from emmy.compiler.dim import Dim
-from emmy.compiler.dtype import F16, F32, F64, I16, I32, U8, U16, U32
+from emmy.compiler.dtype import BOOL, F16, F32, F64, I16, I32, U8, U16, U32
 from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Literal, TernaryExpr, Var
@@ -798,6 +798,29 @@ def test_narrow_integers_keep_their_width_where_they_are_defined():
     got = run(body, {}, {"out": (len(names), 32)}, 1, 32, out_dtype="f64")["out"]
     want = np.repeat(np.array([[0], [1], [1], [1], [-32768], [44], [128]], np.float64), 32, axis=1)
     assert np.array_equal(got, want), got[:, 0]
+
+def test_a_bool_holds_zero_or_one():
+    """C converts a value to bool as whether it is non-zero (a NaN too), so a
+    bool holds 0 or 1: bool(2) and bool(0.5) are 1 and bool(-0.0) is 0,
+    whether a typed Let, a typed Assign or a bool accumulator converts it, and
+    arithmetic on it then sees that 1 (bool(2) * x is x)."""
+    t = Var("t")
+    x = np.array([2.0, 0.5, 0.0, -0.0, -3.0, 1e-30, 256.0, 1.0] * 4, np.float32)
+    nan = (Assign("q", "divide", ("v", "zero")),)  # 0/0 for the zeros, so a NaN without an input of one
+    stmts = [Load(name="v", input="x", index=(t,)), Let(name="zero", value=Literal(0.0), dtype=F32), *nan,
+             Let(name="two", value=I(2), dtype=BOOL), Let(name="half", value=Literal(0.5), dtype=BOOL),
+             Let(name="lv", value=Var("v"), dtype=BOOL), Assign("av", "copy", ("v",), dtype=BOOL),
+             Let(name="lq", value=Var("q"), dtype=BOOL), Assign("times", "multiply", ("two", "v")),
+             Init("any", 0.0, dtype=BOOL), Loop(axis=Axis("j", Dim(3)), body=(Accum("any", "two", dtype=BOOL),),
+                                                seed=False)]
+    names = ["two", "half", "lv", "av", "lq", "times", "any"]
+    stmts += [Write("out", (I(k), t), n) for k, n in enumerate(names)]
+    body = [Tile(axes=(Axis("t", Dim(32)),), block_threads=32, body=tuple(stmts))]
+    got = run(body, {"x": x}, {"out": (len(names), 32)}, 1, 32, out_dtype="f64")["out"]
+    nonzero = (x != 0).astype(np.float64)
+    want = np.array([np.ones(32), np.ones(32), nonzero, nonzero, np.ones(32), x, np.ones(32)])
+    assert np.array_equal(got, want), got[:, :8]
+
 
 def test_initializers_keep_their_own_precision():
     """An f64 Init keeps all 53 bits, an integer Let all 32: neither passes

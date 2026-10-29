@@ -207,3 +207,21 @@ def test_a_sum_that_keeps_every_value_is_still_regrouped():
         loop, *full_combine(), Write("out", (Var("r"), Var("t")), "acc")))]
     decided = remarks(body, {"x": np.zeros((2, N), np.float32)}, (2, B), B, grid=2)
     assert any("128 cooperating threads take contiguous chunks" in r for r in decided), decided
+
+
+def test_a_value_built_from_a_long_chain_is_checked_once():
+    """The loop reads w60, where w(i+1) = w(i) + w(i) from the block's row:
+    the same on every cooperating thread, which the check follows through
+    each register once (following both operands at each step would take
+    2^60 paths), so the sum is still regrouped."""
+    from emmy.compiler.dtype import F32
+    from emmy.compiler.ir.stmt.leaves import Let
+    lets = [Let(name="w0", value=Var("r"), dtype=F32)]
+    lets += [Let(name=f"w{i + 1}", value=BinaryExpr("+", Var(f"w{i}"), Var(f"w{i}")), dtype=F32) for i in range(60)]
+    row = Load(name="x0", input="x", index=(Var("r"), Var("a")))
+    loop = StridedLoop(axis=Axis("a", Dim(N)), start=Var("t"), step=Literal(B, "int"),
+                       body=(row, Assign("y", "multiply", ("x0", "w60")), Accum("acc", "y")))
+    body = [Tile(axes=(Axis("r", Dim(2)), Axis("t", Dim(B))), block_threads=B, body=(
+        *lets, loop, *full_combine(), Write("out", (Var("r"), Var("t")), "acc")))]
+    decided = remarks(body, {"x": np.zeros((2, N), np.float32)}, (2, B), B, grid=2)
+    assert any("128 cooperating threads take contiguous chunks" in r for r in decided), decided

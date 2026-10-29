@@ -13,7 +13,10 @@ refinement, the idea behind global value numbering:
 2. evaluate one iteration of the loop body symbolically under that
    assumption: every value becomes a structural term (loads by buffer and
    index terms, operations by operator and operand terms, a class's value at
-   the top of the iteration by the class);
+   the top of the iteration by the class). Each distinct term is numbered
+   once and its users hold that number, so comparing two terms costs the same
+   however deep they are (a chain of ``x + x`` would otherwise double the
+   work at every step);
 3. split every class whose members end the iteration with different terms,
    and repeat until no class splits.
 
@@ -58,7 +61,7 @@ class _Eval:
     """Symbolic evaluation of one loop iteration (see module doc)."""
 
     def __init__(self, loopvars: dict[str, tuple], classes: dict[str, int], carried: set[str], written: set[str],
-                 fresh=None):
+                 fresh=None, terms: dict | None = None):
         self.env: dict[str, tuple] = {}
         self.loopvars = loopvars  # loop variable -> its iteration term, outermost first
         self.classes = classes  # candidate accumulator -> class
@@ -66,9 +69,14 @@ class _Eval:
         self.written = written  # buffers stored inside the loop: their loads are fresh each time
         self.next: dict[str, tuple] = {}
         self._fresh = fresh if fresh is not None else itertools.count()  # shared: fresh terms never collide
+        self._terms = terms if terms is not None else {}  # shared: a term's parts -> its number
 
     def fresh(self) -> tuple:
         return ("fresh", next(self._fresh))
+
+    def term(self, *parts) -> tuple:
+        """The term made of ``parts`` (operands among them, already terms), by its number."""
+        return ("term", self._terms.setdefault(parts, len(self._terms)))
 
     def name(self, n: str) -> tuple:
         if n in self.env:
@@ -88,13 +96,13 @@ class _Eval:
         if kind == "Literal":
             return ("lit", repr(e.value), e.dtype)
         if kind == "BinaryExpr":
-            return ("bin", e.op, self.expr(e.left), self.expr(e.right))
+            return self.term("bin", e.op, self.expr(e.left), self.expr(e.right))
         if kind == "TernaryExpr":
-            return ("tern", self.expr(e.cond), self.expr(e.if_true), self.expr(e.if_false))
+            return self.term("tern", self.expr(e.cond), self.expr(e.if_true), self.expr(e.if_false))
         if kind == "CastExpr":
-            return ("cast", e.dtype, self.expr(e.expr))
+            return self.term("cast", e.dtype, self.expr(e.expr))
         if kind == "FuncCallExpr":
-            return ("call", e.name, tuple(self.expr(a) for a in e.args))
+            return self.term("call", e.name, tuple(self.expr(a) for a in e.args))
         if kind == "Builtin":
             return ("builtin", e.name)
         return self.fresh()
@@ -106,21 +114,23 @@ class _Eval:
                 idx = tuple(self.expr(e) for e in s.index)
                 for k, n in enumerate(s.names):
                     fresh = s.input in self.written
-                    self.env[n] = self.fresh() if fresh else ("load", s.input, _dtype(s), idx, k, len(s.names))
+                    self.env[n] = (self.fresh() if fresh else
+                                   self.term("load", s.input, _dtype(s), idx, k, len(s.names)))
             elif kind == "Assign":
-                self.env[s.name] = ("op", s.op.name, _dtype(s), tuple(self.name(a) for a in s.args))
+                self.env[s.name] = self.term("op", s.op.name, _dtype(s), tuple(self.name(a) for a in s.args))
             elif kind == "Let":
-                self.env[s.name] = ("let", _dtype(s), self.expr(s.value))
+                self.env[s.name] = self.term("let", _dtype(s), self.expr(s.value))
             elif kind == "Init":
                 self.env[s.name] = ("init", repr(s.identity), _dtype(s))
             elif kind == "Accum":
                 base = self.name(s.base if s.base is not None else s.name)
-                term = ("fold", _REDUCE.get(s.op.name, "add"), _dtype(s), base, self.name(s.value))
+                term = self.term("fold", _REDUCE.get(s.op.name, "add"), _dtype(s), base, self.name(s.value))
                 if s.name in self.classes:
                     self.next[s.name] = term
                 self.env[s.name] = term
             elif kind == "Select":
-                self.env[s.name] = ("select", tuple((self.name(b.value), self.expr(b.select)) for b in s.branches))
+                self.env[s.name] = self.term("select", tuple((self.name(b.value), self.expr(b.select))
+                                                             for b in s.branches))
             elif kind in ("Loop", "StridedLoop"):
                 self.loop(s)
             elif kind == "Cond":  # names it declares are local; what it reassigns becomes unknown
@@ -136,7 +146,7 @@ class _Eval:
                 self.env[n] = self.fresh()
             return
         loopvars = {**self.loopvars, s.axis.name: ("iter", len(self.loopvars))}
-        inner = _Eval(loopvars, self.classes, self.carried, self.written, self._fresh)
+        inner = _Eval(loopvars, self.classes, self.carried, self.written, self._fresh, self._terms)
         inner.env = dict(self.env)
         for i, n in enumerate(own):
             inner.env[n] = ("nhead", i)
@@ -147,9 +157,9 @@ class _Eval:
         else:
             bounds = ("range", str(s.axis.extent))
         seeds = tuple(("identity", _REDUCE.get(_op_of(s.body, n), "add")) if s.seed else self.name(n) for n in own)
-        signature = ("loop", bounds, seeds, tuple(inner.env.get(n) for n in own))
+        signature = self.term("loop", bounds, seeds, tuple(inner.env.get(n) for n in own))
         for i, n in enumerate(own):
-            self.env[n] = ("after", signature, i)
+            self.env[n] = self.term("after", signature, i)
         for n in _reassigned(s.body) - set(own):
             self.env[n] = self.fresh()
 

@@ -7,7 +7,8 @@ IR's own rules from emmy: result types from ``dtype_promote``, reduction
 identities from ``ElementwiseImpl``. Arithmetic is numpy's, which the
 problems are checked against: float32 in float32 (IEEE, no fused
 multiply-add), f64 in double, integers in fixed width (wrapping, floor
-division, logical shifts of unsigned values). Transcendental functions are
+division, logical shifts of unsigned values), and a bool as C converts to
+one: 1 for any non-zero value (NaN too). Transcendental functions are
 computed in double and rounded once. Float ``maximum``, ``minimum`` and
 ``relu`` are CUDA's ``fmaxf`` and ``fminf``, which emmy's renderer emits for
 them: a NaN gives the other operand, and -0 is below +0, as the GPU computes
@@ -31,7 +32,7 @@ from emmy.compiler.ir.elementwise import ElementwiseImpl, reduce_canon
 from emmy.compiler.ir.stmt.base import dtype_promote
 
 NP = {"f32": np.float32, "f64": np.float64, "f16": np.float16, "i16": np.int16, "i32": np.int32,
-      "i64": np.int64, "u8": np.uint8, "u16": np.uint16, "u32": np.uint32, "u64": np.uint64, "bool": np.float32}
+      "i64": np.int64, "u8": np.uint8, "u16": np.uint16, "u32": np.uint32, "u64": np.uint64, "bool": np.bool_}
 C_TYPES = {"float": "f32", "double": "f64", "int": "i32", "unsigned": "u32", "unsigned int": "u32", "__half": "f16"}
 WARP = 32
 
@@ -275,9 +276,7 @@ def _dtype_name(d) -> str | None:
 
 
 def _numpy_name(dtype: np.dtype) -> str:
-    if np.dtype(dtype) == np.bool_:
-        return "bool"
-    return {np.dtype(v): k for k, v in NP.items() if k != "bool"}[np.dtype(dtype)]
+    return {np.dtype(v): k for k, v in NP.items()}[np.dtype(dtype)]
 
 
 def _float_fn(fn):
@@ -327,12 +326,16 @@ _BINARY = {
     "mod": np.remainder, "left_shift": np.left_shift, "right_shift": np.right_shift,
     "bitwise_and": np.bitwise_and, "bitwise_or": np.bitwise_or, "bitwise_xor": np.bitwise_xor,
 }
+# operations emmy renders on integers only (and so, for a bool result, computes in int)
+_INTEGER_ONLY = frozenset({"floor_divide", "remainder", "mod", "left_shift", "right_shift", "bitwise_xor", "bitwise_count"})
 _COMPARE = {"equal": np.equal, "not_equal": np.not_equal, "greater": np.greater, "less": np.less,
             "greater_equal": np.greater_equal, "less_equal": np.less_equal}
 
 
 def apply(op: str, args: list[np.ndarray], out: str) -> np.ndarray:
     """``op(*args)`` with result dtype ``out``, as numpy computes it."""
+    if out == "bool" and op not in _COMPARE:  # as emmy renders it: computed in f32, then converted
+        return apply(op, args, "i32" if op in _INTEGER_ONLY else "f32").astype(np.bool_)  # (or an integer-only op)
     t = NP[out]
     with np.errstate(all="ignore"):
         if op in _COMPARE:  # compared in the operands' common type; the result is the 0 or 1 of the test

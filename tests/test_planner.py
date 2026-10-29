@@ -18,7 +18,7 @@ def keys(*body, axes=(("t", 32),)) -> dict[str, tuple]:
 
 def test_an_accumulator_updated_from_lane_data_carries_its_lane():
     """s starts at 0, then folds x[t]: a loop folding s * w[j] depends on t,
-    though s's definition (its Init) reads nothing (an independent review's case)."""
+    though s's definition (its Init) reads nothing."""
     found = keys(Init("s", 0.0, dtype=F32),
                  Loop(axis=Axis("k", Dim(1)), seed=False, body=(Load(name="xv", input="x", index=(Var("t"),)),
                                                                  Accum("s", "xv"))),

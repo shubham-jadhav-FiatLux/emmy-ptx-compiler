@@ -261,21 +261,25 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         if self._cell_rank.get(getattr(start.op, "name", None)) != threads or block % threads or (
                 threads > WARP and threads != block):
             return "it does not start at each thread's own rank among the cooperating threads"
+        known: dict[str, int] = {}
         for name in sorted(outer_values(loop)):
             v = self.scope.lookup(name)
-            if not isinstance(v, Value) or self._alike_threads(v) % threads:
+            if not isinstance(v, Value) or self._alike_threads(v, known) % threads:
                 return f"{name} may differ between the cooperating threads (an element would take its new thread's)"
         for st in loop.body:
             if kind(st) == "Load" and st.input not in self._readonly:
                 return f"it reads {st.input}, which the kernel also writes"
         return None
 
-    def _alike_threads(self, x) -> int:
+    def _alike_threads(self, x, known: dict[str, int]) -> int:
         """How many consecutive threads, in aligned groups, surely hold operand
         ``x`` alike: 0 for any number (a constant, a kernel parameter), a block
         for ``%ctaid``, a Tile coordinate's count (cells.py), and the gcd of the
         operands' counts for what a pure instruction computes (a read-only load
-        too); 1 when nothing is known (a variable's read, a shuffle)."""
+        too); 1 when nothing is known (a variable's read, a shuffle). ``known``
+        holds the registers already counted, so a value that several operands
+        share is followed once (x + x, then that plus itself, and so on, would
+        otherwise take twice as long at each step)."""
         if isinstance(x, Value):
             if x.const is not None:
                 return 0
@@ -292,8 +296,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             return 0
         if x.name.startswith("%ctaid"):
             return self.src.launch.block
-        d = self.b.def_of(x)
-        return 1 if d is None else math.gcd(*(self._alike_threads(a) for a in d[1]))
+        if x.name not in known:
+            d = self.b.def_of(x)
+            known[x.name] = 1 if d is None else math.gcd(*(self._alike_threads(a, known) for a in d[1]))
+        return known[x.name]
 
     def _fusable(self, s, t) -> bool:
         """May sibling loops ``s`` and ``t`` be fused? Only loops that stay loops:
@@ -857,7 +863,7 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
     def stmt_Let(self, s) -> None:
         if s.dtype is None:
             v = self.expr(s.value)
-        elif kind(s.value) == "Literal":  # a number of the declared type, rounded once
+        elif kind(s.value) == "Literal" and s.dtype.name != "bool":  # a number of the declared type, rounded once
             v = self.b.const_of(s.value.value, elementwise.value_type(s.dtype.name))
             v = elementwise.declared(self.b, v, s.dtype.name, literal=True)
         else:  # converted as C converts it to the declared type (a u8 keeps 8 bits)
@@ -1013,7 +1019,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         b = self.b
         buf = self.buffer(s.output)
         vtype = VALUE_TYPE[buf.type]
-        values = [b.in_reg(b.convert(self.value(v), vtype)) for v in s.values]
+        values = [self.value(v) for v in s.values]
+        if getattr(self.src.buffers.get(s.output), "dtype", None) == "bool":  # a bool element holds 0 or 1
+            values = [elementwise.declared(b, v, "bool") for v in values]
+        values = [b.in_reg(b.convert(v, vtype)) for v in values]
         base = self.flat(buf, s.index)
         shared = isinstance(buf, SharedArray)
         space = "shared" if shared else "global"
@@ -1646,5 +1655,8 @@ def _dtype_name(vtype: str) -> str:
 
 def _declared(dtype, vtype: str) -> str:
     """The emmy dtype an accumulator declared ``dtype`` (or None) computes in:
-    a narrow integer type itself, so that it wraps; else that of ``vtype``."""
-    return dtype.name if dtype is not None and dtype.name in elementwise.NARROW_RANGE else _dtype_name(vtype)
+    a narrow integer type itself, so that it wraps, and a bool, so that it
+    stays 0 or 1; else that of ``vtype``."""
+    if dtype is not None and (dtype.name in elementwise.NARROW_RANGE or dtype.name == "bool"):
+        return dtype.name
+    return _dtype_name(vtype)

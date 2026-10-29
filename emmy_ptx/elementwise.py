@@ -68,6 +68,8 @@ def apply(b: Builder, op: str, args: list[Value], dtype: str) -> Value:
     """``op(*args)`` with result dtype ``dtype``."""
     if op in _F8_CASTS:
         return _F8_CASTS[op](b, args[0])
+    if dtype == "bool" and op not in _COMPARE:  # as emmy renders it: computed in f32, then converted
+        return declared(b, apply(b, op, args, "f32" if op in _FLOAT else "i32"), "bool")  # (or an integer-only op)
     out_type = value_type(dtype)
     if op in _COMPARE:
         # C compares the operands in their own types (integers exactly, an f64 in
@@ -249,7 +251,10 @@ def declared(b: Builder, v: Value, dtype: str, literal: bool = False) -> Value:
     complement for signed ones): 255 + 1 in a u8 is 0, though its register
     holds 32 bits. A float, and a ``literal`` (which emmy writes as a float),
     truncates and saturates at the type's range, as cvt.rzi does (C leaves an
-    out-of-range float undefined)."""
+    out-of-range float undefined). A bool is 1 for any non-zero value (a NaN
+    too) and 0 for zero: 2 and 0.5 both give 1."""
+    if dtype == "bool":
+        return b.convert(b.truthy(v), value_type(dtype))
     out = b.convert(v, value_type(dtype))
     if dtype not in NARROW_RANGE or not out.is_int:
         return out

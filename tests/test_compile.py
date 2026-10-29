@@ -1,9 +1,10 @@
 """End-to-end compile tests over problem folders.
 
 Problem folders are looked up in $EMMY_PROBLEMS (one or more paths separated
-by os.pathsep), defaulting to the hackathon repository checked out next to
-this one. When ptxas is on PATH (or $PTXAS points at it) every module is also
-assembled for sm_120, which catches any PTX the runner would reject. Every
+by os.pathsep), defaulting to the open problems of the hackathon repository
+when it is checked out next to this one, else to the bundled examples/. When
+ptxas is on PATH (or $PTXAS points at it) every module is also assembled for
+sm_120, which catches any PTX the runner would reject. Every
 kernel is compiled three ways: as usual, with ``--strict`` (no rewrite that
 changes rounding), and with the fallback lowering (``--plain``).
 """
@@ -22,7 +23,8 @@ import emmy_ptx
 from emmy_ptx import compile_file, lower
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT = ROOT.parent / "upstream" / "emmy-hackathon-2026" / "problems"
+OPEN = ROOT.parent / "emmy-hackathon-2026" / "problems"
+DEFAULT = OPEN if OPEN.is_dir() else ROOT / "examples"
 SEARCH = [Path(p) for p in os.environ.get("EMMY_PROBLEMS", str(DEFAULT)).split(os.pathsep)]
 KERNELS = sorted(ir for d in SEARCH if d.is_dir() for ir in d.glob("*/*.ir.json"))
 PTXAS = os.environ.get("PTXAS") or shutil.which("ptxas")

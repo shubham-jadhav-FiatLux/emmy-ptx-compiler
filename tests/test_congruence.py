@@ -73,3 +73,13 @@ def test_merge_reads_one_snapshot_and_drops_member_updates():
     assert sorted(lets) == ["l0$top", "m0$top"]
     reads = {a for st in new if type(st).__name__ == "Assign" for a in st.args}
     assert "m1" not in reads and "l1" not in reads
+
+
+def test_deep_shared_terms_cost_no_more_than_their_length():
+    """Two sums of w60, where w(i+1) = w(i) + w(i): each term is numbered once,
+    so the analysis follows the 60 steps once (as nested terms, comparing
+    them would follow 2^60 paths)."""
+    chain = [Assign(f"w{i + 1}", "add", (f"w{i}", f"w{i}")) for i in range(60)]
+    loop = Loop(axis=K, body=(Load(name="w0", input="x", index=(Var("k"),)), *chain,
+                              Accum("a0", "w60"), Accum("a1", "w60")))
+    assert congruent_accumulators(loop, starts(loop, ("imm", "f32", 0.0))) == {"a1": "a0"}
