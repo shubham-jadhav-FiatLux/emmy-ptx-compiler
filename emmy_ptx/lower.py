@@ -865,13 +865,16 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
         (emmy/compiler/ir/stmt/normalize.py) turns ``x / c`` into
         ``x * reciprocal(c)``, and x * RN(1/3) can be an ulp from the correctly
         rounded quotient that the source's ``x / 3.0`` gives (pointwise problems
-        compare with numpy at rtol = 0). It applies only where the graph says
-        c divided in the source: a ConstantOp that emmy's tracer named after a
-        division node (``div_c1``, trace/torch.py) or a mean's element count
-        (``*_count``, decomposition/090_mean.py), see ``_divisor_constant``. A
-        reciprocal the IR asks for in its own right keeps its literal meaning,
-        as do ``--strict`` and ``--plain`` everywhere. A power-of-two c, whose
-        reciprocal is exact, stays a multiply."""
+        compare with numpy at rtol = 0). It applies where c is a ConstantOp
+        named as emmy's tracer names a division's divisor (``div_c1``,
+        trace/torch.py) or a mean's element count (``*_count``,
+        decomposition/090_mean.py), see ``_divisor_constant``: a convention of
+        emmy 0.3.11, recognised by name, not a proof that the source divided.
+        A reciprocal written in the IR of a constant that carries such a name
+        becomes the quotient too (renaming the constant changes the rounding);
+        of a constant named otherwise, or a literal, it keeps its literal
+        meaning, as it does under ``--strict`` and ``--plain`` everywhere. A
+        power-of-two c, whose reciprocal is exact, stays a multiply."""
         if op != "multiply" or len(args) != 2 or self.strict or self.plain or self._loops:
             return None
         if elementwise.value_type(dtype) not in ("f32", "f16"):

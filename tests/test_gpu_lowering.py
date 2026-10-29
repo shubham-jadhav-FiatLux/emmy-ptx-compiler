@@ -532,6 +532,25 @@ def test_a_reciprocal_the_ir_asks_for_keeps_its_meaning():
     assert np.array_equal(got, x * (np.float32(1) / np.float32(3)))
 
 
+@pytest.mark.parametrize("name", ["three_c", "div_c1"])
+def test_the_divisor_of_a_division_is_recognised_by_its_name(name):
+    """The same x * reciprocal(c) of a constant c = 3: named like emmy's
+    divisor of a division (div_c1) the optimized lowering computes x / 3,
+    named otherwise the product x * RN(1/3). A naming convention, not a
+    proof: renaming the constant changes the rounding (strict and plain keep
+    the product either way)."""
+    x = rng.standard_normal(256).astype(np.float32)
+    t = Var("t")
+    body = [Tile(axes=(Axis("t", Dim(256)),), body=(
+        Load(name="v", input="x", index=(t,)), Load(name="c", input=name, index=(I(0),)),
+        Assign("r", "reciprocal", ("c",)), Assign("y", "multiply", ("v", "r")), Write("out", (t,), "y"),
+    ))]
+    got = run(body, {"x": x, name: np.array([3], np.float32)}, {"out": (256,)}, 1, 256, constants={name: 3.0})["out"]
+    product, quotient = x * (np.float32(1) / np.float32(3)), x / np.float32(3)
+    assert not np.array_equal(product, quotient)  # (the inputs tell the two apart)
+    assert np.array_equal(got, quotient if name == "div_c1" and not LOWERING else product)
+
+
 def test_fp8_decode_and_encode_match_emmys_definitions():
     """from_f8* / to_f8* against emmy's own reference tables (dtype.decode_f8,
     encode_f8): all 256 codes of each format decoded, and float32 values of

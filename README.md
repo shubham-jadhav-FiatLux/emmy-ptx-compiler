@@ -104,8 +104,10 @@ MLP that runs in thread-block clusters.
   shared parts.
 * `--plain`, a lowering fallback: if the optimizing lowering raises an error
   or its module is too long for the runner, the kernel is lowered again
-  without the optional rewrites. It catches failures, not wrong code (the
-  tests do that), and is tested on every problem.
+  without the optional rewrites. The builder's own work stays (constant
+  folding, integer ranges, value numbering, hoisting invariant code), and so
+  does FMA contraction unless `--strict` is given too. It catches failures,
+  not wrong code (the tests do that), and is tested on every problem.
 * `--report` shows what the compiler did to any kernel: the shape it gave
   each loop (split across lanes, lane-blocked, unrolled...), the cells it
   moved, the trees it folded, and a profile of the PTX.
@@ -156,13 +158,16 @@ MLP that runs in thread-block clusters.
 * An independent interpreter of the IR (`tests/oracle.py`, numpy, the IR's
   own types, no code shared with the compiler) checks randomly generated
   kernels in every lowering on the GPU, attention with lane blocking
-  included; on the build before the 27 Oct fixes it finds 25 failures among
-  72 kernels, on the current one none.
-* 312 tests: unit, compile and GPU tests, each kernel lowered three ways,
+  included: 24 kernels, each in the three lowerings (72 runs). On the build
+  before the 27 Oct fixes 25 of the 72 runs fail, on the current one none.
+* 354 tests: unit, compile and GPU tests, each kernel lowered three ways,
   plus a lane-level interpreter for lane blocking. The GPU tests include
   edge cases found by an independent review: signed zeros, integers past
   2^24, unsigned shifts, f64 constants, `sin(1e20)`, a read of a tree's shared
-  memory, and a maximum of per-lane sums.
+  memory, and a maximum of per-lane sums; and from a second review, sums that
+  regrouping must leave strided (a weight or a row that is the thread's own,
+  a partial written for one warp only, and three more like them) and a u8
+  bound to 255 + 1.
 * 512 problems, generated with the organisers' tool: the open set, a wider
   corpus of 205 (20 of them f16), a schedule sweep of 106, and three held-out
   sets (81, 66, then 39) written after the compiler.
@@ -184,16 +189,16 @@ launch from `meta.json`:
 | Held-out set (`tools/corpus_holdout.py`: 81 new problems written after the compiler, to estimate the hidden set) | **81 / 81** pass on first run; worst error 10.5% of the tolerance |
 | Second held-out set (`tools/corpus_holdout2.py`: 66 problems written on 26 Oct, after every optimization) | **64 / 66** pass. The other two fail for any compiler, nvcc's build included: the generator lists a consumer kernel before its producer, and emmy traces `A @ v` into a 500x300 output. The set found one bug: emmy's `x * reciprocal(3.0)` is an ulp off numpy's `x / 3.0` at `rtol = 0`, so it is now computed as the correctly rounded quotient (nvcc's build still fails it; `--strict` and `--plain` keep emmy's multiply, 62 / 66) |
 | Third held-out set (`tools/corpus_holdout3.py`: 39 problems written on 27 Oct, after the fixes below were frozen, and run once) | **39 / 39** pass on the first run; worst error 6.2% of the tolerance. Aimed also at the edges the fixes cover: sines and cosines of arguments up to 1e30, divisions by constants and means at `rtol = 0`, clamps, minima and maxima |
-| Edge cases from an independent review (a maximum of per-lane sums, `x*(+0)` against `x*(-0)`, integers past 2^24, a u32 right shift, an f64 constant, `sin(1e20)`, a read of a tree's shared memory, a reciprocal written in the IR) | all pass in every lowering, as GPU tests; seven were wrong before the fixes of 27 Oct (DESIGN 9). The fixes leave the speed unchanged: the 43 kernels whose PTX they changed run at 0.999x their previous time |
+| Edge cases from an independent review (a maximum of per-lane sums, `x*(+0)` against `x*(-0)`, integers past 2^24, a u32 right shift, an f64 constant, `sin(1e20)`, a read of a tree's shared memory, a reciprocal written in the IR) | all pass in every lowering, as GPU tests; seven were wrong before the fixes of 27 Oct (DESIGN 9). The fixes leave the speed unchanged: of the 43 kernels whose PTX they changed, the 42 that run (the other is a generator fault) take 0.999x their previous time |
 | Edge cases from a second independent review (sums whose elements regrouping moved to a thread that computes them differently: a weight `t`, a row `x[t, i]`, a partial written for one warp only; and two more found with them: unrolled copies that compute differently, a loop starting at a Tile's row; and `255 + 1` bound to a u8) | all pass in every lowering, as GPU tests. Before 29 Oct the five sums were wrong in the optimized lowering and the u8 held 256 in every lowering. The stricter regrouping check keeps every regrouping the 533 kernels had: their PTX is unchanged (DESIGN 4.6, 7) |
 | Fallback lowering (`compile.py --plain`: what runs if an optimization fails) | **469 / 473** pass: all but the two generator faults and the two `rtol = 0` divisions, where it keeps emmy's multiply by the reciprocal |
-| Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **469 / 473** pass, the same four aside. Checked bit for bit on 402 problems: the 371 without float atomics give outputs identical to the plain lowering's (so every rewrite it keeps is exact) |
+| Strict mode (`compile.py --strict`: no rewrite that changes rounding) | **469 / 473** pass, the same four aside. Checked bit for bit on 402 problems: the 371 without float atomics give outputs identical to the plain lowering's (so every rewrite it keeps is exact). Compared as the runner returns them: every finite value exactly, signed zeros included, while NaN and infinities all come back as null |
 | Accuracy against numpy's answer (the check the evaluation runs) | worst error **26% of the tolerance** (`k_mlp_gelu_64x256x1024x128`), median 0.14%, over the 471 passing problems at commit 8b76863 (an observation on these inputs, not a bound). On the 402-problem set of 26 Oct, numpy's own float32 had median 0.12%, nvcc's build 0.18% and failed 2 bit-exact problems |
 | Fused MLPs (`act(x @ w1) @ w2` in one kernel, which emmy's schedules recompute the hidden layer for) | the five of corpus round 6 (gelu, relu, tanh, silu) at **0.005x to 0.08x** the time of nvcc's build (13x to 187x faster, through lane blocking); `k_gelu_mlp` 389 → 173 µs through thread-block clusters (nvcc: 408 µs) |
 | Speed against nvcc's build of emmy's reference CUDA (321 problems, same launches) | **0.51x the time** (geometric mean of the per-problem ratios, a 1.96x speedup): chained 0.13x, attention 0.16x, fused 0.53x, reductions 0.65x, matmul 0.88x, pointwise 1.00x (launch-bound). Total 4.0 ms against 158.2 ms, a sum dominated by the slowest problems. Measured on 26 Oct (commit 13ee1e4); the runner's clocks are not locked, so single problems vary by up to a third between runs |
 | Math library accuracy (against correctly rounded results, about two million inputs per range) | exp, tanh ≤ 2 ulp · log, erf ≤ 1 ulp · sin, cos ≤ 1 ulp over the whole float32 range · float64 exp, log ≤ 1 ulp, sigmoid ≤ 2 ulp |
-| Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **72 / 72** match in every lowering (bit for bit wherever the IR's order of operations is kept); 25 of them fail on the build before the fixes of 27 Oct, none of them attention |
-| Tests | 312 (183 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
+| Random kernels against an independent interpreter (`tests/test_oracle.py`: pointwise, lane-shared and cooperative reductions, attention) | **24 kernels in 3 lowerings: 72 / 72** runs match (bit for bit wherever the IR's order of operations is kept); 25 of the 72 fail on the build before the fixes of 27 Oct, none of them attention |
+| Tests | 354 (210 run on the GPU); compile and GPU tests run each kernel optimized, strict and plain |
 | Compile time (`tools/compile_cost.py`, 533 kernels, one at a time) | a cold `compile.py` takes a median 0.43 s (95th percentile 0.81 s, the longest 2.6 s), ptxas a median 0.03 s; `--explore` cuts ptxas on the 14 largest modules from 21.7 s to 6.9 s |
 
 The same PTX compiles byte for byte under Python 3.12 and 3.14.
@@ -269,7 +274,9 @@ The same PTX compiles byte for byte under Python 3.12 and 3.14.
   u8, u16 or i16 keeps its width wherever it is defined (255 + 1 in a u8 is
   0). A
   division the IR records, which emmy spells as a multiply by the reciprocal,
-  is computed as the correctly rounded quotient. fp8 values are byte codes
+  is computed as the correctly rounded quotient (recognised by the names
+  emmy's tracer gives a divisor, `div_c1` and `*_count`: a convention of emmy
+  0.3.11, not a proof that the source divided). fp8 values are byte codes
   that only emmy's encode and decode casts touch.
   `exp`, `log`, `tanh`, `erf`, `sin`, `cos` and `pow` are accurate routines
   built from minimax polynomials and exact argument reductions (`exp`, `log`
