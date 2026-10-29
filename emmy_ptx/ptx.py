@@ -38,6 +38,15 @@ def _isa(version: str) -> tuple[int, ...]:
     return tuple(int(x) for x in version.split("."))
 
 
+def instruction_lines(ptx: str):
+    """The instructions of a rendered module, one stripped line each (no
+    directives, labels, braces or comments)."""
+    for line in ptx.splitlines():
+        text = line.strip()
+        if text and not text.startswith(("//", ".", "{", "}", "$")) and not text.endswith(":"):
+            yield text
+
+
 # PTX value type -> register class that holds it
 REG_CLASS: dict[str, str] = {
     "pred": "pred",
@@ -228,6 +237,7 @@ class Kernel:
     min_target: str = "sm_0"  # the target an instruction needs beyond the default (the copy engine: sm_90)
     cluster: int | None = None  # blocks a thread-block cluster (.reqnctapercluster), if any
     budgeted: bool = False  # did the unrolling budget allow a complete unrolling (Lowerer.unrolls_within)?
+    copies: bool = False  # did a complete unrolling copy a loop that stays rolled (Lowerer._may_copy)?
     _counts: dict[str, int] = field(default_factory=dict)
     _labels: int = 0
 

@@ -17,6 +17,8 @@ f64 result in single precision.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from . import mathlib
@@ -141,6 +143,26 @@ def _unary(opcode: str, fold):
     return fn
 
 
+def _fmax(x: float, y: float) -> float:
+    """emmy's ``maximum`` is CUDA's ``fmaxf``; folded as the GPU's ``max`` computes
+    it: a NaN gives the other operand, and -0 is below +0 (Python's ``max``
+    keeps the first of two zeros, and a NaN that comes first)."""
+    if math.isnan(x) or math.isnan(y):
+        return y if math.isnan(x) else x
+    if x == y == 0:
+        return x if math.copysign(1.0, x) > 0 else y
+    return max(x, y)
+
+
+def _fmin(x: float, y: float) -> float:
+    """``minimum``, CUDA's ``fminf``, folded as the GPU's ``min`` (see _fmax)."""
+    if math.isnan(x) or math.isnan(y):
+        return y if math.isnan(x) else x
+    if x == y == 0:
+        return x if math.copysign(1.0, x) < 0 else y
+    return min(x, y)
+
+
 def _minmax(opcode: str, pick):
     def fn(b: Builder, x: Value, y: Value) -> Value:
         t = float_type(x, y)
@@ -163,15 +185,15 @@ _FLOAT = {
     "subtract": lambda b, x, y: b.fbin("-", x, y),
     "multiply": lambda b, x, y: b.fbin("*", x, y),
     "divide": lambda b, x, y: b.fbin("/", x, y),
-    "maximum": _minmax("max", max),
-    "minimum": _minmax("min", min),
+    "maximum": _minmax("max", _fmax),
+    "minimum": _minmax("min", _fmin),
     "negative": _unary("neg", lambda v: -v),
     "abs": _unary("abs", abs),
     "copy": lambda b, x: x,
     "pad": lambda b, x: x,
     "square": lambda b, x: b.fbin("*", x, x),
     "reciprocal": _unary("rcp.rn", lambda v: 1 / v),
-    "relu": lambda b, x: _minmax("max", max)(b, x, b.f32_const(0.0)),
+    "relu": lambda b, x: _minmax("max", _fmax)(b, x, b.f32_const(0.0)),
     "sqrt": _unary("sqrt.rn", _sqrt),
     "rsqrt": _unary("rsqrt.approx", None),
     "exp": mathlib.exp,

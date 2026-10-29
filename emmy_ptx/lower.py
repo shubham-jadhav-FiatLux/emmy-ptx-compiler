@@ -33,14 +33,14 @@ from dataclasses import replace
 from . import bulk, cluster, coarsen, elementwise, mapping
 from .builder import INT_RANGE, WARP, Builder, Value, Variable, eliminate_dead_code
 from .cells import CellLayout
-from .common import (ATOMIC_ADD, AUTO_UNROLL_TRIPS, C_TYPE, IDENTITY, MEM_TYPE, REDUCE_CANON, SMEM_UNROLL_TRIPS,
-                     STATIC_SMEM_LIMIT, TARGET_SMS, UNROLL_BUDGET, VALUE_TYPE, Affine, GlobalBuffer, LoweringError,
-                     Scope, SharedArray, body_size, lowbit)
+from .common import (ATOMIC_ADD, AUTO_UNROLL_TRIPS, C_TYPE, COPY_BUDGET, IDENTITY, MEM_TYPE, REDUCE_CANON,
+                     SMEM_UNROLL_TRIPS, STATIC_SMEM_LIMIT, TARGET_SMS, UNROLL_BUDGET, VALUE_TYPE, Affine, GlobalBuffer,
+                     LoweringError, Scope, SharedArray, body_size, lowbit)
 from .congruence import congruent_accumulators, drop_needless_snapshots, merge_congruent
 from .frontend import KernelSource
 from .lanes import LANE_BUFFER, LaneSharing
 from .mapping import LOOPS, assigned, kind, produced, reads, walk
-from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, LabelRef, Mem, Reg, Sym, Vec
+from .ptx import PTX_LIMIT, PTX_VERSION, SIZEOF, TARGET, Imm, Kernel, LabelRef, Mem, Reg, Sym, Vec, instruction_lines
 from .regroup import combine_refusal, outer_values, regroup
 from .tensorcore import TensorCoreLowering, fragment_index, fragment_refs
 from .vectorize import vectorize_loads
@@ -67,11 +67,14 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
 
     def __init__(self, src: KernelSource, spread: bool = False, plain: bool = False, place: bool = False,
                  strict: bool = False, bulk_copy: bool = False, disable: frozenset | None = None,
-                 expansion: float = 1.0):
+                 expansion: float = 1.0, copy_rolled: bool = True):
         self.src = src
         # scales every complete-unrolling limit (compile_file's compile budget lowers it below 1 for a
         # module that would take ptxas too long; the IR's own unroll marks are then hints like the rest)
         self.expansion = expansion
+        # may a complete unrolling copy a loop that stays rolled (_may_copy)? run turns it off for a
+        # kernel that would otherwise pass COPY_BUDGET instructions
+        self.copy_rolled = copy_rolled
         self.bulk_copy = bulk_copy  # hand contiguous cp.async fills to the copy engine (bulk.py)
         # rewrites switched off one by one (EMMY_PTX_DISABLE=split,blocking,...), to measure what each
         # contributes (tools/ablate.py); all of them are on by default
@@ -133,10 +136,10 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             # share it with more lanes each (_spread) or laid out anew (_placement)
             if self.wants_spread:
                 return Lowerer(self.src, spread=True, strict=self.strict, bulk_copy=self.bulk_copy,
-                               disable=self.disable, expansion=self.expansion).run()
+                               disable=self.disable, expansion=self.expansion, copy_rolled=self.copy_rolled).run()
             if self.wants_place:
                 placed = Lowerer(self.src, place=True, strict=self.strict, bulk_copy=self.bulk_copy,
-                                 disable=self.disable, expansion=self.expansion)
+                                 disable=self.disable, expansion=self.expansion, copy_rolled=self.copy_rolled)
                 kernel = placed.run()
                 # each region lowers the Tile's body again: keep it while the module fits the runner
                 if placed.placed_shared and len(kernel.render(PTX_VERSION, TARGET)) <= PTX_LIMIT:
@@ -154,6 +157,17 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             self.remark(f"{self._fmas} multiply-adds contracted into FMA")
         one_wave = "; .minnctapersm 1 (the grid fits in one wave)" if self.kernel.minnctapersm else ""
         self.remark(f"launch hints: .maxntid {self.src.launch.block}{one_wave}")
+        if self.kernel.copies:
+            # copies of a rolled loop gain no straight-line code, and in a large kernel they can keep
+            # ptxas from unrolling that loop itself (k_mlp: 76 -> 35 us without them)
+            n = sum(1 for _ in instruction_lines(self.kernel.render(PTX_VERSION, TARGET)))
+            if n > COPY_BUDGET:
+                kernel = Lowerer(self.src, spread=self.spread, place=self.place, strict=self.strict,
+                                 bulk_copy=self.bulk_copy, disable=self.disable, expansion=self.expansion,
+                                 copy_rolled=False).run()
+                kernel.remarks.append(f"copies of a rolled loop undone: with them the kernel took {n} "
+                                      f"instructions, more than {COPY_BUDGET}")
+                return kernel
         return self.kernel
 
     def remark(self, text: str) -> None:
@@ -687,7 +701,8 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
             self._deal(s, start, step, end, trips[0], dealt)
         elif trips is not None and (_indexes_fragments(s) or self.unrolls_within(
                 trips[1] * size <= UNROLL_BUDGET * self.expansion
-                and ((s.unroll and self.expansion >= 1) or trips[1] <= self._auto_unroll(s)))):
+                and ((s.unroll and self.expansion >= 1) or trips[1] <= self._auto_unroll(s))
+                and self._may_copy(s.body))):
             self.remark(f"loop {name}: unrolled ({trips[1]} trips)")
             for k in range(trips[1]):
                 v = self.b.add(start, self.b.mul(step, self.b.int_const(k)))
@@ -710,6 +725,23 @@ class Lowerer(CellLayout, LaneSharing, TensorCoreLowering):
                    for x in walk(s.body))
         return int((SMEM_UNROLL_TRIPS if tile else AUTO_UNROLL_TRIPS) * self.expansion)
 
+    def _copies_a_rolled_loop(self, body) -> bool:
+        """Does ``body`` hold a loop that stays rolled (more trips than unroll
+        completely), which a complete unrolling of its loop would copy whole?"""
+        return any(kind(st) in LOOPS and not getattr(st, "unroll", False)
+                   and mapping.trip_estimate(st) > self._auto_unroll(st) for st in walk(body))
+
+    def _may_copy(self, body) -> bool:
+        """May a complete unrolling copy the loops in ``body``? Copies of a loop
+        that stays rolled gain no straight-line code (each still branches, and
+        value numbering shares nothing across loops), only size: allowed and
+        noted on the kernel unless ``copy_rolled`` is off, which run sets for a
+        kernel that would pass COPY_BUDGET instructions with them."""
+        if self.plain or not self._copies_a_rolled_loop(body):
+            return True
+        if self.copy_rolled:
+            self.kernel.copies = True
+        return self.copy_rolled
 
     def _rolled(self, s, start: Value, step: Value, end: Value, trips, factor: int, hoist_loads: bool = True) -> None:
         try:

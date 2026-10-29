@@ -18,6 +18,7 @@ import re
 from collections import Counter
 
 from . import planner
+from .ptx import instruction_lines
 
 # (singular, plural, test on the opcode) in the order they are printed
 _KINDS = (
@@ -47,10 +48,7 @@ def profile(ptx: str) -> str:
     """Static instruction counts of a PTX module, by kind (vector accesses noted)."""
     counts, vectors = Counter(), Counter()
     lines = 0
-    for line in ptx.splitlines():
-        text = line.strip()
-        if not text or text.startswith(("//", ".", "{", "}", "$")) or text.endswith(":"):
-            continue
+    for text in instruction_lines(ptx):
         lines += 1
         op = re.sub(r"^@!?%p\d+\s+", "", text).split(None, 1)[0]
         for one, _, test in _KINDS:

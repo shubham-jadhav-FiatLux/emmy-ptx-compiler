@@ -8,7 +8,11 @@ identities from ``ElementwiseImpl``. Arithmetic is numpy's, which the
 problems are checked against: float32 in float32 (IEEE, no fused
 multiply-add), f64 in double, integers in fixed width (wrapping, floor
 division, logical shifts of unsigned values). Transcendental functions are
-computed in double and rounded once. Cross-thread statements follow their
+computed in double and rounded once. Float ``maximum``, ``minimum`` and
+``relu`` are CUDA's ``fmaxf`` and ``fminf``, which emmy's renderer emits for
+them: a NaN gives the other operand, and -0 is below +0, as the GPU computes
+them (numpy's own propagate a NaN and, of two zeros, return the second
+operand). Cross-thread statements follow their
 definitions in emmy's IR: a WarpShuffle is a butterfly over aligned groups
 of lanes, a TreeHalve folds its shared slab level by level, leaves it so and
 broadcasts the root, and a barrier is implicit in lockstep execution.
@@ -288,13 +292,29 @@ def _erf(x):
     return np.vectorize(math.erf, otypes=[np.float64])(x)
 
 
+def _fmax(a, b):
+    """CUDA's fmax for floats (a NaN gives the other operand, -0 is below +0); numpy's for integers."""
+    if not np.issubdtype(np.result_type(a, b), np.floating):
+        return np.maximum(a, b)
+    r = np.fmax(a, b)
+    return np.where((a == 0) & (b == 0) & ~(np.signbit(a) & np.signbit(b)), np.abs(r), r)
+
+
+def _fmin(a, b):
+    """CUDA's fmin for floats, as _fmax."""
+    if not np.issubdtype(np.result_type(a, b), np.floating):
+        return np.minimum(a, b)
+    r = np.fmin(a, b)
+    return np.where((a == 0) & (b == 0) & (np.signbit(a) | np.signbit(b)), -np.abs(r), r)
+
+
 _UNARY = {
     "negative": lambda t, x: np.negative(x.astype(t)),
     "abs": lambda t, x: np.abs(x.astype(t)),
     "copy": lambda t, x: x.astype(t), "pad": lambda t, x: x.astype(t),
     "square": lambda t, x: np.multiply(x.astype(t), x.astype(t)),
     "reciprocal": lambda t, x: np.divide(t(1), x.astype(t)),
-    "relu": lambda t, x: np.maximum(x.astype(t), t(0)),
+    "relu": lambda t, x: _fmax(x.astype(t), t(0)),
     "sqrt": lambda t, x: np.sqrt(x.astype(t)),
     "exp": _float_fn(np.exp), "log": _float_fn(np.log), "tanh": _float_fn(np.tanh), "sin": _float_fn(np.sin),
     "cos": _float_fn(np.cos), "erf": _float_fn(_erf), "sigmoid": _float_fn(lambda x: 1 / (1 + np.exp(-x))),
@@ -303,7 +323,7 @@ _UNARY = {
 }
 _BINARY = {
     "add": np.add, "subtract": np.subtract, "multiply": np.multiply, "divide": np.divide,
-    "maximum": np.maximum, "minimum": np.minimum, "floor_divide": np.floor_divide, "remainder": np.remainder,
+    "maximum": _fmax, "minimum": _fmin, "floor_divide": np.floor_divide, "remainder": np.remainder,
     "mod": np.remainder, "left_shift": np.left_shift, "right_shift": np.right_shift,
     "bitwise_and": np.bitwise_and, "bitwise_or": np.bitwise_or, "bitwise_xor": np.bitwise_xor,
 }

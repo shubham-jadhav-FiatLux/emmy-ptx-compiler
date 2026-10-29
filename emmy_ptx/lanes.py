@@ -298,7 +298,8 @@ class LaneSharing:
         (value numbering shares them), which pays while they take at most half
         the registers a thread of this launch may have (measured); beyond that
         the blocks run as a rolled loop that leaves those loads in place
-        (ptxas still keeps what fits)."""
+        (ptxas still keeps what fits). So they do when a block's loop stays
+        rolled and the kernel would pass COPY_BUDGET instructions (run)."""
         self.mutable |= plan.mutable
         self.shared_loop = True
         self._lane_region = self._lane_rows(plan)
@@ -311,7 +312,8 @@ class LaneSharing:
                 unrolls = self.unrolls_within(
                     ((loop.unroll and self.expansion >= 1) or n <= AUTO_UNROLL_TRIPS * self.expansion)
                     and n * size <= UNROLL_BUDGET * self.expansion)
-                if unrolls and plan.invariant <= registers // 2:
+                if unrolls and plan.invariant <= registers // 2 and (
+                        self.copy_rolled or not self._copies_a_rolled_loop(loop.body)):
                     with self.block(dominated=True):
                         self._loop_body(loop, b.int_const(0), b.int_const(1), b.int_const(n), (n, n), size)
                 else:

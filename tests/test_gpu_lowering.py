@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import requests
 from kernels import (column_recomputing_mlp, rasterized_row_scale, regroup_hazards, shared_sum_added_atomically,
-                     staged_matmul, three_column_attention)
+                     short_loop_around_a_long_one, staged_matmul, three_column_attention)
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F16, F32, F64, I16, I32, U8, U16, U32
@@ -655,6 +655,19 @@ def test_work_repeated_across_blocks_is_shared_in_a_cluster():
     assert np.allclose(got, want, rtol=1e-4, atol=1e-3)
 
 
+@pytest.mark.parametrize("hidden", [16, 64])
+def test_a_short_loop_around_a_long_one_copied_or_rolled(hidden):
+    """16 copies of the rolled inner loop stay; 64 would take the kernel past
+    COPY_BUDGET instructions, and the outer loop is rolled instead (Lowerer.run)."""
+    k, cols = 200, 32
+    x = rng.standard_normal((hidden, k)).astype(np.float32)
+    y = rng.standard_normal((k, cols)).astype(np.float32)
+    w = rng.standard_normal((hidden, cols)).astype(np.float32)
+    got = run(short_loop_around_a_long_one(hidden, k, cols), {"x": x, "y": y, "w": w}, {"out": (cols,)}, 1, cols)["out"]
+    want = (w.astype(np.float64) * np.tanh(x.astype(np.float64) @ y)).sum(axis=0)
+    assert np.allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
 def test_matmul_cells_merged_in_pairs():
     """coarsen.py: the first half of the block computes two cells a thread,
     the other half only fills the shared tiles."""
@@ -684,6 +697,36 @@ def test_signed_zero_constants_stay_distinct():
     ))]
     got = run(body, {"x": np.ones(32, np.float32)}, {"out": (32,)}, 1, 32)["out"]
     assert np.array_equal(got, np.ones(32, np.float32))
+
+
+def test_maximum_and_minimum_are_cudas_fmax_and_fmin():
+    """emmy renders maximum, minimum and relu as fmaxf and fminf: a NaN gives
+    the other operand, and -0 is below +0, whichever operand comes first. The
+    folded constants follow the same rule as the GPU's max and min."""
+    t = Var("t")
+    # x and y are made on the GPU as numerator / denominator (JSON cannot carry a NaN):
+    # x = 0, -0, NaN, 1, -0, NaN, -0, 2 and y = -0, 0, 1, NaN, -0, -0, 3, 2
+    x = np.array([0.0, -0.0, 0.0, 1.0, -0.0, 0.0, -0.0, 2.0], np.float32)
+    xd = np.array([1, 1, 0, 1, 1, 0, 1, 1], np.float32)
+    y = np.array([-0.0, 0.0, 1.0, 0.0, -0.0, -0.0, 3.0, 2.0], np.float32)
+    yd = np.array([1, 1, 1, 0, 1, 1, 1, 1], np.float32)
+    folded = [("maximum", "pz", "nz"), ("maximum", "nz", "pz"), ("minimum", "pz", "nz"), ("minimum", "nz", "pz")]
+    body = [Tile(axes=(Axis("t", Dim(8)),), body=(
+        *(Load(name=f"{v}{part}", input=f"{v}{part}", index=(t,)) for v in "xy" for part in ("", "d")),
+        Assign("xv", "divide", ("x", "xd")), Assign("yv", "divide", ("y", "yd")),
+        Let(name="pz", value=Literal(0.0), dtype=F32), Let(name="nz", value=Literal(-0.0), dtype=F32),
+        Assign("hi", "maximum", ("xv", "yv")), Assign("lo", "minimum", ("xv", "yv")), Assign("r", "relu", ("xv",)),
+        *(Assign(f"c{k}", op, args) for k, (op, *args) in enumerate(folded)),
+        Write("out", (I(0), t), "hi"), Write("out", (I(1), t), "lo"), Write("out", (I(2), t), "r"),
+        *(Write("folded", (I(k), t), f"c{k}") for k in range(len(folded))),
+    ))]
+    got = run(body, {"x": x, "xd": xd, "y": y, "yd": yd}, {"out": (3, 8), "folded": (len(folded), 8)}, 1, 8)
+    hi = np.array([0.0, 0.0, 1.0, 1.0, -0.0, -0.0, 3.0, 2.0], np.float32)
+    lo = np.array([-0.0, -0.0, 1.0, 1.0, -0.0, -0.0, -0.0, 2.0], np.float32)
+    relu = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0], np.float32)
+    for got_row, want in zip(got["out"], (hi, lo, relu)):  # values and the signs of zeros
+        assert np.array_equal(got_row, want) and np.array_equal(np.signbit(got_row), np.signbit(want))
+    assert np.array_equal(np.signbit(got["folded"][:, 0]), [False, False, True, True])
 
 
 def test_integer_comparisons_min_max_and_select_stay_exact():

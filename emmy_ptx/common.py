@@ -41,6 +41,14 @@ UNROLL_BUDGET = 4096
 # Loops this short are unrolled completely even when the IR does not ask (loops
 # over a shared-memory tile up to SMEM_UNROLL_TRIPS).
 AUTO_UNROLL_TRIPS, SMEM_UNROLL_TRIPS = 64, 128
+# Complete unrollings that copy a loop which stays rolled are undone in a kernel past
+# this many PTX instructions (Lowerer.run). Below it such copies can pay (a_d80, 2,438
+# instructions: 12.9 us with them, 18.9 without); past it none was measured to (k_mlp,
+# 7,613: 76.3 us with them, 35.4 without, as ptxas then unrolls the one copy left
+# itself; a synthetic kernel of 3,760 and 5,008: the same time either way). At about
+# two machine instructions of 16 bytes a PTX one, it is also the 128 KB a loop can run
+# from the RTX 5090's instruction cache (tools/icache.py).
+COPY_BUDGET = 4096
 # Streaming multiprocessors of the evaluation GPU (RTX 5090). Only a scheduling
 # hint depends on it, no result (the code needs sm_89, or sm_90 for clusters).
 TARGET_SMS = 170

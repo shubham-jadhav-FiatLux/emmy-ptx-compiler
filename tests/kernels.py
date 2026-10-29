@@ -1,6 +1,7 @@
 """Hand-built Kernel IR shared by the tests: Tiles whose cells the lowering places
 anew (Lowerer._placement), a loop whose work neighbouring blocks repeat
-(cluster.py), a staged matmul whose cells coarsen.py merges, and cooperative
+(cluster.py), a short loop around a long one (copies of a rolled loop,
+Lowerer.run), a staged matmul whose cells coarsen.py merges, and cooperative
 sums regrouping must leave alone."""
 
 import numpy as np
@@ -118,6 +119,29 @@ def column_recomputing_mlp(rows: int = 2, k: int = 128, hidden: int = 128, cols:
         WarpShuffle(state=("acc1",), state_b=("acc1__o",), combine_states=(Assign("acc1", "add", ("acc1", "acc1__o")),),
                     length=lanes),
         Cond(cond=B("==", co, I(0)), body=(Write("out", (Var("a0"), Var("a1")), "acc1"),)),
+    ))]
+
+
+def short_loop_around_a_long_one(hidden: int, k: int = 200, cols: int = 32) -> list:
+    """out[t] = sum_a w[a, t] * tanh(sum_b x[a, b] * y[b, t]): the ``hidden``
+    trips of the outer loop are few enough to unroll completely, the ``k``
+    of the inner one too many, so each copy of the outer body copies a rolled
+    loop. One block of ``cols`` threads."""
+    t = Var("t")
+    return [Tile(axes=(Axis("t", Dim(cols)),), body=(
+        Loop(axis=Axis("a", Dim(hidden)), body=(
+            Loop(axis=Axis("b", Dim(k)), body=(
+                Load(name="xv", input="x", index=(Var("a"), Var("b"))),
+                Load(name="yv", input="y", index=(Var("b"), t)),
+                Assign("p", "multiply", ("xv", "yv")),
+                Accum("acc0", "p"),
+            )),
+            Assign("h", "tanh", ("acc0",)),
+            Load(name="wv", input="w", index=(Var("a"), t)),
+            Assign("q", "multiply", ("wv", "h")),
+            Accum("acc1", "q"),
+        )),
+        Write("out", (t,), "acc1"),
     ))]
 
 

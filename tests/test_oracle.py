@@ -238,21 +238,24 @@ def compile_and_run(body, inputs, outputs, grid, block, options) -> dict:
     assert c.get("ok"), c.get("stderr")
     args = [dict(name=n, dtype=buffers[n].dtype.replace("u32", "i32"), shape=list(a.shape),
                  data=(a.view(np.int32) if a.dtype == np.uint32 else a).ravel().tolist()) for n, a in inputs.items()]
-    args += [dict(name=n, dtype="f64", shape=list(a.shape), output=True) for n, a in outputs.items()]
+    # each f64 output comes back as its two 32-bit words: the runner returns NaN and the
+    # infinities as null, and their bits, the sign of a zero included, as they are
+    args += [dict(name=n, dtype="i32", shape=[*a.shape, 2], output=True) for n, a in outputs.items()]
     r = requests.post(f"{RUNNER}/run", json={
         "cubin_id": c["cubin_id"], "entry": "k_random", "grid": [grid, 1, 1], "block": [block, 1, 1],
-        "smem_bytes": 0, "zero_outputs": [], "args": args, "warmup": 0, "iters": 1, "max_return": 1 << 16},
+        "smem_bytes": 0, "zero_outputs": [], "args": args, "warmup": 0, "iters": 1, "max_return": 1 << 17},
         timeout=120).json()
     assert r.get("ok"), r.get("stderr")
-    # (the runner returns infinities and NaN as null)
-    return {n: np.array([np.nan if v is None else v for v in r["outputs"][n]["values"]], np.float64).reshape(a.shape)
+    return {n: np.array(r["outputs"][n]["values"], np.int32).view(np.float64).reshape(a.shape)
             for n, a in outputs.items()}
 
 
 def agree(got: np.ndarray, want: np.ndarray, kind: str) -> bool:
-    want = np.where(np.isfinite(want), want, np.nan)  # what the runner can return
+    """A NaN matches any NaN, an infinity only one of its sign. ``exact``: every
+    other value bit for bit, so a zero keeps its sign; else within rounding."""
+    want = np.ascontiguousarray(want, np.float64)
     if kind == "exact":
-        same = (got == want) | (np.isnan(got) & np.isnan(want))
+        same = (got.view(np.int64) == want.view(np.int64)) | (np.isnan(got) & np.isnan(want))
         return bool(np.all(same))
     tol = 1e-4 if kind == "approx" else 1e-5  # (approx: exp within its 2 ulp, then sums)
     return bool(np.allclose(got, want, rtol=tol, atol=tol / 10, equal_nan=True))
